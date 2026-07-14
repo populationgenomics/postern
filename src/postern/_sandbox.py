@@ -179,7 +179,15 @@ class SandboxProfile:
 def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str]:
     """The bwrap flags for ``profile`` (excluding the trailing ``-- argv``)."""
     root = str(profile.rootfs) if profile.rootfs is not None else ''
-    argv = ['bwrap', '--unshare-all', '--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
+    # --unshare-all leaves the user and cgroup namespaces *best-effort*
+    # (--unshare-user-try / --unshare-cgroup-try): if the kernel can't provide a
+    # user namespace, bwrap silently continues WITHOUT one and the guest runs as
+    # real root (F1's silent degradation). Re-list them strict so a missing
+    # namespace is a hard launch failure instead — bwrap's own docs say to use
+    # --unshare-user if you rely on it for security. --unshare-all still supplies
+    # the strict ipc/pid/net/uts (and any namespace it gains in future versions).
+    argv = ['bwrap', '--unshare-all', '--unshare-user', '--unshare-cgroup']
+    argv += ['--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
     # Run the guest as a non-root uid/gid (F2): inside the userns it then holds
     # no capabilities to re-gain namespaces through a seccomp gap, and if the
     # userns silently fails to materialise (F1) a root host still drops to a

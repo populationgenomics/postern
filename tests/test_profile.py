@@ -10,6 +10,15 @@ def test_hardened_flags_present():
     assert argv[argv.index('/usr') - 1] == '--ro-bind'
 
 
+def test_user_and_cgroup_namespaces_are_strict():
+    # Explicit --unshare-user/--unshare-cgroup upgrade --unshare-all's best-effort
+    # -try variants, so a missing user namespace is a hard launch failure (F1)
+    # rather than a silent fall-through to a real-root guest.
+    argv = build_base_argv(SandboxProfile(), seccomp_fd=None)
+    assert '--unshare-user' in argv
+    assert '--unshare-cgroup' in argv
+
+
 def test_ephemeral_workspace_is_tmpfs():
     argv = build_base_argv(SandboxProfile(workspace=None), seccomp_fd=None)
     assert '--tmpfs' in argv

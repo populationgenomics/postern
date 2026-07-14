@@ -44,7 +44,10 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
 `Sandbox` launches the guest under [bubblewrap](https://github.com/containers/bubblewrap):
 
 - **empty network namespace** — no egress of any kind (a socket can be created
-  but has no route);
+  but has no route). The user and cgroup namespaces are unshared **strictly**
+  (`--unshare-user`/`--unshare-cgroup`, not `--unshare-all`'s best-effort `-try`
+  variants), so a host that can't provide a user namespace is a hard launch
+  failure rather than a silent fall-through to a real-root guest;
 - **surgical filesystem** — read-only base system dirs + one writable
   `/workspace`; no `/etc`, `/home`, `/root`, or host application code;
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
