@@ -38,7 +38,9 @@ jobs:
           # *system* interpreter (/usr/bin/python3), so grpcio must be importable
           # there — the setup-python env that runs pytest is not bound into the
           # sandbox. Install it into the system interpreter the guest resolves to.
-          sudo /usr/bin/python3 -m pip install --break-system-packages grpcio
+          # --no-deps: grpcio core has no Python runtime deps, and this avoids
+          # pip trying (and failing) to upgrade Debian-managed packages.
+          sudo /usr/bin/python3 -m pip install --break-system-packages --no-deps grpcio
           pytest -q
 
   seccomp-drift:
