@@ -32,8 +32,13 @@ jobs:
         # such restriction. (sysctl key absent on kernels without the knob, so
         # tolerate its failure.)
         run: |
-          sudo apt-get update && sudo apt-get install -y bubblewrap
+          sudo apt-get update && sudo apt-get install -y bubblewrap python3-pip
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # The hatch e2e tests run the guest against the host /usr with the
+          # *system* interpreter (/usr/bin/python3), so grpcio must be importable
+          # there — the setup-python env that runs pytest is not bound into the
+          # sandbox. Install it into the system interpreter the guest resolves to.
+          sudo /usr/bin/python3 -m pip install --break-system-packages grpcio
           pytest -q
 
   seccomp-drift:
