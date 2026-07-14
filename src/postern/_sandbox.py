@@ -23,7 +23,6 @@ import contextlib
 import dataclasses
 import os
 import pathlib
-import platform
 import shutil
 import subprocess
 import tempfile
@@ -62,21 +61,6 @@ class IsolationError(RuntimeError):
     startup — refuse to serve — rather than silently run untrusted code with
     weaker isolation than intended (the F1/F5 silent-degradation risk).
     """
-
-
-# The one thing a successful launch does not already prove. With the strict
-# --unshare-{user,net,…} flags, bwrap aborts if it cannot create the user or
-# network namespace, apply --uid, or drop capabilities — so launch success
-# guarantees a non-root, egress-denied, unprivileged guest. It does *not* prove
-# the seccomp filter enforces here: a default-allow blob loads fine but is a
-# no-op on an architecture it lacks rules for (that arch check is host-side, in
-# verify()). This one-line probe confirms end-to-end that a denied syscall is
-# actually refused — it prints BLOCKED only if seccomp stopped the unshare.
-_PROBE_CODE = (
-    'import ctypes\n'
-    'libc = ctypes.CDLL(None, use_errno=True)\n'
-    "print('BLOCKED' if libc.unshare(0x10000000) != 0 else 'ALLOWED')\n"  # CLONE_NEWUSER
-)
 
 
 @dataclasses.dataclass
@@ -328,31 +312,24 @@ class Sandbox:
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
 
     def verify(self, *, timeout: float = 30) -> None:
-        """Fail closed unless isolation is actually enforced here.
+        """Fail fast at startup unless the sandbox actually launches here.
 
-        A boot-time gate: call once at worker startup against the profile you
-        will serve with, and refuse to run untrusted code if it raises. The
-        strict ``--unshare-{user,net,…}`` flags already make a *successful* launch
-        fail-closed on the namespaces, non-root uid and dropped capabilities
-        (bwrap aborts if it cannot set any of them up), so this only adds the two
-        things launch success does not prove: that the seccomp filter covers this
-        architecture (F4 — a default-allow blob is a silent no-op otherwise) and
-        that it is actively refusing a denied syscall. A launch failure — the
-        symptom of a missing user namespace, gVisor, etc. (F1) — surfaces here as
-        an :class:`IsolationError` too.
+        A boot-time gate: call once against the profile you will serve with, and
+        refuse to run untrusted code if it raises. Every control is already
+        fail-closed on the launch path — the strict ``--unshare-{user,net,…}``
+        flags make bwrap abort if it cannot create the namespaces, apply
+        ``--uid`` or drop capabilities (F1/F2/F5), and :func:`_seccomp.load_filter`
+        refuses an architecture the filter doesn't cover (F4). So there is nothing
+        to *probe* for at runtime (a successful launch is the proof, as in
+        Chrome's sandbox): this just triggers one trivial launch so a broken
+        platform — no user namespace, gVisor, an uncovered arch — surfaces as an
+        :class:`IsolationError` at startup rather than on the first real request.
         """
-        problems: list[str] = []
         if not self._profile.seccomp:
-            problems.append('seccomp is disabled')
-        elif not _seccomp.arch_is_covered():
-            problems.append(f'seccomp filter carries no program for this architecture ({platform.machine()!r})')
-        result = self.run_python(_PROBE_CODE, timeout=timeout)
+            raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
+        result = self.run_python('pass', timeout=timeout)
         if not result.ok:
-            problems.append(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
-        elif self._profile.seccomp and 'BLOCKED' not in result.stdout:
-            problems.append('seccomp did not refuse a denied syscall (filter is not enforcing)')
-        if problems:
-            raise IsolationError('isolation self-test failed: ' + '; '.join(problems))
+            raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
 
     def close(self) -> None:
         """Remove the workspace if this Sandbox created it (a no-op for a caller-owned path)."""

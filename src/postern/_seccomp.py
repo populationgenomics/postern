@@ -10,7 +10,10 @@ libseccomp) and committed as ``_seccomp.bpf`` next to this module. The runtime
 only *loads* that blob and hands its fd to ``bwrap --seccomp`` — so installing or
 running postern needs no libseccomp, keeping the core dependency-free. The blob
 is a single multi-arch program (x86_64, x86, x32, aarch64, arm); on any other
-architecture its default-allow makes it a safe no-op.
+architecture its default-allow would make it a silent no-op, so :func:`load_filter`
+**refuses to load it** there (fail closed) rather than run with an unenforced
+filter — that arch check is the only thing that isn't self-evident from the
+kernel accepting the filter, so there is no runtime probe.
 
 The syscall lists below are the source of truth the generator consumes; they are
 derived from Flatpak's seccomp policy (``common/flatpak-run.c``). Editing them
@@ -31,9 +34,8 @@ _SPEC_RESOURCE = '_seccomp.spec'
 
 # The machine architectures the committed blob actually carries a program for
 # (the ``uname -m`` names for ``tools/gen_seccomp._ARCHES``). On anything else
-# the filter's default-allow makes it a silent no-op, so a caller that relies on
-# the backstop must treat an uncovered arch as fail-closed rather than trusting a
-# filter that enforces nothing — see ``Sandbox.verify``.
+# the filter's default-allow makes it a silent no-op, so ``load_filter`` refuses
+# to load it there rather than run with a filter that enforces nothing.
 COVERED_ARCHES: frozenset[str] = frozenset(
     {'x86_64', 'amd64', 'i386', 'i486', 'i586', 'i686', 'aarch64', 'arm64', 'armv6l', 'armv7l', 'armv8l', 'arm'}
 )
@@ -159,9 +161,16 @@ def load_filter() -> typing.IO[bytes]:
     """Load the prebuilt BPF denylist into an open temp file positioned at 0.
 
     The caller passes its fd to ``bwrap --seccomp`` and keeps it open for the
-    child's lifetime, then closes it. Raises if the blob is missing from the
-    install (a packaging error — fail loudly rather than run unfiltered).
+    child's lifetime, then closes it. Fails closed rather than run with an
+    unenforced filter: raises on an architecture the blob doesn't cover (where it
+    would be a default-allow no-op), or if the blob is missing from the install
+    (a packaging error).
     """
+    if not arch_is_covered():
+        raise RuntimeError(
+            f'seccomp filter has no coverage for this architecture ({platform.machine()!r}); refusing to run '
+            'untrusted code with an unenforced filter (set SandboxProfile(seccomp=False) to override deliberately)'
+        )
     data = importlib.resources.files('postern').joinpath(_BPF_RESOURCE).read_bytes()
     if not data:
         raise RuntimeError(f'seccomp filter {_BPF_RESOURCE!r} is missing or empty; the postern install is broken')

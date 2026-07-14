@@ -2,6 +2,8 @@ import hashlib
 import importlib.resources
 import json
 
+import pytest
+
 from postern import _seccomp
 
 
@@ -44,6 +46,26 @@ def test_committed_blob_is_not_stale():
     assert manifest['bpf_sha256'] == hashlib.sha256(blob).hexdigest(), (
         '_seccomp.bpf does not match its manifest — regenerate with tools/gen_seccomp.sh'
     )
+
+
+def test_load_filter_fails_closed_on_uncovered_arch(monkeypatch):
+    # On an arch the blob doesn't cover, the filter is a default-allow no-op, so
+    # load_filter refuses rather than run untrusted code unfiltered.
+    monkeypatch.setattr(_seccomp, 'arch_is_covered', lambda: False)
+    monkeypatch.setattr(_seccomp.platform, 'machine', lambda: 'riscv64')
+    with pytest.raises(RuntimeError, match='no coverage for this architecture'):
+        _seccomp.load_filter()
+
+
+def test_load_filter_loads_on_covered_arch():
+    # The negative control: on a covered host the blob loads normally.
+    if not _seccomp.arch_is_covered():
+        pytest.skip('test host architecture is not covered by the committed blob')
+    f = _seccomp.load_filter()
+    try:
+        assert f.read()
+    finally:
+        f.close()
 
 
 def test_arch_is_covered_recognises_supported_and_rejects_others():

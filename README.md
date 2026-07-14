@@ -67,14 +67,14 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
 The hatch UDS is bind-mounted in as the single controlled opening. Because the
 RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
 
-**Fail-closed boot check.** The strict `--unshare-*` flags already make a
-*failed* launch the signal of a missing user namespace, gVisor, etc. — bwrap
-aborts rather than degrading. `Sandbox(profile).verify()` turns that into a
-boot-time gate: it launches the sandbox (so a setup failure raises
-`IsolationError`) and adds the checks launch success can't prove — that the
-seccomp blob covers this architecture and is actively refusing a denied syscall.
-Call it once at worker startup and refuse to serve if it raises
-(`examples/worker.py` does this).
+**Fail-closed boot check.** Every control is enforced on the launch path: the
+strict `--unshare-*` flags make bwrap abort if it can't create the namespaces,
+apply `--uid`, or drop capabilities, and the seccomp loader refuses an uncovered
+architecture — so a successful launch *is* the proof (no runtime probe, like
+Chrome's sandbox). `Sandbox(profile).verify()` just triggers one trivial launch
+at startup so a broken platform (no user namespace, gVisor, uncovered arch)
+raises `IsolationError` there rather than on the first request. Call it at worker
+startup and refuse to serve if it raises (`examples/worker.py` does this).
 
 ## The environment (getting pandas etc. in)
 
@@ -97,9 +97,11 @@ mounted read-only — never `pip install`ed at run time.
 Linux with **bubblewrap** and unprivileged user namespaces (a Cloud Run gen2 Job,
 or any such host). `postern.available()` reports whether a sandbox can launch.
 The seccomp filter is a prebuilt multi-arch BPF blob (x86_64, x86, x32, aarch64,
-arm); on any other architecture its default-allow makes it a safe no-op and the
-netns/capability boundary still holds. Not runnable on macOS except against a
-Linux target — `import postern` works anywhere, `Sandbox.run*` needs the OS.
+arm); on any other architecture it would be a default-allow no-op, so `Sandbox`
+**refuses to launch** there (fail-closed) rather than run with an unenforced
+filter — set `SandboxProfile(seccomp=False)` to override deliberately. Not
+runnable on macOS except against a Linux target — `import postern` works
+anywhere, `Sandbox.run*` needs the OS.
 
 **Ubuntu 23.10+ / 24.04** restrict unprivileged user namespaces by default
 (`kernel.apparmor_restrict_unprivileged_userns=1`), which bubblewrap needs —
