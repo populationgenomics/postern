@@ -132,6 +132,17 @@ class SandboxProfile:
         env: Environment for the guest (``--clearenv`` wipes everything first).
         seccomp: Load the syscall denylist.
         rlimit_nproc: Per-run process-count cap (fork-bomb backstop).
+        guest_uid: uid the guest runs as (``--uid``). Defaults to ``65534``
+            (nobody) so the guest is **non-root inside its user namespace** —
+            defusing a seccomp-gap namespace/cap re-acquisition (F2) and, when
+            run as root, dropping to a non-root real uid even if the user
+            namespace silently fails to materialise (F1's degraded case). The
+            guest's ``/workspace`` and ``/tmp`` are made writable to suit; a
+            caller-owned ``workspace`` dir is chmod'd world-writable at launch so
+            the non-root guest can use it. ``None`` keeps the legacy uid-0-in-
+            userns behaviour.
+        guest_gid: gid the guest runs as (``--gid``). Defaults to ``65534``.
+            ``None`` leaves the gid unset.
     """
 
     workspace: pathlib.Path | None = None
@@ -142,6 +153,8 @@ class SandboxProfile:
     env: dict[str, str] = dataclasses.field(default_factory=lambda: {'PATH': '/usr/local/bin:/usr/bin:/bin'})
     seccomp: bool = True
     rlimit_nproc: int = 1024
+    guest_uid: int | None = 65534
+    guest_gid: int | None = 65534
 
     @classmethod
     def with_venv(cls, venv: str | pathlib.Path, **kwargs: typing.Any) -> SandboxProfile:  # noqa: ANN401
@@ -160,6 +173,14 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     """The bwrap flags for ``profile`` (excluding the trailing ``-- argv``)."""
     root = str(profile.rootfs) if profile.rootfs is not None else ''
     argv = ['bwrap', '--unshare-all', '--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
+    # Run the guest as a non-root uid/gid (F2): inside the userns it then holds
+    # no capabilities to re-gain namespaces through a seccomp gap, and if the
+    # userns silently fails to materialise (F1) a root host still drops to a
+    # non-root real uid rather than running the guest as real root.
+    if profile.guest_uid is not None:
+        argv += ['--uid', str(profile.guest_uid)]
+    if profile.guest_gid is not None:
+        argv += ['--gid', str(profile.guest_gid)]
     for d in _SYSTEM_DIRS:
         # /usr is mandatory (plain --ro-bind); the rest are ``-try`` so a path
         # absent on this base (e.g. /lib64) is skipped, not fatal.
@@ -168,12 +189,14 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     argv += ['--ro-bind-try', root + '/etc/ld.so.cache', '/etc/ld.so.cache']
     for host, guest in profile.ro_binds:
         argv += ['--ro-bind-try', host, guest]
-    # '/tmp' is the guest's in-sandbox mountpoint (a fresh tmpfs), not a host path.
-    argv += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']  # noqa: S108
+    # '/tmp' is the guest's in-sandbox mountpoint (a fresh tmpfs), not a host
+    # path; '--perms 1777' gives it the sticky world-writable mode a non-root
+    # guest needs (and that a real /tmp has anyway).
+    argv += ['--proc', '/proc', '--dev', '/dev', '--perms', '1777', '--tmpfs', '/tmp']  # noqa: S108
     if profile.workspace is not None:
         argv += ['--bind', str(profile.workspace), _GUEST_WORKSPACE]
     else:
-        argv += ['--tmpfs', _GUEST_WORKSPACE]
+        argv += ['--perms', '1777', '--tmpfs', _GUEST_WORKSPACE]
     argv += ['--chdir', _GUEST_WORKSPACE]
     env = dict(profile.env)
     if profile.stubs is not None:
@@ -237,6 +260,12 @@ class Sandbox:
     ) -> ProcResult:
         if not available():
             raise RuntimeError('bubblewrap (bwrap) not found on PATH; postern requires Linux + bubblewrap')
+        # A non-root guest cannot write a workspace dir owned by (and mode-locked
+        # to) the host user, so open it up. The dir is private to this single-
+        # tenant sandbox, so world-writable is immaterial (see F9).
+        if self._profile.guest_uid not in (None, 0):
+            with contextlib.suppress(OSError):
+                self._workspace.chmod(0o777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
         fd = seccomp.fileno() if seccomp is not None else None
         try:
@@ -331,6 +360,12 @@ class Sandbox:
             problems.append('network egress is not denied (the empty netns did not take effect)')
         if self._profile.seccomp and report.get('userns_reblocked') is not True:
             problems.append('guest was able to create a new user namespace (seccomp is not enforcing)')
+        guest_uid = self._profile.guest_uid
+        if guest_uid not in (None, 0):
+            if report.get('uid') != guest_uid:
+                problems.append(f'guest runs as uid {report.get("uid")}, not the configured non-root {guest_uid}')
+            if report.get('cap_eff') != 0:
+                problems.append(f'guest holds effective capabilities (CapEff={report.get("cap_eff")}), expected none')
         if problems:
             raise IsolationError('isolation self-test failed: ' + '; '.join(problems))
 

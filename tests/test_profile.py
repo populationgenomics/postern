@@ -17,6 +17,27 @@ def test_ephemeral_workspace_is_tmpfs():
     assert '--bind' not in argv  # no host directory is bound writable
 
 
+def test_non_root_guest_uid_gid_by_default():
+    argv = build_base_argv(SandboxProfile(), seccomp_fd=None)
+    assert argv[argv.index('--uid') + 1] == '65534'
+    assert argv[argv.index('--gid') + 1] == '65534'
+
+
+def test_guest_uid_none_leaves_uid_unset():
+    argv = build_base_argv(SandboxProfile(guest_uid=None, guest_gid=None), seccomp_fd=None)
+    assert '--uid' not in argv
+    assert '--gid' not in argv
+
+
+def test_tmp_and_ephemeral_workspace_are_world_writable():
+    # A non-root guest needs a writable /tmp and cwd; --perms 1777 precedes each.
+    argv = build_base_argv(SandboxProfile(workspace=None), seccomp_fd=None)
+    assert argv[argv.index('/tmp') - 1] == '--tmpfs'  # noqa: S108
+    assert argv[argv.index('/tmp') - 2] == '1777'  # noqa: S108
+    assert argv[argv.index('/workspace') - 1] == '--tmpfs'
+    assert argv[argv.index('/workspace') - 2] == '1777'
+
+
 def test_bound_workspace(tmp_path):
     argv = build_base_argv(SandboxProfile(workspace=tmp_path), seccomp_fd=None)
     assert '--bind' in argv

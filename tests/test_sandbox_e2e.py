@@ -64,6 +64,12 @@ def test_self_test_reports_isolation():
     assert report['cap_eff'] == 0  # --cap-drop ALL left no effective capabilities
 
 
+def test_guest_runs_as_non_root_by_default():
+    report = Sandbox().self_test()
+    assert report['uid'] == 65534  # nobody, not uid 0 in the userns (F2)
+    assert report['gid'] == 65534
+
+
 def test_verify_passes_on_the_hardened_profile():
     Sandbox().verify()  # must not raise on a correctly-configured sandbox
 
