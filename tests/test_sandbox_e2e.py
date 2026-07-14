@@ -57,17 +57,10 @@ def test_network_is_denied():
     assert 'no-egress' in result.stdout
 
 
-def test_self_test_reports_isolation():
-    report = Sandbox().self_test()
-    assert report['egress'] is False  # empty netns denies egress
-    assert report['userns_reblocked'] is True  # seccomp refuses CLONE_NEWUSER
-    assert report['cap_eff'] == 0  # --cap-drop ALL left no effective capabilities
-
-
 def test_guest_runs_as_non_root_by_default():
-    report = Sandbox().self_test()
-    assert report['uid'] == 65534  # nobody, not uid 0 in the userns (F2)
-    assert report['gid'] == 65534
+    result = Sandbox().run_python('import os; print(os.getuid(), os.getgid())')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '65534 65534'  # nobody, not uid 0 in the userns (F2)
 
 
 def test_verify_passes_on_the_hardened_profile():
@@ -75,9 +68,9 @@ def test_verify_passes_on_the_hardened_profile():
 
 
 def test_verify_fails_closed_without_seccomp():
-    # With seccomp off the guest can re-gain a user namespace, so the boot-time
-    # gate must refuse to serve rather than silently run weaker isolation.
-    with pytest.raises(IsolationError, match='user namespace'):
+    # verify() is the "am I fully hardened" gate; a seccomp-disabled profile is
+    # not, so it must refuse rather than let the caller serve under it.
+    with pytest.raises(IsolationError, match='seccomp'):
         Sandbox(SandboxProfile(seccomp=False)).verify()
 
 

@@ -67,13 +67,14 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
 The hatch UDS is bind-mounted in as the single controlled opening. Because the
 RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
 
-**Fail-closed boot check.** The isolation depends on the platform providing a
-real userns-enabled kernel; if that silently regresses (no userns, gVisor, an
-arch the seccomp blob doesn't cover), the sandbox could weaken without any
-error. `Sandbox(profile).verify()` launches an in-sandbox probe and raises
-`IsolationError` unless egress is denied, seccomp is enforcing, the guest is
-non-root, and the architecture is covered — call it once at worker startup and
-refuse to serve if it raises (`examples/worker.py` does this).
+**Fail-closed boot check.** The strict `--unshare-*` flags already make a
+*failed* launch the signal of a missing user namespace, gVisor, etc. — bwrap
+aborts rather than degrading. `Sandbox(profile).verify()` turns that into a
+boot-time gate: it launches the sandbox (so a setup failure raises
+`IsolationError`) and adds the checks launch success can't prove — that the
+seccomp blob covers this architecture and is actively refusing a denied syscall.
+Call it once at worker startup and refuse to serve if it raises
+(`examples/worker.py` does this).
 
 ## The environment (getting pandas etc. in)
 
@@ -119,7 +120,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`) and `.self_test()` (the raw isolation report).
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`).
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534)` and `SandboxProfile.with_venv(venv, **kw)`. `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `available()` — bubblewrap present?

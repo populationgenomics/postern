@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import json
 import os
 import pathlib
 import platform
@@ -65,32 +64,19 @@ class IsolationError(RuntimeError):
     """
 
 
-# A stdlib-only probe run *inside* the sandbox by :meth:`Sandbox.self_test`. It
-# reports the guest's uid/gid, its effective capabilities, whether egress is
-# denied, and whether re-gaining a user namespace is blocked — the observable
-# signals of the isolation controls. It prints one JSON object as its last line.
-_SELFTEST_CODE = r"""
-import ctypes, json, os, socket
-report = {'uid': os.getuid(), 'gid': os.getgid()}
-caps = -1
-try:
-    with open('/proc/self/status') as fh:
-        for line in fh:
-            if line.startswith('CapEff:'):
-                caps = int(line.split()[1], 16)
-                break
-except OSError:
-    pass
-report['cap_eff'] = caps
-try:
-    socket.create_connection(('1.1.1.1', 443), timeout=3).close()
-    report['egress'] = True
-except OSError:
-    report['egress'] = False
-libc = ctypes.CDLL(None, use_errno=True)
-report['userns_reblocked'] = libc.unshare(0x10000000) != 0  # CLONE_NEWUSER
-print(json.dumps(report))
-"""
+# The one thing a successful launch does not already prove. With the strict
+# --unshare-{user,net,…} flags, bwrap aborts if it cannot create the user or
+# network namespace, apply --uid, or drop capabilities — so launch success
+# guarantees a non-root, egress-denied, unprivileged guest. It does *not* prove
+# the seccomp filter enforces here: a default-allow blob loads fine but is a
+# no-op on an architecture it lacks rules for (that arch check is host-side, in
+# verify()). This one-line probe confirms end-to-end that a denied syscall is
+# actually refused — it prints BLOCKED only if seccomp stopped the unshare.
+_PROBE_CODE = (
+    'import ctypes\n'
+    'libc = ctypes.CDLL(None, use_errno=True)\n'
+    "print('BLOCKED' if libc.unshare(0x10000000) != 0 else 'ALLOWED')\n"  # CLONE_NEWUSER
+)
 
 
 @dataclasses.dataclass
@@ -341,51 +327,30 @@ class Sandbox:
         with self._hatch.accepting():
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
 
-    def self_test(self, *, timeout: float = 30) -> dict[str, typing.Any]:
-        """Launch an in-sandbox probe and return its isolation report.
+    def verify(self, *, timeout: float = 30) -> None:
+        """Fail closed unless isolation is actually enforced here.
 
-        The report has ``uid``/``gid``/``cap_eff`` (effective capabilities, 0 ==
-        fully unprivileged), ``egress`` (True if an outbound connection
-        succeeded — it must not), and ``userns_reblocked`` (True if the guest was
-        refused a fresh user namespace). This only *observes*; :meth:`verify`
-        turns the report into a fail-closed gate. Raises :class:`IsolationError`
-        if the probe cannot run or emits no report.
-        """
-        result = self.run_python(_SELFTEST_CODE, timeout=timeout)
-        if not result.ok:
-            detail = result.stderr.strip() or result.returncode
-            raise IsolationError(f'isolation self-test probe failed to run: {detail}')
-        try:
-            return json.loads(result.stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError) as exc:
-            raise IsolationError(f'isolation self-test emitted no report (stdout={result.stdout!r})') from exc
-
-    def verify(self) -> None:
-        """Fail closed unless every load-bearing isolation control is enforced.
-
-        Intended as a boot-time gate: call once at worker startup against the
-        profile you will serve with, and refuse to run untrusted code if it
-        raises. It converts the silent-degradation risks (F1: no user namespace /
-        real-root guest; F5: open egress; F4: seccomp that is a no-op on this
-        architecture) into a hard :class:`IsolationError` at startup instead of a
-        weakened sandbox that looks healthy.
+        A boot-time gate: call once at worker startup against the profile you
+        will serve with, and refuse to run untrusted code if it raises. The
+        strict ``--unshare-{user,net,…}`` flags already make a *successful* launch
+        fail-closed on the namespaces, non-root uid and dropped capabilities
+        (bwrap aborts if it cannot set any of them up), so this only adds the two
+        things launch success does not prove: that the seccomp filter covers this
+        architecture (F4 — a default-allow blob is a silent no-op otherwise) and
+        that it is actively refusing a denied syscall. A launch failure — the
+        symptom of a missing user namespace, gVisor, etc. (F1) — surfaces here as
+        an :class:`IsolationError` too.
         """
         problems: list[str] = []
-        if self._profile.seccomp and not _seccomp.arch_is_covered():
-            problems.append(
-                f'seccomp filter carries no program for this architecture ({platform.machine()!r}); it enforces nothing'
-            )
-        report = self.self_test()
-        if report.get('egress') is not False:
-            problems.append('network egress is not denied (the empty netns did not take effect)')
-        if self._profile.seccomp and report.get('userns_reblocked') is not True:
-            problems.append('guest was able to create a new user namespace (seccomp is not enforcing)')
-        guest_uid = self._profile.guest_uid
-        if guest_uid not in (None, 0):
-            if report.get('uid') != guest_uid:
-                problems.append(f'guest runs as uid {report.get("uid")}, not the configured non-root {guest_uid}')
-            if report.get('cap_eff') != 0:
-                problems.append(f'guest holds effective capabilities (CapEff={report.get("cap_eff")}), expected none')
+        if not self._profile.seccomp:
+            problems.append('seccomp is disabled')
+        elif not _seccomp.arch_is_covered():
+            problems.append(f'seccomp filter carries no program for this architecture ({platform.machine()!r})')
+        result = self.run_python(_PROBE_CODE, timeout=timeout)
+        if not result.ok:
+            problems.append(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+        elif self._profile.seccomp and 'BLOCKED' not in result.stdout:
+            problems.append('seccomp did not refuse a denied syscall (filter is not enforcing)')
         if problems:
             raise IsolationError('isolation self-test failed: ' + '; '.join(problems))
 
