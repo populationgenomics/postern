@@ -24,10 +24,16 @@ jobs:
       - name: Pyright
         run: pyright
       - name: Tests
-        # bubblewrap is present on ubuntu-latest, so the sandbox e2e tests run
-        # here (they skip on hosts without it).
+        # Install bubblewrap so the sandbox e2e tests run here (they skip on
+        # hosts without it). ubuntu-latest is now 24.04, which restricts
+        # unprivileged user namespaces via AppArmor — bwrap then fails with
+        # "loopback: Failed RTM_NEWADDR: Operation not permitted". Lift it so
+        # bwrap can set up the sandbox; Cloud Run gen2 (the deploy target) has no
+        # such restriction. (sysctl key absent on kernels without the knob, so
+        # tolerate its failure.)
         run: |
           sudo apt-get update && sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           pytest -q
 
   seccomp-drift:
