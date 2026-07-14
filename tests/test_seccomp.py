@@ -1,3 +1,7 @@
+import hashlib
+import importlib.resources
+import json
+
 from postern import _seccomp
 
 
@@ -26,6 +30,20 @@ def test_socket_not_blocked():
     # empty netns's job, not seccomp's.
     assert 'socket' not in _seccomp.BLOCKED_EPERM
     assert 'socket' not in _seccomp.BLOCKED_ENOSYS
+
+
+def test_committed_blob_is_not_stale():
+    # Drift guard (F4): if the syscall lists change without regenerating the
+    # blob, or the blob is hand-edited, the committed manifest no longer matches.
+    # Dependency-free — the authoritative regenerate-and-diff runs in CI.
+    manifest = json.loads(importlib.resources.files('postern').joinpath(_seccomp._SPEC_RESOURCE).read_text())
+    assert manifest['source_digest'] == _seccomp.spec_digest(), (
+        'seccomp syscall lists changed without regenerating _seccomp.bpf — run tools/gen_seccomp.sh'
+    )
+    blob = importlib.resources.files('postern').joinpath(_seccomp._BPF_RESOURCE).read_bytes()
+    assert manifest['bpf_sha256'] == hashlib.sha256(blob).hexdigest(), (
+        '_seccomp.bpf does not match its manifest — regenerate with tools/gen_seccomp.sh'
+    )
 
 
 def test_arch_is_covered_recognises_supported_and_rejects_others():

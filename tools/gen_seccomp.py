@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import json
 import pathlib
 import sys
 
@@ -25,11 +26,13 @@ sys.path.insert(0, str(_ROOT / 'src'))
 from postern import _seccomp  # import after sys.path tweak — needs the src path above
 
 _OUT = _ROOT / 'src' / 'postern' / _seccomp._BPF_RESOURCE
+_SPEC_OUT = _ROOT / 'src' / 'postern' / _seccomp._SPEC_RESOURCE
 
 # Cover the compat ABIs too (Flatpak does the same) so a blocked syscall cannot
-# be reached via a different architecture's syscall table. The native arch of
-# the build host is already present; adding it again is a harmless no-op.
-_ARCHES = (seccomp.Arch.X86_64, seccomp.Arch.X86, seccomp.Arch.X32, seccomp.Arch.AARCH64, seccomp.Arch.ARM)
+# be reached via a different architecture's syscall table. The arch set lives in
+# postern._seccomp (the source of truth the drift digest hashes); the native
+# arch of the build host is already present, so re-adding it is a harmless no-op.
+_ARCHES = tuple(getattr(seccomp.Arch, name) for name in _seccomp.GEN_ARCHES)
 
 
 def build() -> seccomp.SyscallFilter:
@@ -58,6 +61,11 @@ def main() -> None:
     with _OUT.open('wb') as out:
         f.export_bpf(out)
     print(f'wrote {_OUT.relative_to(_ROOT)} ({_OUT.stat().st_size} bytes)')
+    # Record the drift manifest alongside: the source-spec digest plus the blob
+    # hash, so a stale blob is caught without libseccomp (see _seccomp.manifest
+    # and tests/test_seccomp.py). Written after the blob so the hash is current.
+    _SPEC_OUT.write_text(json.dumps(_seccomp.manifest(), indent=2, sort_keys=True) + '\n')
+    print(f'wrote {_SPEC_OUT.relative_to(_ROOT)}')
 
 
 if __name__ == '__main__':

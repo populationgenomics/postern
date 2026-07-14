@@ -45,7 +45,7 @@ lint = ["ruff", "pyright", "pytest", "pre-commit"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-postern = ["py.typed", "_seccomp.bpf"]
+postern = ["py.typed", "_seccomp.bpf", "_seccomp.spec"]
 
 [tool.ruff]
 line-length = 120

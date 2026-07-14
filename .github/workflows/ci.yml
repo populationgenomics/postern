@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[grpc]' pytest ruff pyright
+      - name: Ruff lint
+        run: ruff check src tests
+      - name: Ruff format
+        run: ruff format --check src tests
+      - name: Pyright
+        run: pyright
+      - name: Tests
+        # bubblewrap is present on ubuntu-latest, so the sandbox e2e tests run
+        # here (they skip on hosts without it).
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          pytest -q
+
+  seccomp-drift:
+    # Authoritative F4 check: regenerate the blob from the syscall lists with
+    # libseccomp and fail if the committed _seccomp.bpf / _seccomp.spec differ.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate seccomp blob
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3 python3-seccomp
+          python3 tools/gen_seccomp.py
+      - name: Fail on drift
+        run: |
+          if ! git diff --exit-code -- src/postern/_seccomp.bpf src/postern/_seccomp.spec; then
+            echo '::error::_seccomp.bpf/_seccomp.spec are stale — run tools/gen_seccomp.sh and commit the result'
+            exit 1
+          fi

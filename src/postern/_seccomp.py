@@ -19,12 +19,15 @@ requires regenerating the blob — see ``tools/gen_seccomp.sh``.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.resources
+import json
 import platform
 import tempfile
 import typing
 
 _BPF_RESOURCE = '_seccomp.bpf'
+_SPEC_RESOURCE = '_seccomp.spec'
 
 # The machine architectures the committed blob actually carries a program for
 # (the ``uname -m`` names for ``tools/gen_seccomp._ARCHES``). On anything else
@@ -111,9 +114,45 @@ CLONE_NEWUSER = 0x10000000  # block clone(CLONE_NEWUSER, ...) — the gap unshar
 TIOCSTI = 0x5412  # fake terminal input (CVE-2017-5226)
 TIOCLINUX = 0x541C  # ditto via the linux console ioctl
 
+# The libseccomp Arch names the generator compiles into the blob. Kept here as
+# the source of truth (not in the generator) so the drift digest below covers
+# them without this module importing libseccomp.
+GEN_ARCHES: tuple[str, ...] = ('X86_64', 'X86', 'X32', 'AARCH64', 'ARM')
+
 # Deliberately NOT blocked: socket / socketpair. Network isolation is the empty
 # netns's job (no interface, no route); the guest needs socket(AF_UNIX) to reach
 # the hatch UDS, so blocking it breaks the hatch while adding nothing.
+
+
+def spec_digest() -> str:
+    """A stable digest of the syscall spec the committed blob was built from.
+
+    Hashes the source-of-truth rule lists and the generator's arch set, so a
+    change to them that was *not* followed by regenerating ``_seccomp.bpf`` is
+    detectable with no libseccomp dependency — the generator records this digest
+    (and the blob's own hash) in ``_seccomp.spec``, and a test compares. It does
+    not prove the blob is what libseccomp would emit today (only the CI
+    regenerate-and-diff does); it catches the common drift of editing a list and
+    forgetting to regenerate.
+    """
+    payload = json.dumps(
+        {
+            'blocked_eperm': list(BLOCKED_EPERM),
+            'blocked_enosys': list(BLOCKED_ENOSYS),
+            'clone_newuser': CLONE_NEWUSER,
+            'tiocsti': TIOCSTI,
+            'tioclinux': TIOCLINUX,
+            'gen_arches': list(GEN_ARCHES),
+        },
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def manifest() -> dict[str, str]:
+    """Build the ``_seccomp.spec`` manifest for the currently committed blob."""
+    blob = importlib.resources.files('postern').joinpath(_BPF_RESOURCE).read_bytes()
+    return {'source_digest': spec_digest(), 'bpf_sha256': hashlib.sha256(blob).hexdigest()}
 
 
 def load_filter() -> typing.IO[bytes]:
