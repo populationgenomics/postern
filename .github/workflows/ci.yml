@@ -9,8 +9,8 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Install
@@ -48,7 +48,7 @@ jobs:
     # libseccomp and fail if the committed _seccomp.bpf / _seccomp.spec differ.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Regenerate seccomp blob
         run: |
           sudo apt-get update && sudo apt-get install -y python3 python3-seccomp
