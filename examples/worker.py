@@ -12,7 +12,7 @@ import sys
 import greeter_pb2
 import greeter_pb2_grpc
 
-from postern import Sandbox, SandboxProfile
+from postern import IsolationError, Sandbox, SandboxProfile
 from postern.grpc import GrpcHatch
 
 
@@ -35,9 +35,20 @@ print('PANDAS:', pd.__version__)
 
 
 def main() -> int:
+    profile = SandboxProfile(rootfs='/opt/guest-root')
+    # Boot-time gate: refuse to serve unless isolation is actually enforced here
+    # (egress denied, seccomp enforcing, guest non-root, arch covered). This
+    # converts the platform-dependence risk from silent weakening into a hard
+    # startup failure — see the security review's §3 condition 1.
+    try:
+        Sandbox(profile).verify()
+    except IsolationError as exc:
+        print(f'FATAL: isolation self-test failed, refusing to serve: {exc}', file=sys.stderr)
+        return 2
+
     hatch = GrpcHatch(allowlist={'/greeter.Greeter/SayHello'})
     hatch.add_servicer(greeter_pb2_grpc.add_GreeterServicer_to_server, Greeter())
-    result = Sandbox(SandboxProfile(rootfs='/opt/guest-root'), hatch=hatch).run_python(_GUEST, timeout=120)
+    result = Sandbox(profile, hatch=hatch).run_python(_GUEST, timeout=120)
     hatch.close()
     print(result.stdout)
     print(result.stderr.strip())

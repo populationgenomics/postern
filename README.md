@@ -49,14 +49,28 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
   `/workspace`; no `/etc`, `/home`, `/root`, or host application code;
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
   **`--die-with-parent`**, **`--clearenv`**;
+- **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
+  no capabilities inside its user namespace, and if the userns fails to
+  materialise on a root host it still drops to a non-root real uid
+  (`SandboxProfile(guest_uid=None)` restores the legacy uid-0-in-userns);
 - a **seccomp denylist** blocking escape-enabling syscalls (`unshare`, `setns`,
   `mount`, `ptrace`, `bpf`, `keyctl`, …). `socket` is deliberately *not* blocked
   — network isolation is the netns's job, and the guest needs `socket(AF_UNIX)`
   for the hatch;
-- **`RLIMIT_NPROC`** as a fork-bomb backstop (set inside the guest).
+- **`RLIMIT_NPROC`** as a fork-bomb backstop (set inside the guest), and an
+  optional **`RLIMIT_AS`** memory backstop (`SandboxProfile(rlimit_as=...)`, off
+  by default; a cgroup `memory.max` at the deploy layer is the real isolation).
 
 The hatch UDS is bind-mounted in as the single controlled opening. Because the
 RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
+
+**Fail-closed boot check.** The isolation depends on the platform providing a
+real userns-enabled kernel; if that silently regresses (no userns, gVisor, an
+arch the seccomp blob doesn't cover), the sandbox could weaken without any
+error. `Sandbox(profile).verify()` launches an in-sandbox probe and raises
+`IsolationError` unless egress is denied, seccomp is enforcing, the guest is
+non-root, and the architecture is covered — call it once at worker startup and
+refuse to serve if it raises (`examples/worker.py` does this).
 
 ## The environment (getting pandas etc. in)
 
@@ -102,8 +116,8 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`.
-- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024)` and `SandboxProfile.with_venv(venv, **kw)`. `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`) and `.self_test()` (the raw isolation report).
+- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534)` and `SandboxProfile.with_venv(venv, **kw)`. `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `available()` — bubblewrap present?
 
