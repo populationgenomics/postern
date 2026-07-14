@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
 import pathlib
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -52,6 +54,43 @@ class Hatch(typing.Protocol):
 def available() -> bool:
     """Whether a sandbox can launch here (bubblewrap present on the PATH)."""
     return shutil.which('bwrap') is not None
+
+
+class IsolationError(RuntimeError):
+    """A boot-time isolation self-test found a load-bearing control unenforced.
+
+    Raised by :meth:`Sandbox.verify`. It exists so a worker can *fail closed* at
+    startup — refuse to serve — rather than silently run untrusted code with
+    weaker isolation than intended (the F1/F5 silent-degradation risk).
+    """
+
+
+# A stdlib-only probe run *inside* the sandbox by :meth:`Sandbox.self_test`. It
+# reports the guest's uid/gid, its effective capabilities, whether egress is
+# denied, and whether re-gaining a user namespace is blocked — the observable
+# signals of the isolation controls. It prints one JSON object as its last line.
+_SELFTEST_CODE = r"""
+import ctypes, json, os, socket
+report = {'uid': os.getuid(), 'gid': os.getgid()}
+caps = -1
+try:
+    with open('/proc/self/status') as fh:
+        for line in fh:
+            if line.startswith('CapEff:'):
+                caps = int(line.split()[1], 16)
+                break
+except OSError:
+    pass
+report['cap_eff'] = caps
+try:
+    socket.create_connection(('1.1.1.1', 443), timeout=3).close()
+    report['egress'] = True
+except OSError:
+    report['egress'] = False
+libc = ctypes.CDLL(None, use_errno=True)
+report['userns_reblocked'] = libc.unshare(0x10000000) != 0  # CLONE_NEWUSER
+print(json.dumps(report))
+"""
 
 
 @dataclasses.dataclass
@@ -252,6 +291,48 @@ class Sandbox:
         env['POSTERN_HATCH'] = _GUEST_SOCK
         with self._hatch.accepting():
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
+
+    def self_test(self, *, timeout: float = 30) -> dict[str, typing.Any]:
+        """Launch an in-sandbox probe and return its isolation report.
+
+        The report has ``uid``/``gid``/``cap_eff`` (effective capabilities, 0 ==
+        fully unprivileged), ``egress`` (True if an outbound connection
+        succeeded — it must not), and ``userns_reblocked`` (True if the guest was
+        refused a fresh user namespace). This only *observes*; :meth:`verify`
+        turns the report into a fail-closed gate. Raises :class:`IsolationError`
+        if the probe cannot run or emits no report.
+        """
+        result = self.run_python(_SELFTEST_CODE, timeout=timeout)
+        if not result.ok:
+            detail = result.stderr.strip() or result.returncode
+            raise IsolationError(f'isolation self-test probe failed to run: {detail}')
+        try:
+            return json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError) as exc:
+            raise IsolationError(f'isolation self-test emitted no report (stdout={result.stdout!r})') from exc
+
+    def verify(self) -> None:
+        """Fail closed unless every load-bearing isolation control is enforced.
+
+        Intended as a boot-time gate: call once at worker startup against the
+        profile you will serve with, and refuse to run untrusted code if it
+        raises. It converts the silent-degradation risks (F1: no user namespace /
+        real-root guest; F5: open egress; F4: seccomp that is a no-op on this
+        architecture) into a hard :class:`IsolationError` at startup instead of a
+        weakened sandbox that looks healthy.
+        """
+        problems: list[str] = []
+        if self._profile.seccomp and not _seccomp.arch_is_covered():
+            problems.append(
+                f'seccomp filter carries no program for this architecture ({platform.machine()!r}); it enforces nothing'
+            )
+        report = self.self_test()
+        if report.get('egress') is not False:
+            problems.append('network egress is not denied (the empty netns did not take effect)')
+        if self._profile.seccomp and report.get('userns_reblocked') is not True:
+            problems.append('guest was able to create a new user namespace (seccomp is not enforcing)')
+        if problems:
+            raise IsolationError('isolation self-test failed: ' + '; '.join(problems))
 
     def close(self) -> None:
         """Remove the workspace if this Sandbox created it (a no-op for a caller-owned path)."""

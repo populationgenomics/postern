@@ -20,10 +20,30 @@ requires regenerating the blob — see ``tools/gen_seccomp.sh``.
 from __future__ import annotations
 
 import importlib.resources
+import platform
 import tempfile
 import typing
 
 _BPF_RESOURCE = '_seccomp.bpf'
+
+# The machine architectures the committed blob actually carries a program for
+# (the ``uname -m`` names for ``tools/gen_seccomp._ARCHES``). On anything else
+# the filter's default-allow makes it a silent no-op, so a caller that relies on
+# the backstop must treat an uncovered arch as fail-closed rather than trusting a
+# filter that enforces nothing — see ``Sandbox.verify``.
+COVERED_ARCHES: frozenset[str] = frozenset(
+    {'x86_64', 'amd64', 'i386', 'i486', 'i586', 'i686', 'aarch64', 'arm64', 'armv6l', 'armv7l', 'armv8l', 'arm'}
+)
+
+
+def arch_is_covered(machine: str | None = None) -> bool:
+    """Whether the committed filter carries a program for ``machine``.
+
+    Defaults to the running host's ``platform.machine()``. False means the blob
+    would load but enforce nothing here (default-allow no-op).
+    """
+    return (machine or platform.machine()).lower() in COVERED_ARCHES
+
 
 # Blocked with EPERM: escape-enabling or dangerous syscalls the guest never
 # legitimately needs. (Flatpak's main blocklist plus its non-devel additions —

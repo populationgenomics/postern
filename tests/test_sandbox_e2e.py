@@ -6,7 +6,7 @@ path is exercised by the standalone example against a real venv on a Linux host.
 
 import pytest
 
-from postern import Sandbox, SandboxProfile, available
+from postern import IsolationError, Sandbox, SandboxProfile, available
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
 
@@ -55,6 +55,24 @@ def test_network_is_denied():
     assert result.ok
     assert 'CONNECTED' not in result.stdout
     assert 'no-egress' in result.stdout
+
+
+def test_self_test_reports_isolation():
+    report = Sandbox().self_test()
+    assert report['egress'] is False  # empty netns denies egress
+    assert report['userns_reblocked'] is True  # seccomp refuses CLONE_NEWUSER
+    assert report['cap_eff'] == 0  # --cap-drop ALL left no effective capabilities
+
+
+def test_verify_passes_on_the_hardened_profile():
+    Sandbox().verify()  # must not raise on a correctly-configured sandbox
+
+
+def test_verify_fails_closed_without_seccomp():
+    # With seccomp off the guest can re-gain a user namespace, so the boot-time
+    # gate must refuse to serve rather than silently run weaker isolation.
+    with pytest.raises(IsolationError, match='user namespace'):
+        Sandbox(SandboxProfile(seccomp=False)).verify()
 
 
 def test_host_filesystem_not_visible():

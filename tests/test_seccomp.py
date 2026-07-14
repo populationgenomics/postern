@@ -26,3 +26,14 @@ def test_socket_not_blocked():
     # empty netns's job, not seccomp's.
     assert 'socket' not in _seccomp.BLOCKED_EPERM
     assert 'socket' not in _seccomp.BLOCKED_ENOSYS
+
+
+def test_arch_is_covered_recognises_supported_and_rejects_others():
+    # The blob carries programs for x86 and ARM families; anything else is a
+    # default-allow no-op the caller must treat as fail-closed (F4).
+    assert _seccomp.arch_is_covered('x86_64')
+    assert _seccomp.arch_is_covered('AARCH64')  # case-insensitive
+    assert _seccomp.arch_is_covered('armv7l')
+    assert not _seccomp.arch_is_covered('mips64')
+    assert not _seccomp.arch_is_covered('riscv64')
+    assert not _seccomp.arch_is_covered('s390x')
