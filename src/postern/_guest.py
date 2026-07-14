@@ -18,6 +18,12 @@ def main() -> None:
     nproc = int(os.environ.get('POSTERN_NPROC') or 0)
     if nproc:
         resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
+    # Address-space backstop: a partial guard against a memory bomb starving the
+    # co-located trusted worker (F3). It is per-process, not a true total-memory
+    # bound — a cgroup memory.max set by the worker/deploy is the real fix.
+    as_bytes = int(os.environ.get('POSTERN_AS') or 0)
+    if as_bytes:
+        resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
     code = os.environ.get('POSTERN_CODE', '')
     exec(code, {'__name__': '__main__'})  # noqa: S102 — executing guest code is the whole point
 

@@ -81,6 +81,22 @@ def test_verify_fails_closed_without_seccomp():
         Sandbox(SandboxProfile(seccomp=False)).verify()
 
 
+def test_rlimit_as_caps_guest_memory():
+    # A 256 MiB address-space cap makes a larger allocation fail inside the
+    # guest, without killing the co-located worker (F3 backstop).
+    profile = SandboxProfile(rlimit_as=256 * 1024 * 1024)
+    code = (
+        'try:\n'
+        "    b = bytearray(512 * 1024 * 1024); print('ALLOCATED', len(b))\n"
+        'except MemoryError:\n'
+        "    print('capped')\n"
+    )
+    result = Sandbox(profile).run_python(code)
+    assert result.ok, result.stderr
+    assert 'capped' in result.stdout
+    assert 'ALLOCATED' not in result.stdout
+
+
 def test_host_filesystem_not_visible():
     result = Sandbox().run_python("open('/etc/passwd').read()")
     assert not result.ok  # /etc is not bound into the guest

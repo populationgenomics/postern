@@ -132,6 +132,12 @@ class SandboxProfile:
         env: Environment for the guest (``--clearenv`` wipes everything first).
         seccomp: Load the syscall denylist.
         rlimit_nproc: Per-run process-count cap (fork-bomb backstop).
+        rlimit_as: Per-process address-space cap in bytes (memory-bomb backstop),
+            applied by the guest shim. ``None`` leaves it unlimited. This is a
+            *partial* guard — it bounds one process, not the guest's total
+            memory; a cgroup ``memory.max`` set by the worker/deploy is the real
+            isolation from the co-located trusted worker (F3). Leave it unset for
+            legitimately memory-hungry workloads and rely on the cgroup.
         guest_uid: uid the guest runs as (``--uid``). Defaults to ``65534``
             (nobody) so the guest is **non-root inside its user namespace** —
             defusing a seccomp-gap namespace/cap re-acquisition (F2) and, when
@@ -153,6 +159,7 @@ class SandboxProfile:
     env: dict[str, str] = dataclasses.field(default_factory=lambda: {'PATH': '/usr/local/bin:/usr/bin:/bin'})
     seccomp: bool = True
     rlimit_nproc: int = 1024
+    rlimit_as: int | None = None
     guest_uid: int | None = 65534
     guest_gid: int | None = 65534
 
@@ -312,7 +319,12 @@ class Sandbox:
         ``RLIMIT_NPROC`` before running the code.
         """
         binds = ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
-        env = {'POSTERN_CODE': code, 'POSTERN_NPROC': str(self._profile.rlimit_nproc), 'POSTERN_HATCH': ''}
+        env = {
+            'POSTERN_CODE': code,
+            'POSTERN_NPROC': str(self._profile.rlimit_nproc),
+            'POSTERN_AS': str(self._profile.rlimit_as or 0),
+            'POSTERN_HATCH': '',
+        }
         argv = [self._profile.python, '-u', _GUEST_SHIM]
         if self._hatch is None:
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
