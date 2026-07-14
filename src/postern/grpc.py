@@ -98,6 +98,12 @@ class GrpcHatch:
         if not self._started:
             self._server.start()
             self._started = True
+            # Deterministic socket perms, not umask-dependent (F9). The guest
+            # runs as a non-root uid, so it must be able to connect; host-side
+            # isolation rests on the 0700 mkdtemp dir above, which keeps other
+            # host users from reaching the socket at all.
+            with contextlib.suppress(OSError):
+                os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
 
     @contextlib.contextmanager
     def accepting(self) -> Generator[GrpcHatch, None, None]:
