@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postern"
+version = "0.1.0"
+description = "Run untrusted Python in an OS-isolated sandbox whose only exit is a set of host-defined, typed calls."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Centre for Population Genomics" }]
+keywords = ["sandbox", "bubblewrap", "isolation", "untrusted-code", "seccomp", "rpc", "agent", "tool-use"]
+# The core has NO runtime dependencies — pure stdlib (subprocess, socket, json),
+# bubblewrap at the OS layer. gRPC hatch and provider adapters are extras.
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Security",
+    "Topic :: Software Development :: Interpreters",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+# The gRPC hatch: serve any grpc.aio servicer over the sandbox UDS, method-allowlisted.
+grpc = ["grpcio>=1.60"]
+
+[project.urls]
+Repository = "https://github.com/populationgenomics/postern"
+Issues = "https://github.com/populationgenomics/postern/issues"
+
+# Supply-chain age gate: never resolve a release younger than 7 days (relative,
+# in-repo so CI and contributors inherit it).
+[tool.uv]
+exclude-newer = "7 days"
+
+[dependency-groups]
+test = ["pytest"]
+lint = ["ruff", "pyright", "pytest", "pre-commit"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+postern = ["py.typed", "_seccomp.bpf"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = [
+    "A", "B", "C", "D", "E", "F", "G", "I", "N", "Q", "S", "W",
+    "ANN", "ARG", "BLE", "COM", "DTZ", "ERA", "EXE", "ICN", "ISC",
+    "PGH", "PIE", "PL", "PT", "PYI", "RET", "RSE", "RUF",
+    "SIM", "SLF", "T10", "TID", "UP", "YTT",
+]
+fixable = ["ALL"]
+ignore = [
+    "COM812",
+    "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",
+    "ISC001",
+    "PLR0913",
+    "PLR2004",
+    "Q000", "Q003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The in-sandbox shim is stdlib-only, dynamic (host.<attr> dispatch), run as a
+# script and never imported by the package — held to correctness, not API rigor.
+"src/postern/_guest.py" = ["T201", "BLE001", "ANN", "D", "SLF001"]
+"src/postern/_sandbox.py" = ["S603"]
+"tests/**" = ["S101", "S102", "S603", "S607", "SLF001", "ANN", "D", "PLR2004", "T201"]
+# Runnable examples: gRPC servicer methods are PascalCase; print is the UI; no
+# package __init__; they import generated stubs not present at lint time.
+"examples/**" = ["N802", "T201", "ANN", "D", "S", "INP001", "ARG"]
+# Build-time tooling (not shipped): imports libseccomp, prints, no package init.
+"tools/**" = ["T201", "ANN", "D", "S", "INP001", "E402", "SLF001"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests"]
+exclude = ["**/__pycache__", "src/postern/_guest.py"]
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
