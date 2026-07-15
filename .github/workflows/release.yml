@@ -1,0 +1,49 @@
+name: release
+
+# Publishes to PyPI via Trusted Publishing (OIDC) — no API token. The PyPI
+# project's trusted publisher must reference this repo, this workflow filename,
+# and the `pypi` environment. Triggered on a published GitHub Release; the tag
+# must match the package version (guarded below).
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      # Publishing a version is irreversible, so fail loudly if the release tag
+      # (vX.Y.Z) doesn't match the version in pyproject.toml.
+      - name: Check tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(uv version --short)"
+          if [ "$tag" != "$pkg" ]; then
+            echo "Release tag '$GITHUB_REF_NAME' does not match package version '$pkg'"
+            exit 1
+          fi
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # The trusted-publisher and OIDC scope both key off this environment name.
+    environment: pypi
+    permissions:
+      id-token: write # mint the OIDC token PyPI exchanges for an upload token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

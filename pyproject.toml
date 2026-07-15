@@ -17,6 +17,10 @@ dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Topic :: Security",
@@ -37,9 +41,14 @@ Issues = "https://github.com/populationgenomics/postern/issues"
 [tool.uv]
 exclude-newer = "7 days"
 
+# grpcio (the `grpc` extra) is in the dev groups so the hatch tests run and
+# pyright resolves postern.grpc + the hatch tests; consumers opt in via the
+# `grpc` extra.
 [dependency-groups]
-test = ["pytest"]
-lint = ["ruff", "pyright", "pytest", "pre-commit"]
+test = ["pytest", "grpcio>=1.60"]
+# typing-extensions: type-check-only backport of typing.Self for the 3.10 floor
+# (see src/postern/_sandbox.py) — not a runtime dependency.
+lint = ["ruff", "pyright", "pre-commit", "pytest", "grpcio>=1.60", "typing-extensions"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -90,9 +99,9 @@ convention = "google"
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 
 [tool.pyright]
-pythonVersion = "3.11"
-venvPath = "."
-venv = ".venv"
+# Check against the floor of requires-python; run via `uv run --group lint` so
+# the uv-managed environment supplies the imports.
+pythonVersion = "3.10"
 include = ["src", "tests"]
 exclude = ["**/__pycache__", "src/postern/_guest.py"]
 typeCheckingMode = "standard"

@@ -31,6 +31,11 @@ from collections.abc import Sequence
 
 from postern import _seccomp
 
+if typing.TYPE_CHECKING:
+    # `typing.Self` is 3.11+, but postern supports 3.10; the backport is
+    # type-check-only (guarded here), so the runtime stays dependency-free.
+    from typing_extensions import Self
+
 _GUEST_DIR = '/run/postern'
 _GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
@@ -336,7 +341,7 @@ class Sandbox:
         if self._own_workspace:
             shutil.rmtree(self._workspace, ignore_errors=True)
 
-    def __enter__(self) -> typing.Self:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:

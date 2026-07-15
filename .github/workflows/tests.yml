@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize]
+  push:
+    branches: [main]
+
+jobs:
+  pytest:
+    # Skip draft PRs.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      # The sandbox e2e tests need bubblewrap. ubuntu-latest is 24.04, which
+      # restricts unprivileged user namespaces via AppArmor (bwrap symptom:
+      # "loopback: Failed RTM_NEWADDR: Operation not permitted"); lift it — Cloud
+      # Run gen2 (the deploy target) has no such restriction. The hatch e2e tests
+      # run the guest against the host /usr with the *system* interpreter, so
+      # grpcio must be importable there (the uv env that runs pytest is not bound
+      # into the sandbox). --no-deps: grpcio core has no Python runtime deps, and
+      # this avoids pip failing to upgrade Debian-managed packages.
+      - run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap python3-pip
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo /usr/bin/python3 -m pip install --break-system-packages --no-deps grpcio
+      - run: uv sync --locked --group test --python ${{ matrix.python-version }}
+      - run: uv run pytest -q
+
+  seccomp-drift:
+    # Authoritative F4 check: regenerate the blob from the syscall lists with
+    # libseccomp and fail if the committed _seccomp.bpf / _seccomp.spec differ.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          sudo apt-get update && sudo apt-get install -y python3 python3-seccomp
+          python3 tools/gen_seccomp.py
+      - name: Fail on drift
+        run: |-
+          if ! git diff --exit-code -- src/postern/_seccomp.bpf src/postern/_seccomp.spec; then
+            echo '::error::_seccomp.bpf/_seccomp.spec are stale — run tools/gen_seccomp.sh and commit the result'
+            exit 1
+          fi
