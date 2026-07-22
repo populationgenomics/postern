@@ -151,6 +151,23 @@ class SandboxProfile:
         return cls(python=str(path / 'bin' / 'python'), ro_binds=binds, **kwargs)
 
 
+def bwrap_env() -> dict[str, str]:
+    """Environment for the *bwrap process itself* — scrubbed to PATH alone.
+
+    ``--clearenv``/``--setenv`` define the *guest's* environment; they do not
+    touch bwrap's own process image. bwrap is PID 1 in the guest's PID namespace
+    and (because ``--uid`` is applied to it too) runs at the guest's uid, so
+    whatever bwrap inherited is readable from inside the jail via
+    ``/proc/1/environ`` — a same-uid ``ptrace_may_access`` read that no namespace
+    or capability drop prevents. The trusted worker's environment holds the live
+    secrets the hatch exists to keep from the guest (session tokens, API keys,
+    backend URLs), so bwrap must be exec'd with none of them: postern does not
+    trust the worker to have pre-scrubbed its own environment. Only ``PATH``
+    survives, so bare ``bwrap`` still resolves.
+    """
+    return {'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}
+
+
 def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str]:
     """The bwrap flags for ``profile`` (excluding the trailing ``-- argv``)."""
     root = str(profile.rootfs) if profile.rootfs is not None else ''
@@ -270,6 +287,10 @@ class Sandbox:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                # Scrub bwrap's own environment: it is PID 1 in the guest's
+                # namespace at the guest uid, so an inherited secret would be
+                # readable from inside via /proc/1/environ (see bwrap_env).
+                env=bwrap_env(),
                 pass_fds=(fd,) if fd is not None else (),
             )
             try:

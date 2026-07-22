@@ -57,6 +57,19 @@ def test_network_is_denied():
     assert 'no-egress' in result.stdout
 
 
+def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
+    # bwrap is PID 1 in the guest's PID namespace and (because --uid applies to
+    # it too) runs at the guest uid, so its /proc/1/environ is a same-uid read
+    # from inside the jail. --clearenv only scrubs the *guest's* env, not bwrap's
+    # own image, so a secret inherited from the trusted worker would leak here.
+    # The launcher must exec bwrap with a scrubbed environment.
+    monkeypatch.setenv('WORKER_SESSION_TOKEN', 'worker-SECRET-should-not-leak')
+    code = 'data = open("/proc/1/environ", "rb").read()\nprint("LEAK" if b"SECRET" in data else "clean")\n'
+    result = Sandbox().run_python(code)
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == 'clean'
+
+
 def test_guest_runs_as_non_root_by_default():
     result = Sandbox().run_python('import os; print(os.getuid(), os.getgid())')
     assert result.ok, result.stderr
