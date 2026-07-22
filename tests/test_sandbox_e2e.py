@@ -64,10 +64,44 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
     # own image, so a secret inherited from the trusted worker would leak here.
     # The launcher must exec bwrap with a scrubbed environment.
     monkeypatch.setenv('WORKER_SESSION_TOKEN', 'worker-SECRET-should-not-leak')
-    code = 'data = open("/proc/1/environ", "rb").read()\nprint("LEAK" if b"SECRET" in data else "clean")\n'
+    # No secret must reach the guest via PID 1 — whether because bwrap's env is
+    # scrubbed or because --as-pid-1 makes PID 1 the guest's own non-dumpable init
+    # (so the read is denied outright). Either outcome is "clean".
+    code = (
+        'try:\n'
+        '    data = open("/proc/1/environ", "rb").read()\n'
+        '    print("LEAK" if b"SECRET" in data else "clean")\n'
+        'except OSError:\n'
+        "    print('clean')  # /proc/1 not even readable\n"
+    )
     result = Sandbox().run_python(code)
     assert result.ok, result.stderr
     assert result.stdout.strip() == 'clean'
+
+
+def test_pid1_is_the_guest_entrypoint_not_bwrap():
+    # --as-pid-1 runs the shim as PID 1, so there is no separate bwrap process in
+    # the namespace for the guest to read; the shim forks the guest (PID 2).
+    result = Sandbox().run_python('import os; print(os.getpid(), open("/proc/1/comm").read().strip())')
+    assert result.ok, result.stderr
+    pid, comm = result.stdout.split()
+    assert pid != '1'  # the guest is a child of the init, not PID 1 itself
+    assert comm != 'bwrap'  # PID 1 is our entrypoint, not a resident bwrap reaper
+
+
+def test_init_pid1_is_non_dumpable():
+    # The PID 1 init marks itself non-dumpable, so a co-uid guest cannot read its
+    # /proc/1 memory/environ/maps even though they share a uid.
+    code = (
+        'import os\n'
+        'try:\n'
+        '    open("/proc/1/environ", "rb").read(); print("READABLE")\n'
+        'except OSError as e:\n'
+        '    print("blocked", os.strerror(e.errno))\n'
+    )
+    result = Sandbox().run_python(code)
+    assert result.ok, result.stderr
+    assert result.stdout.startswith('blocked')
 
 
 def test_guest_runs_as_non_root_by_default():

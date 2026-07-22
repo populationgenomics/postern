@@ -52,6 +52,14 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
   `/workspace`; no `/etc`, `/home`, `/root`, or host application code;
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
   **`--die-with-parent`**, **`--clearenv`**;
+- **`--as-pid-1`** — the guest entrypoint *is* PID 1 of the guest's PID
+  namespace, so no resident bwrap process sits there for the guest to read. That
+  bwrap shared the guest uid, so its `/proc/1` (cmdline, maps, read/write mem,
+  and env) was reachable from inside; with the entrypoint as PID 1 there is no
+  such process. `run_python`'s shim then acts as a minimal init — it forks the
+  guest, reaps orphaned descendants, propagates the guest's exit status, and
+  marks *itself* `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot
+  read the init either;
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
   no capabilities inside its user namespace, and if the userns fails to
   materialise on a root host it still drops to a non-root real uid

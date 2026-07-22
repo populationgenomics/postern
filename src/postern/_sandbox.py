@@ -180,6 +180,14 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     # the strict ipc/pid/net/uts (and any namespace it gains in future versions).
     argv = ['bwrap', '--unshare-all', '--unshare-user', '--unshare-cgroup']
     argv += ['--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
+    # --as-pid-1 runs the entrypoint *as* PID 1 of the guest's PID namespace
+    # instead of leaving bwrap resident there as a reaper. That removes the one
+    # in-namespace process the guest neither owns nor can be denied by uid (bwrap
+    # shares the guest uid, so its /proc/1 — cmdline, maps, read/write mem, and
+    # historically environ — was reachable). With no separate bwrap PID 1, /proc/1
+    # is just the guest's own entrypoint. run_python's shim then acts as a minimal
+    # init (fork + reap); a raw run() entrypoint must tolerate being PID 1 itself.
+    argv += ['--as-pid-1']
     # Run the guest as a non-root uid/gid (F2): inside the userns it then holds
     # no capabilities to re-gain namespaces through a seccomp gap, and if the
     # userns silently fails to materialise (F1) a root host still drops to a
