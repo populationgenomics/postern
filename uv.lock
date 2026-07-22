@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [options]
-exclude-newer = "2026-07-08T06:43:48.93692Z"
+exclude-newer = "2026-07-15T06:34:20.310987Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -171,7 +171,7 @@ wheels = [
 
 [[package]]
 name = "postern"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
