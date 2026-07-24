@@ -133,7 +133,40 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 - `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`).
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534)` and `SandboxProfile.with_venv(venv, **kw)`. `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
+- `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f)`, `.restore_tar(f)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`.
 - `available()` — bubblewrap present?
+
+## Reading the workspace safely
+
+The workspace is the one writable surface the guest and host share, and it
+outlives the sandbox. Nothing stops the guest planting a reference that points
+*outside* it — `ln -s /proc/self/environ doc`, `ln -s / root`, a FIFO. Inside the
+jail these are inert; the danger is when the **host** later reads, tars, or
+restores the tree in its own namespace and privileges and becomes a confused
+deputy (exfiltrating its own secrets, or writing through the link to a host path).
+
+postern guarantees the workspace is **reference-closed**: read/pack/restore it
+through the host-side accessor and no guest-planted symlink, `..`, or special
+file is ever followed out of the tree — by construction, not by consumer
+vigilance.
+
+```python
+with sandbox.accessor() as ws:                 # or Workspace(some_dir)
+    report = ws.pack_tar(open('snap.tar', 'wb'))   # only regular files + dirs
+    # report.skipped is the audit trail of neutralized symlinks/FIFOs/…
+    ws.restore_tar(open('snap.tar', 'rb'))          # confined extraction
+    data = (ws / 'out' / 'result.json').read_bytes()
+```
+
+Every path resolves one component at a time with `O_NOFOLLOW` relative to a
+directory fd (the model is Go's `os.Root` / Rust's `cap-std::Dir`); the accessor
+never hands back a dereferenceable host path. It is pure stdlib and needs no
+mount privilege, so it runs on an unprivileged host (e.g. a Cloud Run container).
+A sticky world-writable workspace (`0o1777`) additionally stops the guest
+unlinking host-written files to swap in escaping symlinks. Consumers wedded to
+stock `tarfile` can pass `reference_closed_filter` to
+`TarFile.extractall(filter=...)`; `restore_tar` is stronger (it writes through
+the confined root) and reports what it neutralized.
 
 See `examples/e2e_greeter.py` for an end-to-end run (typed hatch call + pandas,
 verified on a Linux host).
@@ -153,7 +186,8 @@ Run gen2 provides the unprivileged user namespaces bubblewrap needs.
 ## Roadmap
 
 - **Checkpoint/restore** — a `Store` protocol + durable-glob workspace snapshots
-  for run-lived state continuity.
+  for run-lived state continuity, sitting on the reference-closed `Workspace`
+  accessor (`pack_tar`/`restore_tar`) so snapshots are safe by construction.
 - **`overlay=` profile mode** — emit `bwrap --ro-overlay` to stack layers with a
   tmpfs upper, instead of a single `--ro-bind` rootfs.
 - **Agent-runtime adapters** — drive the sandbox from Anthropic Managed Agents,
