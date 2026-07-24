@@ -47,6 +47,19 @@ def test_tmp_and_ephemeral_workspace_are_world_writable():
     assert argv[argv.index('/workspace') - 2] == '1777'
 
 
+def test_proc_sysctl_surface_masked_read_only():
+    # bwrap's fresh --proc re-exposes /proc/sys writable; a guest whose kernel uid
+    # maps to root then owns the global sysctls and escapes by writing
+    # core_pattern. The mask must be a read-only self-bind applied *after* --proc.
+    argv = build_base_argv(SandboxProfile(), seccomp_fd=None)
+    proc_at = argv.index('/proc')
+    for path in ('/proc/sys', '/proc/sysrq-trigger', '/proc/kcore'):
+        i = argv.index(path)
+        assert argv[i - 1] == '--ro-bind-try'
+        assert argv[i + 1] == path  # bound over itself, read-only
+        assert i > proc_at  # layered on top of the fresh procfs, not before it
+
+
 def test_bound_workspace(tmp_path):
     argv = build_base_argv(SandboxProfile(workspace=tmp_path), seccomp_fd=None)
     assert '--bind' in argv
