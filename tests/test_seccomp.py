@@ -21,6 +21,14 @@ def test_blocklist_covers_escape_syscalls():
         assert name in _seccomp.BLOCKED_EPERM
 
 
+def test_io_uring_blocked():
+    # io_uring is a recurring kernel-LPE surface and lets a guest perform
+    # filtered operations (openat, read, …) as ring entries that never re-enter
+    # this syscall filter, so the whole family is blocked.
+    for name in ('io_uring_setup', 'io_uring_enter', 'io_uring_register'):
+        assert name in _seccomp.BLOCKED_EPERM
+
+
 def test_new_mount_and_clone_apis_return_enosys():
     # ENOSYS (not EPERM) so glibc falls back to the classic paths.
     for name in ('clone3', 'fsopen', 'open_tree', 'move_mount'):

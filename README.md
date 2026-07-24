@@ -68,10 +68,15 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
   no capabilities inside its user namespace, and if the userns fails to
   materialise on a root host it still drops to a non-root real uid
-  (`SandboxProfile(guest_uid=None)` restores the legacy uid-0-in-userns);
+  (`SandboxProfile(guest_uid=None)` restores the legacy uid-0-in-userns). bwrap
+  maps `--uid` to its *own* real uid, so a root bwrap still gives the guest
+  kernel uid 0; `SandboxProfile(host_uid=…)` opts into running bwrap itself
+  non-root (defense in depth beyond the `/proc/sys` mask) — off by default
+  because the deploy must then make every bind source reachable by that uid;
 - a **seccomp denylist** blocking escape-enabling syscalls (`unshare`, `setns`,
-  `mount`, `ptrace`, `bpf`, `keyctl`, …). `socket` is deliberately *not* blocked
-  — network isolation is the netns's job, and the guest needs `socket(AF_UNIX)`
+  `mount`, `ptrace`, `bpf`, `keyctl`, `io_uring_setup`, …). `socket` is
+  deliberately *not* blocked — network isolation is the netns's job, and the
+  guest needs `socket(AF_UNIX)`
   for the hatch;
 - **`RLIMIT_NPROC`** as a fork-bomb backstop (set inside the guest), and an
   optional **`RLIMIT_AS`** memory backstop (`SandboxProfile(rlimit_as=...)`, off
@@ -136,7 +141,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 ## Public API
 
 - `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`).
-- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534)` and `SandboxProfile.with_venv(venv, **kw)`. `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
+- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` opts bwrap into running at a non-root real uid (defense in depth for the sysctl surface; the deploy must make bind sources reachable by it). `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).
 - `available()` — bubblewrap present?
