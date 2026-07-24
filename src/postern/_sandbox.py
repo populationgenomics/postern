@@ -45,6 +45,34 @@ _GUEST_WORKSPACE = '/workspace'
 _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
 _SYSTEM_DIRS = ('/usr', '/lib', '/lib64', '/bin', '/sbin')
 
+# bwrap's fresh `--proc /proc` is owned by the guest's user namespace and
+# discards the read-only /proc mask the container runtime applied. Because bwrap
+# runs at the host's real uid (root, under the Cloud Run gen2 posture) the guest's
+# kernel uid maps to 0, so it *owns* root's global sysctls (`0644`) and can write
+# them with no capability and no blocked syscall — writing `core_pattern` alone
+# yields arbitrary code execution as root in the initial namespace (a full host
+# escape). Re-mask the sysctl and other sensitive procfs surfaces read-only, as
+# every container runtime does. Each is bound read-only over *itself* with
+# `--ro-bind-try`, so a write anywhere on the surface is EROFS and a path absent
+# on this kernel is skipped rather than fatal (binding /dev/null over a missing
+# file can't work — bwrap can't create it on the read-only fresh proc). Read-only
+# is sufficient: this is a *write* escape, and the info-leak reads (/proc/kcore,
+# keyrings) need CAP_SYS_RAWIO/owner the cap-dropped guest does not have.
+_PROC_RO_PATHS = (
+    '/proc/sys',
+    '/proc/sysrq-trigger',
+    '/proc/irq',
+    '/proc/bus',
+    '/proc/fs',
+    '/proc/acpi',
+    '/proc/scsi',
+    '/proc/kcore',
+    '/proc/keys',
+    '/proc/latency_stats',
+    '/proc/timer_list',
+    '/proc/sched_debug',
+)
+
 
 class Hatch(typing.Protocol):
     """What `Sandbox` needs of a hatch: a UDS path and a serving context."""
@@ -210,10 +238,16 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     argv += ['--ro-bind-try', root + '/etc/ld.so.cache', '/etc/ld.so.cache']
     for host, guest in profile.ro_binds:
         argv += ['--ro-bind-try', host, guest]
+    argv += ['--proc', '/proc', '--dev', '/dev']
+    # Re-mask the sensitive procfs surfaces bwrap's fresh --proc re-exposes (see
+    # _PROC_RO_PATHS): without this a guest that owns the mapped-root sysctls
+    # escapes the host by writing core_pattern.
+    for path in _PROC_RO_PATHS:
+        argv += ['--ro-bind-try', path, path]
     # '/tmp' is the guest's in-sandbox mountpoint (a fresh tmpfs), not a host
     # path; '--perms 1777' gives it the sticky world-writable mode a non-root
     # guest needs (and that a real /tmp has anyway).
-    argv += ['--proc', '/proc', '--dev', '/dev', '--perms', '1777', '--tmpfs', '/tmp']  # noqa: S108
+    argv += ['--perms', '1777', '--tmpfs', '/tmp']  # noqa: S108
     if profile.workspace is not None:
         argv += ['--bind', str(profile.workspace), _GUEST_WORKSPACE]
     else:
