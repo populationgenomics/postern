@@ -119,9 +119,11 @@ class SandboxProfile:
             run as root, dropping to a non-root real uid even if the user
             namespace silently fails to materialise (F1's degraded case). The
             guest's ``/workspace`` and ``/tmp`` are made writable to suit; a
-            caller-owned ``workspace`` dir is chmod'd world-writable at launch so
-            the non-root guest can use it. ``None`` keeps the legacy uid-0-in-
-            userns behaviour.
+            caller-owned ``workspace`` dir is chmod'd *sticky* world-writable
+            (``0o1777``) at launch so the non-root guest can use it while the
+            sticky bit still stops it unlinking/replacing files it does not own
+            (e.g. swapping a host-written file for an escaping symlink). ``None``
+            keeps the legacy uid-0-in-userns behaviour.
         guest_gid: gid the guest runs as (``--gid``). Defaults to ``65534``.
             ``None`` leaves the gid unset.
     """
@@ -276,11 +278,18 @@ class Sandbox:
         if not available():
             raise RuntimeError('bubblewrap (bwrap) not found on PATH; postern requires Linux + bubblewrap')
         # A non-root guest cannot write a workspace dir owned by (and mode-locked
-        # to) the host user, so open it up. The dir is private to this single-
-        # tenant sandbox, so world-writable is immaterial (see F9).
+        # to) the host user, so open it up. Use the *sticky* world-writable mode
+        # (0o1777), matching the tmpfs branch's `--perms 1777`: without the sticky
+        # bit any uid can unlink/replace files it does not own, so the guest could
+        # delete a host-written file and recreate it as an escaping symlink among
+        # files it does not own. The sticky bit confines each uid to its own
+        # entries — defense in depth. It removes a *precondition* for the attack,
+        # not the whole fix: the guest can still plant escaping symlinks among
+        # files it legitimately owns, which is why the host must read/pack the
+        # workspace through a reference-closed accessor (a follow-up change).
         if self._profile.guest_uid not in (None, 0):
             with contextlib.suppress(OSError):
-                self._workspace.chmod(0o777)
+                self._workspace.chmod(0o1777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
         fd = seccomp.fileno() if seccomp is not None else None
         try:
