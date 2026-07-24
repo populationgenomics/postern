@@ -50,7 +50,22 @@ gate the host opens.
   read-write at `/workspace` (the guest cwd). Persists for the Sandbox's
   lifetime and is readable from the host between runs (the seam a future
   checkpoint/restore **Store** would sit behind). An ephemeral workspace is a
-  private temp dir removed on `close()`.
+  private temp dir removed on `close()`. The `Workspace` *accessor*
+  (`Sandbox.accessor()`) is also the reference-closed host-side handle to that
+  directory — see **reference-closure**.
+
+- **Reference-closure** — the invariant that every path the guest can create in
+  the workspace resolves, in *any* namespace (including the host's, including
+  after the sandbox exits), only to a target within the workspace, or it fails.
+  The guest can plant escaping references (a symlink to `/proc/self/environ`,
+  `root -> /`, a FIFO) that are inert in the jail but turn the host into a
+  confused deputy when it reads/tars/restores the tree. postern enforces closure
+  with a **confined root** — `Workspace` (the capability, modelled on Go's
+  `os.Root`) and `WorkspacePath` (its `pathlib`-like facade) — that resolves
+  every component with `O_NOFOLLOW` and never exposes a dereferenceable host
+  path, so consumers get "read/pack/restore this workspace safely" as an API
+  instead of reimplementing confinement. A sticky world-writable workspace and
+  `reference_closed_filter` (for stock `tarfile`) are the supporting defenses.
 
 - **Rootfs** — a curated base directory bound as the guest's `/usr`, `/lib`, …
   *instead of* the host's, hiding the host userland entirely. Assembled at

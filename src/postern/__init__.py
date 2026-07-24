@@ -26,6 +26,13 @@ from __future__ import annotations
 import importlib.metadata
 
 from postern._sandbox import IsolationError, ProcResult, Sandbox, SandboxProfile, available
+from postern._workspace import (
+    Workspace,
+    WorkspaceError,
+    WorkspacePath,
+    WorkspaceReport,
+    reference_closed_filter,
+)
 
 try:
     __version__ = importlib.metadata.version('postern')
@@ -33,4 +40,16 @@ except importlib.metadata.PackageNotFoundError:
     # Running from a source tree without an install.
     __version__ = '0.0.0+unknown'
 
-__all__ = ['IsolationError', 'ProcResult', 'Sandbox', 'SandboxProfile', '__version__', 'available']
+__all__ = [
+    'IsolationError',
+    'ProcResult',
+    'Sandbox',
+    'SandboxProfile',
+    'Workspace',
+    'WorkspaceError',
+    'WorkspacePath',
+    'WorkspaceReport',
+    '__version__',
+    'available',
+    'reference_closed_filter',
+]
