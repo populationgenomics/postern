@@ -1,6 +1,6 @@
 import pathlib
 
-from postern._sandbox import SandboxProfile, build_base_argv
+from postern._sandbox import SandboxProfile, build_base_argv, bwrap_credentials
 
 
 def test_hardened_flags_present():
@@ -58,6 +58,27 @@ def test_proc_sysctl_surface_masked_read_only():
         assert argv[i - 1] == '--ro-bind-try'
         assert argv[i + 1] == path  # bound over itself, read-only
         assert i > proc_at  # layered on top of the fresh procfs, not before it
+
+
+def test_bwrap_credentials_no_drop_by_default():
+    # host_uid unset: no privilege drop (the /proc/sys mask is the default fix,
+    # and dropping needs the deploy to make bind sources reachable).
+    assert bwrap_credentials(SandboxProfile(), euid=0) == {}
+    assert bwrap_credentials(SandboxProfile(), euid=1000) == {}
+
+
+def test_bwrap_credentials_opt_in_when_root():
+    # host_uid set + we are root: run bwrap non-root, dropping supplementary groups.
+    creds = bwrap_credentials(SandboxProfile(host_uid=65534), euid=0)
+    assert creds == {'user': 65534, 'group': 65534, 'extra_groups': []}
+    # host_gid overrides; falls back to guest_gid otherwise.
+    creds = bwrap_credentials(SandboxProfile(host_uid=100000, host_gid=100000, guest_gid=65534), euid=0)
+    assert creds == {'user': 100000, 'group': 100000, 'extra_groups': []}
+
+
+def test_bwrap_credentials_ignored_when_not_root():
+    # Cannot setuid unless root; bwrap then runs at our (already non-root) uid.
+    assert bwrap_credentials(SandboxProfile(host_uid=65534), euid=1000) == {}
 
 
 def test_bound_workspace(tmp_path):

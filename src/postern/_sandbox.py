@@ -158,6 +158,21 @@ class SandboxProfile:
             keeps the legacy uid-0-in-userns behaviour.
         guest_gid: gid the guest runs as (``--gid``). Defaults to ``65534``.
             ``None`` leaves the gid unset.
+        host_uid: opt-in defense in depth — the *real* uid bwrap runs as when the
+            worker started as root. bwrap maps the guest's ``--uid`` to its own
+            real uid, so a root bwrap gives the guest **kernel** uid 0, which owns
+            root's files by DAC. Setting ``host_uid`` runs bwrap non-root, so the
+            guest's kernel uid owns none of root's files (belt to the ``/proc/sys``
+            mask's braces). As root any uid works with no ``newuidmap``/
+            ``/etc/subuid``; point it at a **dedicated uid that owns no host
+            file** for the tightest mapping. ``None`` (default) does not drop —
+            the always-on ``/proc/sys`` mask is what closes the escape, and
+            dropping requires the deploy to make every bind source (the workspace
+            **and its parents**, the hatch socket's dir, the rootfs) reachable by
+            ``host_uid``, so it is off unless the operator arranges that. Ignored
+            when the worker is already non-root.
+        host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
+            reuses ``guest_gid``.
     """
 
     workspace: pathlib.Path | None = None
@@ -171,6 +186,8 @@ class SandboxProfile:
     rlimit_as: int | None = None
     guest_uid: int | None = 65534
     guest_gid: int | None = 65534
+    host_uid: int | None = None
+    host_gid: int | None = None
 
     @classmethod
     def with_venv(cls, venv: str | pathlib.Path, **kwargs: typing.Any) -> SandboxProfile:  # noqa: ANN401
@@ -200,6 +217,33 @@ def bwrap_env() -> dict[str, str]:
     survives, so bare ``bwrap`` still resolves.
     """
     return {'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}
+
+
+def bwrap_credentials(profile: SandboxProfile, euid: int) -> dict[str, typing.Any]:
+    """`Popen` uid/gid kwargs to run bwrap at a non-root real uid (opt-in).
+
+    bwrap maps the guest's ``--uid`` to its own real uid, so a root bwrap gives
+    the guest kernel uid 0 — which owns root's files by DAC. Running bwrap at a
+    non-root uid instead makes the guest's kernel uid non-root, so a re-exposed
+    root-owned surface is unwritable by ownership as well as by the ``/proc/sys``
+    mask (defense in depth). ``extra_groups=[]`` drops root's supplementary
+    groups too.
+
+    Opt-in via ``host_uid`` because bwrap, now unprivileged, must be able to
+    *reach* every bind source: the workspace **and its parent directories**, the
+    hatch socket's directory, and the rootfs must be traversable/readable by
+    ``host_uid`` (a caller-owned workspace under a ``0700`` home, or the hatch
+    socket in a private dir, otherwise fails with ``Permission denied``). Empty
+    (no drop) when ``host_uid`` is unset or we are not root — the always-on
+    ``/proc/sys`` mask is what closes the escape by default.
+    """
+    if euid != 0 or profile.host_uid is None:
+        return {}
+    creds: dict[str, typing.Any] = {'user': profile.host_uid, 'extra_groups': []}
+    gid = profile.host_gid if profile.host_gid is not None else profile.guest_gid
+    if gid is not None:
+        creds['group'] = gid
+    return creds
 
 
 def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str]:
@@ -359,6 +403,10 @@ class Sandbox:
                 # readable from inside via /proc/1/environ (see bwrap_env).
                 env=bwrap_env(),
                 pass_fds=(fd,) if fd is not None else (),
+                # Run bwrap at a non-root real uid when we are root, so the
+                # guest's kernel uid (which bwrap maps --uid onto) is non-root and
+                # owns none of root's files (see bwrap_credentials).
+                **bwrap_credentials(self._profile, os.geteuid()),
             )
             try:
                 out, err = proc.communicate(timeout=timeout)

@@ -93,6 +93,13 @@ BLOCKED_EPERM: tuple[str, ...] = (
     'reboot',
     'swapon',
     'swapoff',
+    # io_uring: a recurring kernel-LPE surface, and a submission interface that
+    # performs operations (openat, read, …) as ring entries which never pass back
+    # through this syscall filter — so leaving it open would let a guest do
+    # filtered operations out-of-band. The guest has no need for it.
+    'io_uring_setup',
+    'io_uring_enter',
+    'io_uring_register',
 )
 
 # Blocked with ENOSYS (not EPERM): clone3 and the new mount API. seccomp cannot
