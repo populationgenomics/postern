@@ -49,7 +49,12 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
   variants), so a host that can't provide a user namespace is a hard launch
   failure rather than a silent fall-through to a real-root guest;
 - **surgical filesystem** — read-only base system dirs + one writable
-  `/workspace`; no `/etc`, `/home`, `/root`, or host application code;
+  `/workspace`; no `/etc`, `/home`, `/root`, or host application code. bwrap's
+  fresh `--proc` re-exposes the procfs sysctl surface writable and discards the
+  runtime's mask, so `/proc/sys` (and `/proc/sysrq-trigger`, `/proc/irq`,
+  `/proc/kcore`, …) are re-masked read-only — without it a guest whose mapped
+  kernel uid is root can write `core_pattern`/`modprobe` and gain init-namespace
+  root (a full host escape);
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
   **`--die-with-parent`**, **`--clearenv`**;
 - **`--as-pid-1`** — the guest entrypoint *is* PID 1 of the guest's PID
