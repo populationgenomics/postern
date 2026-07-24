@@ -85,6 +85,11 @@ ignore = [
 # script and never imported by the package — held to correctness, not API rigor.
 "src/postern/_guest.py" = ["T201", "BLE001", "ANN", "D", "SLF001"]
 "src/postern/_sandbox.py" = ["S603"]
+# Workspace (the confined-root capability) and WorkspacePath (its pathlib-like
+# facade) are one cohesive deep module: the facade delegates to the capability's
+# internal confined primitives (_lstat/_open_dir/…), so intra-module private
+# access between the two is by design, not a leak.
+"src/postern/_workspace.py" = ["SLF001"]
 "tests/**" = ["S101", "S102", "S603", "S607", "SLF001", "ANN", "D", "PLR2004", "T201"]
 # Runnable examples: gRPC servicer methods are PascalCase; print is the UI; no
 # package __init__; they import generated stubs not present at lint time.

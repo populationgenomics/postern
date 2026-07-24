@@ -30,6 +30,7 @@ import typing
 from collections.abc import Sequence
 
 from postern import _seccomp
+from postern._workspace import Workspace
 
 if typing.TYPE_CHECKING:
     # `typing.Self` is 3.11+, but postern supports 3.10; the backport is
@@ -88,9 +89,12 @@ class SandboxProfile:
     Attributes:
         workspace: Host directory bound read-write at ``/workspace`` (the guest's
             cwd), persisting across calls for the Sandbox's lifetime and readable
-            from the host (e.g. to checkpoint). ``None`` makes the Sandbox create
-            a private temp dir (removed on ``close()``); pass a path to own its
-            location and lifetime.
+            from the host (e.g. to checkpoint). Read/pack/restore it through
+            :meth:`Sandbox.accessor` (a reference-closed :class:`~postern.Workspace`)
+            rather than ``os``/``tarfile`` directly, so a guest-planted symlink or
+            special file is never followed out of the tree. ``None`` makes the
+            Sandbox create a private temp dir (removed on ``close()``); pass a path
+            to own its location and lifetime.
         rootfs: A curated base directory whose ``/usr``, ``/lib`` … are bound as
             the guest's system dirs. ``None`` binds the *host's* system dirs —
             convenient for dev but exposes the host userland read-only; point at
@@ -267,6 +271,18 @@ class Sandbox:
         """The host directory bound read-write at ``/workspace`` (the guest cwd)."""
         return self._workspace
 
+    def accessor(self) -> Workspace:
+        """A reference-closed :class:`~postern.Workspace` over the workspace.
+
+        Read, pack, or restore the guest's workspace through this instead of
+        `os`/`tarfile`/`shutil` directly: every access is confined beneath the
+        workspace, so a guest-planted symlink, ``..`` or special file is never
+        followed out of the tree. Usable while the Sandbox lives and after it
+        (the returned accessor only needs the directory path). Use it as a
+        context manager, or call ``.close()``, to release its anchor fd.
+        """
+        return Workspace(self._workspace)
+
     def _launch(
         self,
         argv: list[str],
@@ -286,7 +302,7 @@ class Sandbox:
         # entries — defense in depth. It removes a *precondition* for the attack,
         # not the whole fix: the guest can still plant escaping symlinks among
         # files it legitimately owns, which is why the host must read/pack the
-        # workspace through a reference-closed accessor (a follow-up change).
+        # workspace through the reference-closed accessor (:meth:`accessor`).
         if self._profile.guest_uid not in (None, 0):
             with contextlib.suppress(OSError):
                 self._workspace.chmod(0o1777)
