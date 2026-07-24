@@ -232,3 +232,111 @@ def test_reference_closed_filter_used_by_stock_extractall(tmp_path):
     buf = _malicious_tar()
     with tarfile.open(fileobj=buf) as tar, pytest.raises(WorkspaceError):
         tar.extractall(dest, filter=reference_closed_filter)  # noqa: S202
+
+
+def test_pack_tar_neutralizes_escaping_hardlink(ws_dir, secret):
+    # A hardlink inside the workspace to a file OUTSIDE it: the inode is also
+    # named outside, so its content is shared out of bounds. pack must not copy
+    # it out, and must record the neutralization (never silent).
+    os.link(str(secret), ws_dir / 'innocent.txt')  # secret nlink 1 -> 2
+    (ws_dir / 'real.txt').write_text('legit')
+    buf = io.BytesIO()
+    with Workspace(ws_dir) as ws:
+        report = ws.pack_tar(buf)
+    assert b'TOP-SECRET-HOST-TOKEN' not in buf.getvalue()
+    assert dict(report.skipped).get('innocent.txt') == 'hardlink'
+    buf.seek(0)
+    with tarfile.open(fileobj=buf) as tar:
+        names = {m.name for m in tar.getmembers()}
+    assert 'real.txt' in names
+    assert 'innocent.txt' not in names
+
+
+def test_pack_tar_keeps_internal_hardlink(ws_dir):
+    # Two names inside the workspace for one inode: fully accounted for within
+    # the tree, so it is safe and both are packed.
+    (ws_dir / 'a.txt').write_text('shared')
+    os.link(ws_dir / 'a.txt', ws_dir / 'b.txt')
+    buf = io.BytesIO()
+    with Workspace(ws_dir) as ws:
+        report = ws.pack_tar(buf)
+    assert report.ok
+    buf.seek(0)
+    with tarfile.open(fileobj=buf) as tar:
+        names = {m.name for m in tar.getmembers()}
+    assert {'a.txt', 'b.txt'} <= names
+
+
+def test_pack_tar_exclude_prunes_subtree(ws_dir):
+    (ws_dir / 'keep.txt').write_text('keep')
+    (ws_dir / 'document.md').write_text('doc')
+    skills = ws_dir / 'skills'
+    skills.mkdir()
+    (skills / 'x.py').write_text('code')
+    buf = io.BytesIO()
+    with Workspace(ws_dir) as ws:
+        # Exclude only the dir itself; its children must be pruned too.
+        ws.pack_tar(buf, exclude=lambda p: p in ('document.md', 'skills'))
+    buf.seek(0)
+    with tarfile.open(fileobj=buf) as tar:
+        names = {m.name for m in tar.getmembers()}
+    assert 'keep.txt' in names
+    assert 'document.md' not in names
+    assert not any(n == 'skills' or n.startswith('skills/') for n in names)
+
+
+def test_pack_tar_skips_unreadable_entry_without_aborting(ws_dir, monkeypatch):
+    # A concurrent type-swap makes the confined open fail; pack must record it
+    # and continue, not abort the whole archive (on_unsafe='skip').
+    (ws_dir / 'a.txt').write_text('a')
+    (ws_dir / 'b.txt').write_text('b')
+    buf = io.BytesIO()
+    with Workspace(ws_dir) as ws:
+        real_open = ws._open_read_fd
+
+        def flaky(parts):
+            if parts == ('a.txt',):
+                raise OSError('raced')
+            return real_open(parts)
+
+        monkeypatch.setattr(ws, '_open_read_fd', flaky)
+        report = ws.pack_tar(buf)
+    assert dict(report.skipped).get('a.txt') == 'unreadable'
+    buf.seek(0)
+    with tarfile.open(fileobj=buf) as tar:
+        assert 'b.txt' in {m.name for m in tar.getmembers()}
+
+
+def _tar_of_files(n, size):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as tar:
+        for i in range(n):
+            info = tarfile.TarInfo(f'f{i}.txt')
+            data = b'x' * size
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    buf.seek(0)
+    return buf
+
+
+def test_restore_tar_max_entries(tmp_path):
+    dest = tmp_path / 'd'
+    dest.mkdir()
+    with Workspace(dest) as ws, pytest.raises(WorkspaceError, match='max_entries'):
+        ws.restore_tar(_tar_of_files(5, 10), max_entries=3)
+
+
+def test_restore_tar_max_bytes(tmp_path):
+    dest = tmp_path / 'd'
+    dest.mkdir()
+    with Workspace(dest) as ws, pytest.raises(WorkspaceError, match='max_bytes'):
+        ws.restore_tar(_tar_of_files(5, 100), max_bytes=250)  # 500 bytes total
+
+
+def test_restore_tar_within_caps_ok(tmp_path):
+    dest = tmp_path / 'd'
+    dest.mkdir()
+    with Workspace(dest) as ws:
+        report = ws.restore_tar(_tar_of_files(3, 10), max_entries=10, max_bytes=1000)
+        assert report.ok
+        assert (ws / 'f0.txt').read_bytes() == b'x' * 10

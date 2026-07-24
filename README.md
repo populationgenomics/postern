@@ -133,7 +133,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 - `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`).
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534)` and `SandboxProfile.with_venv(venv, **kw)`. `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
-- `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f)`, `.restore_tar(f)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`.
+- `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).
 - `available()` — bubblewrap present?
 
 ## Reading the workspace safely
@@ -152,9 +152,11 @@ vigilance.
 
 ```python
 with sandbox.accessor() as ws:                 # or Workspace(some_dir)
-    report = ws.pack_tar(open('snap.tar', 'wb'))   # only regular files + dirs
-    # report.skipped is the audit trail of neutralized symlinks/FIFOs/…
-    ws.restore_tar(open('snap.tar', 'rb'))          # confined extraction
+    # only regular files + dirs; symlinks/FIFOs and escaping hardlinks are
+    # neutralized, and exclude drops paths a checkpoint persists elsewhere
+    report = ws.pack_tar(open('snap.tar', 'wb'), exclude=lambda p: p == 'document.md')
+    # report.skipped is the audit trail of what was neutralized (never silent)
+    ws.restore_tar(open('snap.tar', 'rb'), max_entries=20_000, max_bytes=512 << 20)
     data = (ws / 'out' / 'result.json').read_bytes()
 ```
 
@@ -163,10 +165,16 @@ directory fd (the model is Go's `os.Root` / Rust's `cap-std::Dir`); the accessor
 never hands back a dereferenceable host path. It is pure stdlib and needs no
 mount privilege, so it runs on an unprivileged host (e.g. a Cloud Run container).
 A sticky world-writable workspace (`0o1777`) additionally stops the guest
-unlinking host-written files to swap in escaping symlinks. Consumers wedded to
-stock `tarfile` can pass `reference_closed_filter` to
-`TarFile.extractall(filter=...)`; `restore_tar` is stronger (it writes through
-the confined root) and reports what it neutralized.
+unlinking host-written files to swap in escaping symlinks. `restore_tar`'s
+`max_entries`/`max_bytes` bound a decompression bomb from an untrusted store.
+
+`reference_closed_filter` plugs into stock `TarFile.extractall(filter=...)` for
+consumers that keep `tarfile`, but it only **vets members** — stock extraction
+still follows a symlink that already exists in the destination, so it is safe
+only into a fresh host-controlled directory. To extract into a workspace a guest
+may have touched, use `restore_tar`: it writes *through the confined root* (never
+through an in-tree symlink, pre-existing or planted) and reports what it
+neutralized.
 
 See `examples/e2e_greeter.py` for an end-to-end run (typed hatch call + pandas,
 verified on a Linux host).

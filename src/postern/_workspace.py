@@ -42,9 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import fnmatch
 import os
-import shutil
 import stat
 import tarfile
 import typing
@@ -289,12 +287,6 @@ class Workspace:
     def __truediv__(self, other: object) -> WorkspacePath:
         return WorkspacePath(self, _split(other))
 
-    def path(self, *parts: str | os.PathLike[str]) -> WorkspacePath:
-        acc: tuple[str, ...] = ()
-        for p in parts:
-            acc += _split(p)
-        return WorkspacePath(self, acc)
-
     def iterdir(self) -> Iterator[WorkspacePath]:
         return self.root.iterdir()
 
@@ -303,34 +295,86 @@ class Workspace:
 
     # -- consumers (thin: tar is just one) --
 
-    def pack_tar(self, fileobj: typing.BinaryIO, *, on_unsafe: str = 'skip', compression: str = '') -> WorkspaceReport:
+    def pack_tar(
+        self,
+        fileobj: typing.BinaryIO,
+        *,
+        on_unsafe: str = 'skip',
+        compression: str = '',
+        exclude: typing.Callable[[str], bool] | None = None,
+    ) -> WorkspaceReport:
         """Write the workspace tree to ``fileobj`` as a tar of regular files+dirs.
 
-        Non-regular entries (symlinks, FIFOs, sockets, device nodes) are never
-        dereferenced: with ``on_unsafe='skip'`` (default) they are omitted and
-        recorded in the returned :class:`WorkspaceReport`; with ``'error'`` the
-        first one raises :class:`WorkspaceError`. The archive is therefore
-        reference-closed by construction — any consumer can extract it anywhere
-        without following a reference out of the tree. ``compression`` is a
-        ``tarfile`` stream suffix (``'gz'``, ``'bz2'``, ``'xz'``) or ``''``.
+        Only regular files and directories are archived, so the result is
+        reference-closed — any consumer can extract it anywhere without following
+        a reference out of the tree. Entries that are not are never dereferenced:
+        symlinks, FIFOs, sockets, device nodes, and any *hardlink whose link count
+        is not fully accounted for within the workspace* (its inode is also named
+        outside the tree, so its content is shared out of bounds — the one case a
+        confined open cannot tell from an ordinary file) are neutralized. With
+        ``on_unsafe='skip'`` (default) they are omitted and recorded in the
+        returned :class:`WorkspaceReport`; with ``'error'`` the first raises
+        :class:`WorkspaceError`. Nothing is dropped silently — the report is the
+        audit trail.
+
+        ``exclude`` is called with each entry's workspace-relative POSIX path; if
+        it returns true the entry is skipped and, for a directory, not descended
+        (e.g. to checkpoint everything but a separately-persisted ``document.md``
+        and a re-downloaded ``skills/``). ``compression`` is a ``tarfile`` stream
+        suffix (``'gz'``, ``'bz2'``, ``'xz'``) or ``''``.
         """
         report = WorkspaceReport()
+        entries = [(parts, self._lstat(parts)) for parts in self._descendants(())]
+        # Count how many names *inside* the workspace point at each multiply-
+        # linked inode; if fewer than st_nlink, some links lie outside the tree.
+        inside: dict[tuple[int, int], int] = {}
+        for _parts, st in entries:
+            if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                inside[key] = inside.get(key, 0) + 1
+        pruned: list[str] = []
         mode = typing.cast('typing.Any', f'w|{compression}' if compression else 'w')
         with tarfile.open(fileobj=fileobj, mode=mode) as tar:
-            for parts in self._descendants(()):
-                st = self._lstat(parts)
+            for parts, st in entries:
                 name = '/'.join(parts)
+                if any(name == p or name.startswith(p + '/') for p in pruned):
+                    continue  # inside an excluded (undescended) directory
+                if exclude is not None and exclude(name):
+                    pruned.append(name)
+                    continue
                 if stat.S_ISDIR(st.st_mode):
                     tar.addfile(self._tarinfo(name, st, tarfile.DIRTYPE))
                 elif stat.S_ISREG(st.st_mode):
-                    fd = self._open_read_fd(parts)
-                    with os.fdopen(fd, 'rb') as src:
-                        tar.addfile(self._tarinfo(name, st, tarfile.REGTYPE), src)
+                    key = (st.st_dev, st.st_ino)
+                    if st.st_nlink > 1 and inside.get(key, 0) < st.st_nlink:
+                        self._flag(report, name, 'hardlink', on_unsafe)
+                    else:
+                        self._pack_regular(tar, parts, name, report, on_unsafe)
                 else:
-                    report._add(name, _mode_kind(st.st_mode))
-                    if on_unsafe == 'error':
-                        raise WorkspaceError(f'non-regular entry {name!r} ({_mode_kind(st.st_mode)})')
+                    self._flag(report, name, _mode_kind(st.st_mode), on_unsafe)
         return report
+
+    @staticmethod
+    def _flag(report: WorkspaceReport, name: str, reason: str, on_unsafe: str) -> None:
+        report._add(name, reason)
+        if on_unsafe == 'error':
+            raise WorkspaceError(f'neutralized {reason} entry {name!r}')
+
+    def _pack_regular(
+        self, tar: tarfile.TarFile, parts: tuple[str, ...], name: str, report: WorkspaceReport, on_unsafe: str
+    ) -> None:
+        try:
+            fd = self._open_read_fd(parts)
+        except (OSError, WorkspaceError):
+            # Raced: the entry changed type or vanished since the walk. O_NOFOLLOW
+            # means nothing was followed out — this is a robustness skip, never an
+            # escape — so record it rather than aborting the whole pack.
+            self._flag(report, name, 'unreadable', on_unsafe)
+            return
+        with os.fdopen(fd, 'rb') as src:
+            # Size from the *open* fd, not the earlier lstat, so a concurrent
+            # truncation can't desync the tar header from the bytes written.
+            tar.addfile(self._tarinfo(name, os.fstat(fd), tarfile.REGTYPE), src)
 
     @staticmethod
     def _tarinfo(name: str, st: os.stat_result, kind: bytes) -> tarfile.TarInfo:
@@ -345,7 +389,14 @@ class Workspace:
         info.uname = info.gname = ''
         return info
 
-    def restore_tar(self, fileobj: typing.BinaryIO, *, on_unsafe: str = 'skip') -> WorkspaceReport:
+    def restore_tar(
+        self,
+        fileobj: typing.BinaryIO,
+        *,
+        on_unsafe: str = 'skip',
+        max_entries: int | None = None,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReport:
         """Extract a tar into the workspace through the confined root.
 
         Only regular-file and directory members are created, each via an
@@ -353,16 +404,32 @@ class Workspace:
         symlink (in-tree or planted). Members with absolute/``..`` names, or that
         are symlinks/hardlinks/specials, are neutralized: skipped and reported
         (``on_unsafe='skip'``) or raised (``'error'``). This is stronger than a
-        stock ``extractall`` even with :func:`reference_closed_filter`.
+        stock ``extractall`` even with :func:`reference_closed_filter`: the filter
+        vets members but stock extraction still writes through a pre-existing
+        symlink in the destination, whereas this writes through the confined root.
+
+        ``max_entries`` / ``max_bytes`` bound a decompression bomb from an
+        untrusted archive — extraction raises :class:`WorkspaceError` once either
+        is exceeded. Both default to ``None`` (no limit); a consumer restoring
+        from a store it does not fully trust should set them.
         """
         report = WorkspaceReport()
+        written = [0]
         with tarfile.open(fileobj=fileobj, mode='r|*') as tar:
-            for member in tar:
-                self._restore_member(tar, member, report, on_unsafe)
+            for count, member in enumerate(tar, start=1):
+                if max_entries is not None and count > max_entries:
+                    raise WorkspaceError(f'archive exceeds max_entries={max_entries}')
+                self._restore_member(tar, member, report, on_unsafe, max_bytes, written)
         return report
 
     def _restore_member(
-        self, tar: tarfile.TarFile, member: tarfile.TarInfo, report: WorkspaceReport, on_unsafe: str
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        report: WorkspaceReport,
+        on_unsafe: str,
+        max_bytes: int | None,
+        written: list[int],
     ) -> None:
         try:
             parts = _split(member.name)
@@ -382,12 +449,23 @@ class Workspace:
             fd = self._open_write_fd(parts)
             with os.fdopen(fd, 'wb') as dst:
                 if src is not None:
-                    shutil.copyfileobj(src, dst)
+                    self._copy_capped(src, dst, written, max_bytes)
             return
         kind = 'symlink' if member.issym() else 'hardlink' if member.islnk() else 'special'
         report._add(member.name, kind)
         if on_unsafe == 'error':
             raise WorkspaceError(f'non-regular member {member.name!r} ({kind})')
+
+    @staticmethod
+    def _copy_capped(src: typing.IO[bytes], dst: typing.IO[bytes], written: list[int], max_bytes: int | None) -> None:
+        while True:
+            chunk = src.read(65536)
+            if not chunk:
+                return
+            written[0] += len(chunk)
+            if max_bytes is not None and written[0] > max_bytes:
+                raise WorkspaceError(f'archive exceeds max_bytes={max_bytes}')
+            dst.write(chunk)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -415,32 +493,30 @@ class WorkspacePath:
         raise TypeError('WorkspacePath is a confined handle with no dereferenceable host path; use its IO methods')
 
     @property
-    def parts(self) -> tuple[str, ...]:
-        return self._parts
-
-    @property
     def name(self) -> str:
         return self._parts[-1] if self._parts else ''
-
-    @property
-    def parent(self) -> WorkspacePath:
-        return WorkspacePath(self.workspace, self._parts[:-1])
 
     def lstat(self) -> os.stat_result:
         return self.workspace._lstat(self._parts)
 
     def exists(self) -> bool:
-        """Whether the path exists (a dangling/valid symlink counts — lexists)."""
+        """Whether the path exists (a dangling/valid symlink counts — lexists).
+
+        Returns ``False`` — not raises — when an intermediate component is a
+        symlink or non-directory (``OSError``: ELOOP/ENOTDIR), so the predicate is
+        total: a path *behind* a guest-planted symlinked directory reads as absent
+        rather than throwing.
+        """
         try:
             self.workspace._lstat(self._parts)
-        except (FileNotFoundError, NotADirectoryError):
+        except OSError:
             return False
         return True
 
     def _is(self, predicate: typing.Callable[[int], bool]) -> bool:
         try:
             return predicate(self.workspace._lstat(self._parts).st_mode)
-        except (FileNotFoundError, NotADirectoryError):
+        except OSError:
             return False
 
     def is_dir(self) -> bool:
@@ -476,18 +552,6 @@ class WorkspacePath:
             for name in reversed(dirnames):
                 stack.append((*parts, name))
 
-    def glob(self, pattern: str) -> Iterator[WorkspacePath]:
-        """Yield descendants whose workspace-relative path matches ``pattern``.
-
-        ``pathlib.PurePath.match`` semantics (right-anchored, ``*`` does not cross
-        ``/``); confined by the same never-follow traversal as :meth:`walk`.
-        """
-        base = len(self._parts)
-        for parts in self.workspace._descendants(self._parts):
-            rel = parts[base:]
-            if PurePosixPath(*rel).match(pattern) or fnmatch.fnmatch(rel[-1], pattern):
-                yield WorkspacePath(self.workspace, parts)
-
     def open(self, mode: str = 'rb') -> typing.BinaryIO:
         if mode in ('rb', 'r'):
             return typing.cast('typing.BinaryIO', os.fdopen(self.workspace._open_read_fd(self._parts), 'rb'))
@@ -509,22 +573,23 @@ class WorkspacePath:
     def write_text(self, text: str, encoding: str = 'utf-8') -> int:
         return self.write_bytes(text.encode(encoding))
 
-    def mkdir(self, *, parents: bool = False, exist_ok: bool = False) -> None:
-        self.workspace._mkdir(self._parts, parents=parents, exist_ok=exist_ok)
-
 
 def reference_closed_filter(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo:
-    """A ``TarFile.extractall(filter=...)`` hook yielding a reference-closed tree.
+    """A ``TarFile.extractall(filter=...)`` hook that vets members for closure.
 
     Refuses (raises :class:`WorkspaceError`, aborting extraction) any member with
     an absolute or ``..`` name, and any symlink, hardlink, FIFO, socket or device
-    member — so a stock ``extractall`` cannot be tricked into following or
-    creating an out-of-tree reference. Setuid/setgid/sticky bits are stripped.
+    member, so the *archive* cannot introduce an out-of-tree reference or create
+    one on disk. Setuid/setgid/sticky bits are stripped.
 
-    This is the public tarfile seam for consumers who keep stock ``tarfile``. For
-    the strongest guarantee use :meth:`Workspace.restore_tar`, which additionally
-    writes through a confined root (never through an in-tree symlink) and reports
-    what it neutralized rather than aborting.
+    Important scope: a filter only vets members — stock ``extractall`` still does
+    the writes and will follow a symlink that *already exists in the destination*.
+    So this is safe only when extracting into a fresh, host-controlled directory;
+    it does **not** make extraction into a workspace a guest may have touched
+    safe. For that — and for the strongest guarantee generally — use
+    :meth:`Workspace.restore_tar`, which writes through the confined root (never
+    through an in-tree symlink, pre-existing or planted) and reports what it
+    neutralized rather than aborting.
     """
     del path  # confinement is by member vetting, not by the destination path
     _split(member.name)  # raises WorkspaceError on an absolute or ".." name
