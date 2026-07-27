@@ -61,10 +61,15 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
   namespace, so no resident bwrap process sits there for the guest to read. That
   bwrap shared the guest uid, so its `/proc/1` (cmdline, maps, read/write mem,
   and env) was reachable from inside; with the entrypoint as PID 1 there is no
-  such process. `run_python`'s shim then acts as a minimal init — it forks the
-  guest, reaps orphaned descendants, propagates the guest's exit status, and
-  marks *itself* `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot
-  read the init either;
+  such process. The shim then acts as a minimal init and **universal
+  supervisor** for every run (`run`, `run_bash`, `run_python`) — it applies the
+  resource backstops, forks, and the child *execs* the work (a re-exec of the
+  interpreter for `run_python`, or an arbitrary program for `run`/`run_bash`),
+  then reaps orphaned descendants, propagates the exit status, and marks *itself*
+  `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot read the init
+  either. (The supervisor is Python, so `run`/`run_bash` need a Python
+  interpreter present even for a non-Python program; a native shim could lift
+  that later.)
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
   no capabilities inside its user namespace, and if the userns fails to
   materialise on a root host it still drops to a non-root real uid
@@ -140,7 +145,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`).
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). All three run under the shim supervisor (fork + exec), so an arbitrary program gets the same resource backstops, orphan reaping, and hatch as Python code — but the supervisor being the Python shim means `run`/`run_bash` need a Python interpreter in the sandbox too.
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` opts bwrap into running at a non-root real uid (defense in depth for the sysctl surface; the deploy must make bind sources reachable by it). `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).

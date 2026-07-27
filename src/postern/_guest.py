@@ -1,24 +1,35 @@
-"""In-sandbox entrypoint for `Sandbox.run_python`.
+"""In-sandbox supervisor for `Sandbox.run`, `run_python`, and `run_bash`.
 
-Runs *inside* the bubblewrap sandbox, so it is stdlib-only. It applies the
-process-count limit (a fork-bomb backstop set here rather than via a fork-time
-callback in the host) and then execs the guest code.
+Runs *inside* the bubblewrap sandbox, so it is stdlib-only. bwrap launches this
+shim as the entrypoint for **every** run; the shim is the universal supervisor.
+It applies the resource backstops (a fork-bomb / memory backstop set here rather
+than via a fork-time callback in the host) and then execs the actual work —
+whatever ``POSTERN_ARGV`` names: a re-exec of this interpreter to run
+``POSTERN_CODE`` (``run_python``), or an arbitrary program such as ``bash``
+(``run``/``run_bash``). Running the work in a forked child that *execs* is one
+shape for all three: the child inherits the supervisor's setup (limits, and —
+where wired — the hatch) and hands off to any program.
 
-The guest reaches the hatch by dialing the bound Unix socket with an ordinary
-gRPC channel + the generated stub — that machinery lives in the guest's own
-environment, not here. The socket path is exported as ``POSTERN_HATCH``.
+The guest reaches the hatch by dialing the bound Unix socket; that machinery
+lives in the guest's own environment, not here. The socket path is exported as
+``POSTERN_HATCH``.
 
 bwrap launches this shim with ``--as-pid-1``, so it is PID 1 of the guest's PID
 namespace: there is no separate bwrap process whose ``/proc/1`` the guest could
 read (closing the PID-1 environ/cmdline/mem exposure — bwrap shares the guest
 uid, so a same-uid guest could otherwise read and write it). As PID 1 the shim
-owes the namespace a real init, so it forks the guest and reaps it plus any
+owes the namespace a real init, so it forks the work and reaps it plus any
 orphaned descendants that reparent here, and it marks *itself* non-dumpable so
 even a co-uid process the guest spawns cannot read this init's ``/proc/1``.
+
+A native (C/Rust) supervisor could replace this Python shim later — it would drop
+the Python-in-rootfs requirement for non-Python work (``run``/``run_bash``) — but
+the shim keeps the supervisor in the language postern already ships.
 """
 
 import contextlib
 import ctypes
+import json
 import os
 import resource
 import signal
@@ -41,8 +52,13 @@ def _set_nondumpable() -> None:
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
-def _run_guest() -> None:
-    """Apply the resource backstops and execute the guest code in this process."""
+def _apply_rlimits() -> None:
+    """Set the process-count and (optional) address-space backstops.
+
+    Applied in the forked child *before* it execs the work, so an arbitrary
+    program (bash, a compiled tool) inherits them across the exec — not just a
+    Python guest that would otherwise set them itself.
+    """
     nproc = int(os.environ.get('POSTERN_NPROC') or 0)
     if nproc:
         resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
@@ -52,34 +68,63 @@ def _run_guest() -> None:
     as_bytes = int(os.environ.get('POSTERN_AS') or 0)
     if as_bytes:
         resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
+
+
+def _run_code() -> int:
+    """Execute ``POSTERN_CODE`` in *this* process; return its exit status.
+
+    Reached in the fresh process the supervisor re-execs for ``run_python`` (a
+    clean interpreter, not the supervisor's), or as the defensive fallback when
+    the shim is launched without ``--as-pid-1``. Mirrors ``sys.exit(main())``'s
+    handling of the guest's own SystemExit / uncaught exception.
+    """
+    _apply_rlimits()  # idempotent; covers the no-fork fallback path
     code = os.environ.get('POSTERN_CODE', '')
-    exec(code, {'__name__': '__main__'})  # noqa: S102 — executing guest code is the whole point
+    try:
+        exec(code, {'__name__': '__main__'})  # noqa: S102 — executing guest code is the whole point
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    except BaseException:  # surface the guest traceback, then exit nonzero
+        traceback.print_exc()
+        return 1
+    return 0
 
 
-def _init() -> int:
-    """Run as PID 1: fork the guest, reap the namespace, return the guest's status."""
+def _exec_work() -> None:
+    """In the forked child: apply the limits, then exec the work. Never returns.
+
+    ``POSTERN_ARGV`` names the work: ``[python, -u, _guest.py]`` re-execs this
+    shim to run the code (``run_python``), or an arbitrary argv (``run``,
+    ``run_bash``). Running as a normal (dumpable) child, it must not fall back
+    into the parent's reaper, so every path ends in ``os._exit``.
+    """
+    _apply_rlimits()
+    try:
+        argv = json.loads(os.environ.get('POSTERN_ARGV') or '[]')
+    except ValueError:
+        argv = []
+    if argv:
+        try:
+            # Replace this image with the work argv — no shell, by design.
+            os.execvp(argv[0], argv)  # noqa: S606
+        except OSError as exc:
+            print(f'postern: cannot exec {argv[0]!r}: {exc}', file=sys.stderr)
+            os._exit(127)
+    os._exit(_run_code())  # no argv (defensive): run the code in this process
+
+
+def _supervise() -> int:
+    """Run as PID 1: fork the work, reap the namespace, return its status."""
     child = os.fork()
     if child == 0:
-        # The guest runs here as a normal (dumpable) child; only the init above
-        # is hidden. Mirror `sys.exit(main())`'s status handling for the guest's
-        # own SystemExit / uncaught exception, but with os._exit so we never fall
-        # back into the parent's reaper path.
-        try:
-            _run_guest()
-        except SystemExit as exc:
-            code = exc.code
-            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
-        except BaseException:  # surface the guest traceback, then exit nonzero
-            traceback.print_exc()
-            os._exit(1)
-        os._exit(0)
-    # Forward a graceful stop to the guest — PID 1 gets no default signal action,
+        _exec_work()  # never returns
+    # Forward a graceful stop to the work — PID 1 gets no default signal action,
     # so without this a SIGTERM/SIGINT would be dropped rather than reaching it.
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, _frame, c=child: os.kill(c, s))
-    # Reap until the guest exits, absorbing any orphaned descendants reparented to
+    # Reap until the work exits, absorbing any orphaned descendants reparented to
     # PID 1 along the way; leftover processes are SIGKILLed by the kernel when
-    # PID 1 exits, so returning on the guest's own exit is sufficient.
+    # PID 1 exits, so returning on the work's own exit is sufficient.
     while True:
         pid, status = os.wait()
         if pid == child:
@@ -93,11 +138,10 @@ def _init() -> int:
 def main() -> int:
     if os.getpid() == 1:
         _set_nondumpable()
-        return _init()
-    # Defensive fallback if the shim is ever launched without --as-pid-1: there is
-    # no init role to play, so just run the guest in this process.
-    _run_guest()
-    return 0
+        return _supervise()
+    # Not PID 1: we are the work process the supervisor re-exec'd for run_python
+    # (or a defensive fallback launched without --as-pid-1). Run the code here.
+    return _run_code()
 
 
 if __name__ == '__main__':
