@@ -1,75 +1,273 @@
-"""The HTTP forward-proxy escape hatch: brokered network egress, allowlisted.
+"""The HTTP escape hatch: a programmable HTTP endpoint over the sandbox UDS.
 
-Where `GrpcHatch` hands the guest a set of typed methods, `HttpHatch` hands it
-*network egress* — but only to destinations you allowlist. The guest sees an
-ordinary HTTP proxy: point `HTTP_PROXY`/`HTTPS_PROXY` at it and any stdlib or
-third-party client (`urllib`, `requests`, `httpx`, `curl`) works unmodified. The
-proxy runs in the trusted host process, parses the guest's (hostile) HTTP,
-checks the destination against the allowlist — the capability grant, exactly as
-the method set is for gRPC — and only then dials out on the host network.
+Where `GrpcHatch` grants the guest typed methods, `HttpHatch` gives it an
+ordinary HTTP proxy endpoint — but what happens to each request is entirely
+**client-defined**. The hatch is the transport (it pierces the empty netns,
+speaks the proxy protocol, and streams bodies without buffering); *policy* lives
+in a handler you supply. A forwarding proxy with an allowlist is just one thing
+you can build with it — the handler may equally rewrite requests, transform a
+streaming response event-by-event, route to a different backend, or answer with
+a synthetic response and never egress at all.
 
-This closes the loop on postern's empty network namespace *without* reopening
-it. The sandbox still has no route off `lo`; the only thing that pierces the
-netns is the hatch Unix socket (a filesystem object, not a network object). To
-reach it the guest needs a tiny loopback→UDS relay (a dumb byte pump listening
-on ``127.0.0.1`` — bwrap's ``loopback_setup()`` already raised ``lo``, so no
-capability is needed) with ``HTTP_PROXY`` pointed at it. That relay is the
-guest-side counterpart to this host-side proxy; this module is only the trusted
-end. Egress is then a single brokered, auditable channel, not a raw interface.
+    handler(request, forward) -> Response | Tunnel
 
-Unlike the gRPC hatch this is **stdlib-only** — no extra to install. Both proxy
-modes are supported:
+* ``request`` — the parsed proxy request (method, url, host/port, headers, and a
+  buffered ``body``; ``is_connect`` for HTTPS tunnels).
+* ``forward`` — the egress capability: ``forward(request)`` dials upstream and
+  returns a **streaming** `Response` (for HTTP) or a `Tunnel` (for CONNECT).
+  Withhold it and nothing leaves the host.
+* return a `Response` to send it to the guest (synthetic or forwarded, possibly
+  with its ``body`` wrapped/transformed), or a `Tunnel` to splice a CONNECT.
 
-* **absolute-form** (``GET http://host/path``) for plain HTTP — the proxy sees
-  and forwards the full request;
-* **CONNECT** (``CONNECT host:443``) for HTTPS — the proxy sees only ``host:port``
-  and then splices an opaque byte tunnel; it never holds the TLS payload.
+Batteries for the common case ship on top of the core: `allow_hosts` /
+`deny_hosts` reproduce a destination allowlist in one line. Stdlib-only — no
+extra to install.
 
     from postern import Sandbox, SandboxProfile
-    from postern.http import HttpHatch
+    from postern.http import HttpHatch, allow_hosts
 
-    hatch = HttpHatch(allowlist={'api.github.com:443', 'pypi.org'})
-    sandbox = Sandbox(SandboxProfile.with_venv('/opt/env'), hatch=hatch)
-    sandbox.run_python(guest_code)   # guest's HTTP_PROXY -> loopback -> UDS -> here
+    hatch = HttpHatch(allow_hosts({'api.github.com:443', 'pypi.org'}))
+    Sandbox(SandboxProfile.with_venv('/opt/env'), hatch=hatch).run_python(guest_code)
 
-Trust model: every byte from the guest is attacker-controlled, so this proxy is
-the most security-sensitive surface postern exposes. The allowlist is its whole
-job — an entry ``host`` permits any port on that host, ``host:port`` pins the
-port. A permitted host is dialled wherever DNS points it, so allowlist names you
-control (an SSRF via a hostile-resolving name you allowlisted is your choice to
-grant, not the proxy's to second-guess).
+**Streaming / SSE.** ``forward`` returns a lazy `Response.body`, so Server-Sent
+Events (and any chunked/close-delimited stream) flow through in real time and a
+handler can intervene per message with `sse_events` / `encode_sse`:
+
+    def handler(req, forward):
+        resp = forward(req)
+        if resp.content_type.startswith('text/event-stream'):
+            resp = resp.with_body(encode_sse(edit(e) for e in sse_events(resp.body)))
+        return resp
+
+**HTTPS.** A CONNECT tunnel is opaque TLS — the proxy sees only ``host:port``,
+so per-message intervention is impossible without terminating TLS (a separate,
+opt-in concern). Nothing downgrades https→http on its own. To get plaintext for
+a cooperative client, point it at an ``http://`` base URL (e.g.
+``ANTHROPIC_BASE_URL``) and have your handler originate TLS upstream; or refuse
+CONNECT with a `Response` that says so — see `steer_https_to_http`.
+
+Trust model: every byte from the guest is attacker-controlled, so this is the
+most security-sensitive host-side surface. With a bare handler *you* own the
+policy; most callers should wrap `allow_hosts`/`deny_hosts`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import socket
 import tempfile
 import threading
 import urllib.parse
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent import futures
 
 _CRLF = b'\r\n'
 _HEADER_END = b'\r\n\r\n'
-# A request line + headers larger than this is abuse, not a real client: bail
-# rather than buffer unboundedly on a hostile connection.
+# A request line + headers larger than this is abuse, not a real client.
 _MAX_HEADER_BYTES = 64 * 1024
-# Hop-by-hop headers (RFC 7230 §6.1) a proxy must not forward, plus the proxy
-# framing the guest sent us. Everything else is passed through untouched.
+# Request bodies are buffered (so a handler can inspect/rewrite them and forward
+# recomputes Content-Length); responses stream. Cap the buffered request body.
+_DEFAULT_MAX_BODY = 16 * 1024 * 1024
+# Hop-by-hop headers (RFC 7230 §6.1) a proxy must not forward.
 _HOP_BY_HOP = frozenset(
     {b'connection', b'proxy-connection', b'keep-alive', b'proxy-authorization', b'te', b'trailer', b'upgrade'}
 )
+# Framing headers we re-derive rather than copy (bodies are re-emitted
+# close-delimited, so a stale length/encoding would corrupt the stream).
+_FRAMING = frozenset({b'content-length', b'transfer-encoding'})
 
 
+# --------------------------------------------------------------------------- #
+# Request / Response / Tunnel — the handler's data model                       #
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class Request:
+    """One parsed proxy request handed to the handler."""
+
+    method: str
+    target: str  # absolute URL (absolute-form) or "host:port" (CONNECT)
+    headers: list[tuple[str, str]]
+    host: str
+    port: int
+    is_connect: bool
+    origin_target: str = '/'  # path?query sent upstream in origin-form (HTTP only)
+    body: bytes = b''  # buffered request body; a handler may replace it before forwarding
+
+    @property
+    def host_port(self) -> str:
+        return f'{self.host}:{self.port}'
+
+    def header(self, name: str) -> str | None:
+        return _get(self.headers, name)
+
+
+@dataclasses.dataclass
+class Response:
+    """A response to send to the guest — synthetic, or returned by ``forward``.
+
+    ``body`` is an iterable of byte chunks, consumed lazily and streamed to the
+    guest, so a forwarded SSE/chunked response is never buffered.
+    """
+
+    status: int
+    reason: str
+    headers: list[tuple[str, str]]
+    body: Iterable[bytes]
+
+    @property
+    def content_type(self) -> str:
+        return (_get(self.headers, 'content-type') or '').split(';', 1)[0].strip()
+
+    def with_body(self, body: Iterable[bytes]) -> Response:
+        """This response with its body replaced (e.g. a transformed SSE stream)."""
+        return dataclasses.replace(self, body=body)
+
+    @classmethod
+    def text(cls, status: int, reason: str, text: str) -> Response:
+        return cls(status, reason, [('Content-Type', 'text/plain; charset=utf-8')], [text.encode()])
+
+    @classmethod
+    def forbidden(cls, message: str) -> Response:
+        return cls.text(403, 'Forbidden', message + '\n')
+
+    @classmethod
+    def bad_gateway(cls, message: str = 'upstream connection failed') -> Response:
+        return cls.text(502, 'Bad Gateway', message + '\n')
+
+
+@dataclasses.dataclass
+class Tunnel:
+    """Handler verdict for a CONNECT: splice this upstream socket to the guest."""
+
+    upstream: socket.socket
+
+
+Forward = Callable[[Request], 'Response | Tunnel']
+Handler = Callable[[Request, Forward], 'Response | Tunnel']
+
+
+# --------------------------------------------------------------------------- #
+# Batteries — common handlers built on the core                                #
+# --------------------------------------------------------------------------- #
+def allow_hosts(allowed: Iterable[str]) -> Handler:
+    """Forward only to ``allowed`` destinations (``host`` or ``host:port``)."""
+    allowed = frozenset(allowed)
+
+    def handler(req: Request, forward: Forward) -> Response | Tunnel:
+        if req.host_port in allowed or req.host in allowed:
+            return forward(req)
+        return Response.forbidden(f'{req.host_port} is not on the allowlist')
+
+    return handler
+
+
+def deny_hosts(denied: Iterable[str]) -> Handler:
+    """Forward everywhere except ``denied`` destinations (``host`` or ``host:port``)."""
+    denied = frozenset(denied)
+
+    def handler(req: Request, forward: Forward) -> Response | Tunnel:
+        if req.host_port in denied or req.host in denied:
+            return Response.forbidden(f'{req.host_port} is on the denylist')
+        return forward(req)
+
+    return handler
+
+
+def steer_https_to_http(inner: Handler, *, hint: str = '') -> Handler:
+    """Wrap ``inner`` to refuse CONNECT with an actionable message.
+
+    Since nothing downgrades https→http on its own, a client hitting an
+    intercept-only hatch over HTTPS just fails opaquely. This turns that into a
+    clear 405 telling the guest to use an ``http://`` base URL instead, while
+    passing plain-HTTP requests through to ``inner``.
+    """
+    tail = f' {hint}' if hint else ''
+
+    def handler(req: Request, forward: Forward) -> Response | Tunnel:
+        if req.is_connect:
+            return Response.text(
+                405, 'Method Not Allowed', f'HTTPS/CONNECT is not intercepted here; use an http:// base URL.{tail}'
+            )
+        return inner(req, forward)
+
+    return handler
+
+
+# --------------------------------------------------------------------------- #
+# SSE helpers — per-message intervention on a text/event-stream body           #
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class SseEvent:
+    """One Server-Sent Event (`data` may be multi-line; blank-terminated)."""
+
+    data: str = ''
+    event: str | None = None
+    id: str | None = None
+    retry: int | None = None
+
+
+def sse_events(body: Iterable[bytes]) -> Iterator[SseEvent]:
+    """Parse a streaming ``text/event-stream`` body into events, lazily."""
+    buf = ''
+    for chunk in body:
+        buf += chunk.decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '\n')
+        while '\n\n' in buf:
+            block, buf = buf.split('\n\n', 1)
+            event = _parse_sse_block(block)
+            if event is not None:
+                yield event
+
+
+def encode_sse(events: Iterable[SseEvent]) -> Iterator[bytes]:
+    """Serialise events back into ``text/event-stream`` wire bytes."""
+    for ev in events:
+        lines = []
+        if ev.event is not None:
+            lines.append(f'event: {ev.event}')
+        if ev.id is not None:
+            lines.append(f'id: {ev.id}')
+        if ev.retry is not None:
+            lines.append(f'retry: {ev.retry}')
+        lines.extend(f'data: {line}' for line in ev.data.split('\n'))
+        yield ('\n'.join(lines) + '\n\n').encode('utf-8')
+
+
+def _parse_sse_block(block: str) -> SseEvent | None:
+    data: list[str] = []
+    event = ident = None
+    retry = None
+    for line in block.split('\n'):
+        if not line or line.startswith(':'):  # blank or comment
+            continue
+        field, _, value = line.partition(':')
+        if value.startswith(' '):
+            value = value[1:]
+        if field == 'data':
+            data.append(value)
+        elif field == 'event':
+            event = value
+        elif field == 'id':
+            ident = value
+        elif field == 'retry' and value.isdigit():
+            retry = int(value)
+    if not data and event is None and ident is None and retry is None:
+        return None
+    return SseEvent('\n'.join(data), event, ident, retry)
+
+
+# --------------------------------------------------------------------------- #
+# The hatch                                                                     #
+# --------------------------------------------------------------------------- #
 class HttpHatch:
-    """Serve a destination-allowlisted HTTP forward proxy over the sandbox UDS.
+    """Serve a client-defined HTTP endpoint over the sandbox UDS.
 
     Conforms to postern's ``Hatch`` protocol (``socket_path`` + ``accepting()``),
-    so it drops into ``Sandbox(hatch=...)`` exactly where ``GrpcHatch`` would.
-    Reused across many ``run_python`` calls: the server starts once on first
-    :meth:`accepting` and stays up until :meth:`close`.
+    so it drops into ``Sandbox(hatch=...)`` where ``GrpcHatch`` would; the guest
+    reaches it via the shim's loopback relay + ``HTTP_PROXY``. Reused across many
+    ``run_python`` calls: serves once on first :meth:`accepting`, until
+    :meth:`close`.
     """
 
     # Reached via the shim's loopback→UDS relay + HTTP_PROXY, not a direct dial
@@ -78,27 +276,28 @@ class HttpHatch:
 
     def __init__(
         self,
-        allowlist: Iterable[str],
+        handler: Handler,
         *,
         socket_path: str | os.PathLike[str] | None = None,
         max_workers: int = 16,
         connect_timeout: float = 10.0,
+        max_body_bytes: int = _DEFAULT_MAX_BODY,
     ) -> None:
-        """Create a hatch that proxies only to ``allowlist`` destinations.
+        """Create a hatch that runs ``handler`` for each guest request.
 
         Args:
-            allowlist: Permitted destinations. ``host`` allows any port on that
-                host; ``host:port`` pins the port. This set is the capability
-                grant — the security boundary is exactly these entries.
-            socket_path: Where to bind the UDS. Defaults to a fresh ``0700``
-                temp dir (host-side isolation rests on that dir, per F9).
-            max_workers: Concurrent guest connections served at once. A CONNECT
-                tunnel occupies one worker for its lifetime, so size this to the
-                guest's expected concurrency; excess connections queue.
+            handler: ``handler(request, forward) -> Response | Tunnel``. It owns
+                all policy — wrap `allow_hosts`/`deny_hosts` for the common case.
+            socket_path: Where to bind the UDS. Defaults to a fresh ``0700`` temp
+                dir (host-side isolation rests on that dir, per F9).
+            max_workers: Concurrent guest connections; a CONNECT tunnel or an
+                open SSE stream holds one for its lifetime, so size accordingly.
             connect_timeout: Seconds to wait dialling an upstream destination.
+            max_body_bytes: Cap on a buffered request body.
         """
-        self._allowed = frozenset(allowlist)
+        self._handler = handler
         self._timeout = connect_timeout
+        self._max_body = max_body_bytes
         if socket_path is None:
             self._dir: str | None = tempfile.mkdtemp(prefix='postern-http-')
             self._path = os.path.join(self._dir, 'hatch.sock')
@@ -113,9 +312,6 @@ class HttpHatch:
     def socket_path(self) -> str:
         return self._path
 
-    def _allowed_dest(self, host: str, port: int) -> bool:
-        return f'{host}:{port}' in self._allowed or host in self._allowed
-
     # -- serving lifecycle (mirrors GrpcHatch) ------------------------------- #
     def start(self) -> None:
         """Start serving (idempotent). Serves until :meth:`close`."""
@@ -127,8 +323,7 @@ class HttpHatch:
         srv.bind(self._path)
         srv.listen(128)
         # Deterministic perms, not umask-dependent (F9): the guest runs as a
-        # non-root uid so must be able to connect; host-side isolation rests on
-        # the 0700 dir above, which keeps other host users off the socket.
+        # non-root uid so must connect; host-side isolation rests on the 0700 dir.
         with contextlib.suppress(OSError):
             os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
         self._srv = srv
@@ -152,72 +347,69 @@ class HttpHatch:
 
     # -- one guest connection ------------------------------------------------ #
     def _serve_conn(self, conn: socket.socket) -> None:
-        # A single hostile connection must never take a pool worker down, so the
-        # whole exchange is wrapped: on any error we just drop this connection.
+        # A single hostile connection must never take a pool worker down.
         try:
-            head, leftover = self._read_headers(conn)
+            head, leftover = _read_headers(conn)
             if head is None:
                 conn.close()
                 return
-            request_line, _, header_block = head.partition(_CRLF)
-            method, _, rest = request_line.decode('latin-1').partition(' ')
-            target = rest.rsplit(' ', 1)[0].strip()  # drop the trailing "HTTP/1.1"
-            if method.upper() == 'CONNECT':
-                self._do_connect(conn, target)
+            request = self._parse_request(head, leftover, conn)
+            result = self._handler(request, self._make_forward())
+            if isinstance(result, Tunnel):
+                conn.sendall(b'HTTP/1.1 200 Connection established' + _HEADER_END)
+                _splice(conn, result.upstream)  # opaque from here — TLS payload never inspected
             else:
-                self._do_absolute(conn, method, target, header_block, leftover)
+                _write_response(conn, result)
         except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
             with contextlib.suppress(OSError):
                 conn.close()
 
-    @staticmethod
-    def _read_headers(conn: socket.socket) -> tuple[bytes | None, bytes]:
-        """Read to end-of-headers; return (header_bytes, bytes_read_past_them)."""
-        buf = b''
-        while _HEADER_END not in buf:
-            chunk = conn.recv(65536)
-            if not chunk:
-                return (buf or None), b''
-            buf += chunk
-            if len(buf) > _MAX_HEADER_BYTES:
-                return None, b''
-        head, _, leftover = buf.partition(_HEADER_END)
-        return head, leftover
-
-    def _do_connect(self, conn: socket.socket, target: str) -> None:
-        host, port = _split_authority(target, default_port=443)
-        if not self._allowed_dest(host, port):
-            _refuse(conn, host, port)
-            return
-        try:
-            upstream = socket.create_connection((host, port), timeout=self._timeout)
-        except OSError:
-            _bad_gateway(conn)
-            return
-        conn.sendall(b'HTTP/1.1 200 Connection established' + _HEADER_END)
-        upstream.settimeout(None)
-        _splice(conn, upstream)  # opaque from here — the TLS payload is never inspected
-
-    def _do_absolute(self, conn: socket.socket, method: str, target: str, header_block: bytes, leftover: bytes) -> None:
+    def _parse_request(self, head: bytes, leftover: bytes, conn: socket.socket) -> Request:
+        request_line, _, header_block = head.partition(_CRLF)
+        method, _, rest = request_line.decode('latin-1').partition(' ')
+        target = rest.rsplit(' ', 1)[0].strip()  # drop the trailing "HTTP/1.1"
+        headers = _parse_headers(header_block)
+        if method.upper() == 'CONNECT':
+            host, port = _split_authority(target, default_port=443)
+            return Request(method, target, headers, host, port, is_connect=True)
         parts = urllib.parse.urlsplit(target)
-        if parts.scheme != 'http' or not parts.hostname:
-            _refuse(conn, parts.hostname or '?', parts.port or 0)  # https must arrive as CONNECT
-            return
-        host, port = parts.hostname, parts.port or 80
-        if not self._allowed_dest(host, port):
-            _refuse(conn, host, port)
-            return
-        path = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, ''))
-        request_line = f'{method} {path} HTTP/1.1'.encode('latin-1')
-        headers = _rewrite_headers(header_block)
-        try:
-            upstream = socket.create_connection((host, port), timeout=self._timeout)
-        except OSError:
-            _bad_gateway(conn)
-            return
-        upstream.settimeout(None)
-        upstream.sendall(request_line + _CRLF + headers + _HEADER_END + leftover)
-        _splice(conn, upstream)
+        host = parts.hostname or ''
+        port = parts.port or (443 if parts.scheme == 'https' else 80)
+        origin = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, '')) or '/'
+        reader = _SockReader(leftover, conn)
+        body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
+        return Request(method, target, headers, host, port, is_connect=False, origin_target=origin, body=body)
+
+    def _make_forward(self) -> Forward:
+        def forward(req: Request) -> Response | Tunnel:
+            try:
+                upstream = socket.create_connection((req.host, req.port), timeout=self._timeout)
+            except OSError:
+                return Response.bad_gateway()
+            upstream.settimeout(None)
+            if req.is_connect:
+                return Tunnel(upstream)
+            headers = _forward_request_headers(req.headers, len(req.body))
+            upstream.sendall(
+                f'{req.method} {req.origin_target} HTTP/1.1'.encode('latin-1')
+                + _CRLF
+                + _encode_headers(headers)
+                + _HEADER_END
+                + req.body
+            )
+            head, leftover = _read_headers(upstream)
+            if head is None:
+                upstream.close()
+                return Response.bad_gateway('no response from upstream')
+            status, reason, resp_headers = _parse_status_line(head)
+            if status in (204, 304) or 100 <= status < 200:
+                upstream.close()
+                return Response(status, reason, resp_headers, [])
+            reader = _SockReader(leftover, upstream)
+            body = _closing(_decode_body(reader, resp_headers, allow_eof=True), upstream)
+            return Response(status, reason, resp_headers, body)
+
+        return forward
 
     def close(self) -> None:
         """Stop serving, drop the socket, and remove the owned temp dir."""
@@ -234,48 +426,182 @@ class HttpHatch:
                 os.rmdir(self._dir)
 
 
+# --------------------------------------------------------------------------- #
+# Wire helpers                                                                  #
+# --------------------------------------------------------------------------- #
+class _SockReader:
+    """A small buffered reader over ``initial`` bytes then a stream socket."""
+
+    def __init__(self, initial: bytes, sock: socket.socket) -> None:
+        self._buf = bytearray(initial)
+        self._sock = sock
+        self._eof = False
+
+    def _fill(self) -> bool:
+        if self._eof:
+            return False
+        chunk = self._sock.recv(65536)
+        if not chunk:
+            self._eof = True
+            return False
+        self._buf += chunk
+        return True
+
+    def read(self, n: int) -> bytes:
+        while len(self._buf) < n and self._fill():
+            pass
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def readline(self) -> bytes:
+        while b'\n' not in self._buf and self._fill():
+            pass
+        idx = self._buf.find(b'\n')
+        if idx < 0:
+            out = bytes(self._buf)
+            self._buf.clear()
+            return out
+        out = bytes(self._buf[: idx + 1])
+        del self._buf[: idx + 1]
+        return out
+
+
+def _read_headers(sock: socket.socket) -> tuple[bytes | None, bytes]:
+    """Read to end-of-headers; return (header_bytes, bytes_read_past_them)."""
+    buf = b''
+    while _HEADER_END not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return (buf or None), b''
+        buf += chunk
+        if len(buf) > _MAX_HEADER_BYTES:
+            return None, b''
+    head, _, leftover = buf.partition(_HEADER_END)
+    return head, leftover
+
+
+def _decode_body(
+    reader: _SockReader, headers: list[tuple[str, str]], *, allow_eof: bool, max_bytes: int = 0
+) -> Iterator[bytes]:
+    """Yield the decoded message body per its framing headers.
+
+    Handles Transfer-Encoding: chunked and Content-Length; falls back to
+    close-delimited only when ``allow_eof`` (responses, never requests — a
+    bodyless request has no length and must not block waiting for EOF).
+    """
+    if 'chunked' in (_get(headers, 'transfer-encoding') or '').lower():
+        return _iter_chunked(reader, max_bytes)
+    content_length = _get(headers, 'content-length')
+    if content_length is not None:
+        return _iter_fixed(reader, int(content_length), max_bytes)
+    if allow_eof:
+        return _iter_until_eof(reader)
+    return iter(())
+
+
+def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
+    total = 0
+    while True:
+        size_line = reader.readline().strip()
+        if not size_line:
+            continue
+        size = int(size_line.split(b';', 1)[0], 16)
+        if size == 0:
+            while reader.readline().strip():  # consume any trailers
+                pass
+            return
+        data = reader.read(size)
+        reader.read(2)  # trailing CRLF
+        total += len(data)
+        if max_bytes and total > max_bytes:
+            raise ValueError('body exceeds max_body_bytes')
+        yield data
+
+
+def _iter_fixed(reader: _SockReader, remaining: int, max_bytes: int) -> Iterator[bytes]:
+    if max_bytes and remaining > max_bytes:
+        raise ValueError('body exceeds max_body_bytes')
+    while remaining > 0:
+        data = reader.read(min(65536, remaining))
+        if not data:
+            return
+        remaining -= len(data)
+        yield data
+
+
+def _iter_until_eof(reader: _SockReader) -> Iterator[bytes]:
+    while True:
+        data = reader.read(65536)
+        if not data:
+            return
+        yield data
+
+
+def _closing(body: Iterator[bytes], sock: socket.socket) -> Iterator[bytes]:
+    """Yield from ``body``, closing ``sock`` once the stream is exhausted."""
+    try:
+        yield from body
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+def _write_response(conn: socket.socket, resp: Response) -> None:
+    """Write a response to the guest, close-delimited, streaming the body."""
+    headers = [(k, v) for k, v in resp.headers if k.lower().encode() not in _HOP_BY_HOP | _FRAMING]
+    headers.append(('Connection', 'close'))  # body is re-emitted close-delimited
+    conn.sendall(
+        f'HTTP/1.1 {resp.status} {resp.reason}'.encode('latin-1') + _CRLF + _encode_headers(headers) + _HEADER_END
+    )
+    for chunk in resp.body:
+        conn.sendall(chunk)
+    conn.close()
+
+
+def _forward_request_headers(headers: list[tuple[str, str]], body_len: int) -> list[tuple[str, str]]:
+    kept = [(k, v) for k, v in headers if k.lower().encode() not in _HOP_BY_HOP | _FRAMING]
+    if body_len:
+        kept.append(('Content-Length', str(body_len)))
+    kept.append(('Connection', 'close'))  # so upstream EOFs the (close-delimited) response
+    return kept
+
+
+def _parse_status_line(head: bytes) -> tuple[int, str, list[tuple[str, str]]]:
+    status_line, _, block = head.partition(_CRLF)
+    parts = status_line.decode('latin-1').split(' ', 2)
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 502
+    reason = parts[2] if len(parts) > 2 else ''
+    return status, reason, _parse_headers(block)
+
+
+def _parse_headers(block: bytes) -> list[tuple[str, str]]:
+    headers = []
+    for line in block.split(_CRLF):
+        if not line:
+            continue
+        name, _, value = line.partition(b':')
+        headers.append((name.decode('latin-1').strip(), value.decode('latin-1').strip()))
+    return headers
+
+
+def _encode_headers(headers: list[tuple[str, str]]) -> bytes:
+    return _CRLF.join(f'{k}: {v}'.encode('latin-1') for k, v in headers)
+
+
+def _get(headers: list[tuple[str, str]], name: str) -> str | None:
+    name = name.lower()
+    for key, value in headers:
+        if key.lower() == name:
+            return value
+    return None
+
+
 def _split_authority(authority: str, *, default_port: int) -> tuple[str, int]:
-    """Split ``host:port`` (or bare ``host``) into ``(host, port)``."""
     host, sep, port = authority.rpartition(':')
     if sep and host and port.isdigit():
         return host, int(port)
     return authority, default_port
-
-
-def _rewrite_headers(header_block: bytes) -> bytes:
-    """Drop hop-by-hop headers and force ``Connection: close``.
-
-    Forcing close means the upstream signals end-of-response with EOF, which the
-    byte splice propagates back to the guest — no keep-alive bookkeeping, at the
-    cost of one connection per request (fine for brokered agent egress).
-    """
-    kept = [
-        line for line in header_block.split(_CRLF) if line and line.split(b':', 1)[0].strip().lower() not in _HOP_BY_HOP
-    ]
-    kept.append(b'Connection: close')
-    return _CRLF.join(kept)
-
-
-def _refuse(conn: socket.socket, host: str, port: int) -> None:
-    body = f'{host}:{port} is not on the hatch allowlist\n'.encode()
-    conn.sendall(
-        b'HTTP/1.1 403 Forbidden'
-        + _CRLF
-        + b'Content-Type: text/plain'
-        + _CRLF
-        + b'Content-Length: '
-        + str(len(body)).encode()
-        + _CRLF
-        + b'Connection: close'
-        + _HEADER_END
-        + body
-    )
-    conn.close()
-
-
-def _bad_gateway(conn: socket.socket) -> None:
-    conn.sendall(b'HTTP/1.1 502 Bad Gateway' + _CRLF + b'Connection: close' + _HEADER_END)
-    conn.close()
 
 
 def _pump(src: socket.socket, dst: socket.socket) -> None:
