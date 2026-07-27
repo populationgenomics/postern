@@ -301,6 +301,31 @@ def test_chunked_request_body_respects_max_body_bytes(origin):
     hatch.close()
 
 
+def test_chunked_extension_line_is_capped(origin):
+    # A giant chunk-extension (or endless no-newline padding) must not buffer
+    # past the size-line cap to dodge max_body_bytes (the N1 relocation of F3).
+    hatch = HttpHatch(allow_hosts({origin}), max_body_bytes=1024)
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        payload = (
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'Transfer-Encoding: chunked\r\n\r\n'
+            + b'1;'
+            + b'a' * 50_000  # chunk-extension far past the 8 KiB line cap, no newline
+        )
+        # The hatch caps the line and closes mid-send, so the write may break —
+        # either a broken pipe or an empty read means rejected-not-buffered.
+        try:
+            sock.sendall(payload)
+            rejected = sock.recv(4096) == b''
+        except (BrokenPipeError, ConnectionResetError):
+            rejected = True
+        sock.close()
+    hatch.close()
+    assert rejected
+
+
 def test_stalled_guest_is_timed_out_not_pinned():
     # A slowloris that sends a partial header then stalls must not hold a worker.
     hatch = HttpHatch(allow_hosts(set()), connect_timeout=0.5)

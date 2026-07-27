@@ -67,6 +67,9 @@ _CRLF = b'\r\n'
 _HEADER_END = b'\r\n\r\n'
 # A request line + headers larger than this is abuse, not a real client.
 _MAX_HEADER_BYTES = 64 * 1024
+# A chunked size line (hex size + any chunk-extension) or trailer line this large
+# is abuse: cap it so a giant extension can't be buffered to dodge max_body_bytes.
+_MAX_CHUNK_LINE = 8 * 1024
 # Request bodies are buffered (so a handler can inspect/rewrite them and forward
 # recomputes Content-Length); responses stream. Cap the buffered request body.
 _DEFAULT_MAX_BODY = 16 * 1024 * 1024
@@ -362,6 +365,13 @@ class HttpHatch:
                 conn.close()
                 return
             request = self._parse_request(head, leftover, conn)
+            # Clear the deadline for the forward/stream/tunnel phase: a legitimate
+            # long download, idle-gapped SSE stream, or CONNECT tunnel must not be
+            # killed on a timer. The cost is that a guest which stops *reading* can
+            # block conn.sendall (backpressure) and hold this worker + its upstream
+            # fd; that is bounded by max_workers and, in the sandbox, by the outer
+            # Sandbox.run_python(timeout=...) that kills the guest (and its relay,
+            # EOF-ing this conn) — the deliberate backstop rather than a write timer.
             conn.settimeout(None)
             result = self._handler(request, self._make_forward())
             if isinstance(result, Tunnel):
@@ -481,9 +491,14 @@ class _SockReader:
         del self._buf[:n]
         return out
 
-    def readline(self) -> bytes:
+    def readline(self, limit: int = 0) -> bytes:
+        # ``limit`` caps how much is buffered while hunting for the newline, so a
+        # line that never terminates (or a giant chunk-extension) can't be
+        # accumulated unboundedly — the caller's byte budget only counts what a
+        # line *contains*, not what it might grow to mid-read.
         while b'\n' not in self._buf and self._fill():
-            pass
+            if limit and len(self._buf) > limit:
+                raise ValueError('line exceeds limit')
         idx = self._buf.find(b'\n')
         if idx < 0:
             out = bytes(self._buf)
@@ -528,25 +543,36 @@ def _decode_body(
 
 
 def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
+    # ``total`` counts *everything consumed* — size lines, chunk data, and
+    # trailers — against max_bytes, not just the declared data. Otherwise a
+    # flood of blank/size/trailer lines (each tiny, never data) slips the cap;
+    # and the declared size is checked before the read so one huge chunk can't
+    # be buffered first (unlike Content-Length, bounded in _iter_fixed).
+    # max_bytes==0 means unbounded (the streaming response path).
     total = 0
+
+    def budget(delta: int) -> None:
+        nonlocal total
+        total += delta
+        if max_bytes and total > max_bytes:
+            raise ValueError('body exceeds max_body_bytes')
+
     while True:
-        raw = reader.readline()
+        raw = reader.readline(_MAX_CHUNK_LINE)
         if not raw:  # EOF before a size line: truncated. Stop — do NOT spin on b''.
             raise ValueError('truncated chunked body')
+        budget(len(raw))
         size_line = raw.strip()
         if not size_line:  # tolerate a stray blank line between chunks
             continue
         size = int(size_line.split(b';', 1)[0], 16)
         if size == 0:
-            while reader.readline().strip():  # consume any trailers (b'' at EOF ends it)
-                pass
-            return
-        # Check the declared size up front so one huge chunk can't be buffered
-        # past the cap before the check (unlike Content-Length, which is bounded
-        # in _iter_fixed); max_bytes==0 means unbounded (the streaming path).
-        total += size
-        if max_bytes and total > max_bytes:
-            raise ValueError('body exceeds max_body_bytes')
+            while True:  # consume any trailers (b'' at EOF ends it)
+                trailer = reader.readline(_MAX_CHUNK_LINE)
+                budget(len(trailer))
+                if not trailer.strip():
+                    return
+        budget(size)
         yield reader.read(size)
         reader.read(2)  # trailing CRLF
 
