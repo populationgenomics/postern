@@ -57,3 +57,32 @@ def test_run_code_uncaught_exception_is_one(shim, monkeypatch, capsys):
 def test_run_code_empty_is_zero(shim, monkeypatch):
     monkeypatch.delenv('POSTERN_CODE', raising=False)
     assert shim._run_code() == 0
+
+
+def test_run_code_string_exit_prints_message(shim, monkeypatch, capsys):
+    # CPython prints a non-int sys.exit() argument to stderr before exiting 1.
+    monkeypatch.setenv('POSTERN_CODE', 'import sys; sys.exit("nope")')
+    assert shim._run_code() == 1
+    assert 'nope' in capsys.readouterr().err
+
+
+def test_apply_rlimits_applies_both_when_address_space(shim, monkeypatch):
+    calls = []
+    monkeypatch.setattr(shim.resource, 'setrlimit', lambda which, _lim: calls.append(which))
+    monkeypatch.setenv('POSTERN_NPROC', '32')
+    monkeypatch.setenv('POSTERN_AS', str(1024 * 1024))
+    shim._apply_rlimits(address_space=True)
+    assert shim.resource.RLIMIT_NPROC in calls
+    assert shim.resource.RLIMIT_AS in calls
+
+
+def test_apply_rlimits_defers_address_space(shim, monkeypatch):
+    # The run_python re-exec path applies NPROC before exec but defers AS to
+    # _run_code (post-startup), so a fresh interpreter isn't capped mid-launch.
+    calls = []
+    monkeypatch.setattr(shim.resource, 'setrlimit', lambda which, _lim: calls.append(which))
+    monkeypatch.setenv('POSTERN_NPROC', '32')
+    monkeypatch.setenv('POSTERN_AS', str(1024 * 1024))
+    shim._apply_rlimits(address_space=False)
+    assert shim.resource.RLIMIT_NPROC in calls
+    assert shim.resource.RLIMIT_AS not in calls

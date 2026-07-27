@@ -45,6 +45,15 @@ def test_run_bash_inherits_rlimit_nproc():
     assert result.stdout.strip() == '8'
 
 
+def test_run_python_address_space_limit_does_not_break_startup():
+    # RLIMIT_AS is applied after the re-exec'd interpreter is up (not before the
+    # execvp), so a cap doesn't abort CPython startup — regression guard for the
+    # fork+exec model, where a fresh interpreter's virtual size is large.
+    result = Sandbox(SandboxProfile(rlimit_as=1024 * 1024 * 1024)).run_python('print(sum(range(1000)))')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '499500'
+
+
 def test_seccomp_blocks_unshare():
     # unshare(CLONE_NEWUSER) needs no capability, so --cap-drop ALL would let it
     # through; only the seccomp filter stops it. A -1/EPERM proves the committed

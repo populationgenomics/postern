@@ -420,7 +420,7 @@ class Sandbox:
             if seccomp is not None:
                 seccomp.close()
 
-    def _supervised(self, work_argv: list[str], *, code: str = '', timeout: float) -> ProcResult:
+    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False, timeout: float) -> ProcResult:
         """Launch ``work_argv`` under the guest shim supervisor.
 
         Every run goes through the shim (bound in and launched as PID 1): it
@@ -429,11 +429,15 @@ class Sandbox:
         program for :meth:`run`/:meth:`run_bash`. With a :class:`Hatch` the UDS
         is bound in and its path exported as ``POSTERN_HATCH`` for the work to
         reach (a proxy hatch is instead fronted by the shim's relay).
+
+        ``recode`` marks the run_python re-exec so the shim defers ``RLIMIT_AS``
+        until the fresh interpreter is up (see ``_guest._apply_rlimits``).
         """
         binds = ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
         env = {
             'POSTERN_ARGV': json.dumps(work_argv),
             'POSTERN_CODE': code,
+            'POSTERN_RECODE': '1' if recode else '',
             'POSTERN_NPROC': str(self._profile.rlimit_nproc),
             'POSTERN_AS': str(self._profile.rlimit_as or 0),
             'POSTERN_HATCH': '',
@@ -474,7 +478,7 @@ class Sandbox:
         gRPC methods by dialing ``unix:$POSTERN_HATCH`` with the generated stub
         (grpcio and the stubs come from the bound environment).
         """
-        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, timeout=timeout)
+        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True, timeout=timeout)
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.

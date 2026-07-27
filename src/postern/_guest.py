@@ -52,12 +52,19 @@ def _set_nondumpable() -> None:
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
-def _apply_rlimits() -> None:
+def _apply_rlimits(*, address_space: bool = True) -> None:
     """Set the process-count and (optional) address-space backstops.
 
     Applied in the forked child *before* it execs the work, so an arbitrary
     program (bash, a compiled tool) inherits them across the exec — not just a
     Python guest that would otherwise set them itself.
+
+    ``address_space`` gates the ``RLIMIT_AS`` backstop. It is deferred for the
+    ``run_python`` re-exec (applied later in :func:`_run_code`, once the fresh
+    interpreter is up) because a bare CPython's *virtual* size at startup can far
+    exceed its resident use — applying the cap before ``execvp``-ing a new
+    interpreter can abort its startup outright. An external program has no such
+    hook, so ``run``/``run_bash`` apply it before the exec.
     """
     nproc = int(os.environ.get('POSTERN_NPROC') or 0)
     if nproc:
@@ -66,7 +73,7 @@ def _apply_rlimits() -> None:
     # co-located trusted worker (F3). It is per-process, not a true total-memory
     # bound — a cgroup memory.max set by the worker/deploy is the real fix.
     as_bytes = int(os.environ.get('POSTERN_AS') or 0)
-    if as_bytes:
+    if address_space and as_bytes:
         resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
 
 
@@ -78,12 +85,17 @@ def _run_code() -> int:
     the shim is launched without ``--as-pid-1``. Mirrors ``sys.exit(main())``'s
     handling of the guest's own SystemExit / uncaught exception.
     """
-    _apply_rlimits()  # idempotent; covers the no-fork fallback path
+    _apply_rlimits(address_space=True)  # AS applied here, post-startup (see _apply_rlimits)
     code = os.environ.get('POSTERN_CODE', '')
     try:
         exec(code, {'__name__': '__main__'})  # noqa: S102 — executing guest code is the whole point
     except SystemExit as exc:
-        return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        if isinstance(exc.code, int):
+            return exc.code
+        if exc.code is None:
+            return 0
+        print(exc.code, file=sys.stderr)  # CPython prints a non-int sys.exit() arg
+        return 1
     except BaseException:  # surface the guest traceback, then exit nonzero
         traceback.print_exc()
         return 1
@@ -96,21 +108,26 @@ def _exec_work() -> None:
     ``POSTERN_ARGV`` names the work: ``[python, -u, _guest.py]`` re-execs this
     shim to run the code (``run_python``), or an arbitrary argv (``run``,
     ``run_bash``). Running as a normal (dumpable) child, it must not fall back
-    into the parent's reaper, so every path ends in ``os._exit``.
+    into the parent's reaper, so **every** path ends in ``os._exit`` — including
+    an unexpected failure (e.g. ``setrlimit`` EPERM), which must exit here rather
+    than escape into the parent's PID-1 reaper loop.
     """
-    _apply_rlimits()
     try:
+        # AS is deferred to _run_code for the run_python re-exec (POSTERN_RECODE),
+        # so the fresh interpreter isn't capped before it finishes starting up.
+        _apply_rlimits(address_space=not os.environ.get('POSTERN_RECODE'))
         argv = json.loads(os.environ.get('POSTERN_ARGV') or '[]')
-    except ValueError:
-        argv = []
-    if argv:
-        try:
-            # Replace this image with the work argv — no shell, by design.
-            os.execvp(argv[0], argv)  # noqa: S606
-        except OSError as exc:
-            print(f'postern: cannot exec {argv[0]!r}: {exc}', file=sys.stderr)
-            os._exit(127)
-    os._exit(_run_code())  # no argv (defensive): run the code in this process
+    except BaseException:  # a setrlimit/parse failure must exit, not reach the reaper
+        traceback.print_exc()
+        os._exit(1)
+    if not argv:
+        os._exit(_run_code())  # no argv (defensive): run the code in this process
+    try:
+        # Replace this image with the work argv — no shell, by design.
+        os.execvp(argv[0], argv)  # noqa: S606
+    except OSError as exc:
+        print(f'postern: cannot exec {argv[0]!r}: {exc}', file=sys.stderr)
+        os._exit(127)
 
 
 def _supervise() -> int:
@@ -118,10 +135,18 @@ def _supervise() -> int:
     child = os.fork()
     if child == 0:
         _exec_work()  # never returns
+        os._exit(1)  # belt-and-braces: the child must never fall through
+
     # Forward a graceful stop to the work — PID 1 gets no default signal action,
     # so without this a SIGTERM/SIGINT would be dropped rather than reaching it.
+    # Suppress ProcessLookupError: a signal arriving after the child is reaped
+    # must not raise out of the handler during teardown.
+    def _forward(_sig: int, _frame: object, _child: int = child) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(_child, _sig)
+
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda s, _frame, c=child: os.kill(c, s))
+        signal.signal(sig, _forward)
     # Reap until the work exits, absorbing any orphaned descendants reparented to
     # PID 1 along the way; leftover processes are SIGKILLed by the kernel when
     # PID 1 exits, so returning on the work's own exit is sufficient.
