@@ -129,12 +129,35 @@ kernel.apparmor_restrict_unprivileged_userns=0`, or install an AppArmor profile
 that grants bwrap `userns`. Cloud Run gen2 does not have this restriction.
 
 The bare `Sandbox` has **no third-party dependencies and no cloud dependency** —
-it is a Linux primitive. The gRPC hatch pulls `grpcio` via the `grpc` extra.
+it is a Linux primitive. The gRPC hatch pulls `grpcio` via the `grpc` extra; the
+HTTP-proxy hatch (below) is stdlib-only.
+
+## HTTP-proxy hatch
+
+Where the gRPC hatch grants typed methods, `HttpHatch` grants **network egress**
+— but only to destinations you allowlist. It serves an ordinary HTTP forward
+proxy over the sandbox UDS; the guest shim fronts it with a loopback→UDS relay
+and exports `HTTP_PROXY`, so any client (`urllib`, `requests`, `httpx`, `curl`)
+egresses through the allowlisted proxy unmodified. The empty netns is never
+reopened — egress stays a single brokered, auditable channel.
+
+```python
+from postern import Sandbox, SandboxProfile
+from postern.http import HttpHatch
+
+hatch = HttpHatch(allowlist={'api.github.com:443', 'pypi.org'})  # host or host:port
+Sandbox(SandboxProfile.with_venv('/opt/env'), hatch=hatch).run_python(guest_code)
+```
+
+Both proxy modes work: absolute-form for plain HTTP, and `CONNECT` for HTTPS
+(the proxy sees only `host:port`, never the TLS payload). The allowlist is the
+capability grant — this proxy parses attacker-controlled HTTP, so it is the
+most security-sensitive host-side surface.
 
 ## Install
 
 ```bash
-pip install postern              # the bare sandbox (no deps)
+pip install postern              # the bare sandbox + HTTP-proxy hatch (no deps)
 pip install 'postern[grpc]'      # + the gRPC hatch
 ```
 
@@ -143,6 +166,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 - `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`).
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` opts bwrap into running at a non-root real uid (defense in depth for the sysctl surface; the deploy must make bind sources reachable by it). `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
+- `postern.http.HttpHatch(allowlist, *, socket_path=None, max_workers=16, connect_timeout=10.0)` — an allowlisted HTTP forward proxy over the sandbox UDS; the guest reaches it via the shim's loopback relay + `HTTP_PROXY`. Allowlist entries are `host` (any port) or `host:port`. Stdlib-only. `with hatch.accepting(): ...`.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).
 - `available()` — bubblewrap present?
 

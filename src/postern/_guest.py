@@ -22,10 +22,17 @@ import ctypes
 import os
 import resource
 import signal
+import socket
 import sys
+import threading
 import traceback
+from concurrent import futures
 
 _PR_SET_DUMPABLE = 4  # linux/prctl.h
+# Concurrent guest→hatch connections the relay services at once. A CONNECT
+# tunnel holds one slot for its lifetime; excess connections queue. Bounds the
+# threads a hostile guest can make PID 1 spawn by opening loopback sockets.
+_RELAY_MAX_CONNS = 64
 
 
 def _set_nondumpable() -> None:
@@ -39,6 +46,96 @@ def _set_nondumpable() -> None:
     """
     with contextlib.suppress(OSError):
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
+
+
+def _pump(src, dst) -> None:
+    """Copy src -> dst until EOF, then half-close dst's write side."""
+    try:
+        while True:
+            chunk = src.recv(65536)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            dst.shutdown(socket.SHUT_WR)
+
+
+def _relay_conn(client, uds_path) -> None:
+    """Splice one accepted loopback connection to the hatch UDS, both ways.
+
+    The guest-side counterpart to postern.http.HttpHatch: a dumb byte pump with
+    no policy of its own. HTTP_PROXY points the guest's clients at the loopback
+    listener; this carries that TCP conversation to the hatch socket — the one
+    channel that pierces the empty netns — where the host proxy enforces the
+    allowlist. No socat/nc in the rootfs: it is stdlib sockets, nothing more.
+    """
+    try:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        upstream.connect(uds_path)
+    except OSError:
+        client.close()
+        return
+    reverse = threading.Thread(target=_pump, args=(client, upstream), daemon=True)
+    reverse.start()
+    _pump(upstream, client)
+    reverse.join()
+    for sock in (client, upstream):
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+def _bind_proxy_relay(host='127.0.0.1'):
+    """Bind (but do not yet serve) the loopback listener for the proxy relay.
+
+    Bound before the guest fork so its address is known for HTTP_PROXY; served
+    only afterwards, in the parent, so the fork happens single-threaded (no
+    relay thread's lock can be held across it) and the guest never inherits a
+    live accept loop. bwrap's loopback_setup() already raised ``lo``, so binding
+    127.0.0.1 needs no capability.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, 0))
+    srv.listen(128)
+    return srv
+
+
+def _prepare_proxy_relay():
+    """Pre-fork half of the relay: bind the listener and export the proxy env.
+
+    Returns the bound (not yet serving) listener, or ``None`` when no proxy hatch
+    is in play. Runs before the guest fork so HTTP_PROXY can name the port the
+    guest's clients will inherit; the accept loop starts later via
+    :func:`_serve_proxy_relay`, in the parent, keeping the fork single-threaded.
+    """
+    uds_path = os.environ.get('POSTERN_PROXY_UDS')
+    if not uds_path:
+        return None
+    srv = _bind_proxy_relay()
+    host, port = srv.getsockname()
+    proxy = f'http://{host}:{port}'
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'):
+        os.environ[key] = proxy
+    return srv
+
+
+def _serve_proxy_relay(srv, uds_path) -> None:
+    """Run the relay's accept loop over ``srv`` in a daemon thread."""
+    pool = futures.ThreadPoolExecutor(max_workers=_RELAY_MAX_CONNS, thread_name_prefix='postern-relay')
+
+    def accept_loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with contextlib.suppress(RuntimeError):
+                pool.submit(_relay_conn, conn, uds_path)
+
+    threading.Thread(target=accept_loop, daemon=True, name='postern-relay-accept').start()
 
 
 def _run_guest() -> None:
@@ -56,23 +153,39 @@ def _run_guest() -> None:
     exec(code, {'__name__': '__main__'})  # noqa: S102 — executing guest code is the whole point
 
 
+def _guest_child(relay_srv):
+    """The forked child: run the guest and exit, never returning to the reaper.
+
+    Runs as a normal (dumpable) process; only the PID-1 init is hidden. It must
+    not hold the relay's listening socket, so it drops it first. Mirrors
+    `sys.exit(main())`'s status handling for the guest's own SystemExit /
+    uncaught exception, but with os._exit so it never falls into the parent path.
+    """
+    if relay_srv is not None:
+        relay_srv.close()
+    try:
+        _run_guest()
+    except SystemExit as exc:
+        code = exc.code
+        os._exit(code if isinstance(code, int) else (0 if code is None else 1))
+    except BaseException:  # surface the guest traceback, then exit nonzero
+        traceback.print_exc()
+        os._exit(1)
+    os._exit(0)
+
+
 def _init() -> int:
     """Run as PID 1: fork the guest, reap the namespace, return the guest's status."""
+    # With an HTTP-proxy hatch the host asks the shim to front the hatch UDS with
+    # a loopback→UDS relay: bind + export HTTP_PROXY pre-fork, serve post-fork.
+    relay_srv = _prepare_proxy_relay()
     child = os.fork()
     if child == 0:
-        # The guest runs here as a normal (dumpable) child; only the init above
-        # is hidden. Mirror `sys.exit(main())`'s status handling for the guest's
-        # own SystemExit / uncaught exception, but with os._exit so we never fall
-        # back into the parent's reaper path.
-        try:
-            _run_guest()
-        except SystemExit as exc:
-            code = exc.code
-            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
-        except BaseException:  # surface the guest traceback, then exit nonzero
-            traceback.print_exc()
-            os._exit(1)
-        os._exit(0)
+        _guest_child(relay_srv)
+    # Now single-thread past the fork: bring the relay's accept loop up in the
+    # parent (PID 1), which is non-dumpable and outlives each guest call.
+    if relay_srv is not None:
+        _serve_proxy_relay(relay_srv, os.environ['POSTERN_PROXY_UDS'])
     # Forward a graceful stop to the guest — PID 1 gets no default signal action,
     # so without this a SIGTERM/SIGINT would be dropped rather than reaching it.
     for sig in (signal.SIGTERM, signal.SIGINT):

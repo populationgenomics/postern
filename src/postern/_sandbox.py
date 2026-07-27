@@ -75,7 +75,15 @@ _PROC_RO_PATHS = (
 
 
 class Hatch(typing.Protocol):
-    """What `Sandbox` needs of a hatch: a UDS path and a serving context."""
+    """What `Sandbox` needs of a hatch: a UDS path and a serving context.
+
+    Two ways the guest reaches a hatch, selected by the optional ``guest_proxy``
+    attribute (absent/false → the first): a **dial** hatch (e.g. `GrpcHatch`)
+    binds its UDS at ``$POSTERN_HATCH`` for the guest to dial directly; a
+    **proxy** hatch (`HttpHatch`, ``guest_proxy = True``) is instead fronted by
+    an in-shim loopback→UDS relay with ``HTTP_PROXY`` pointed at it, so the guest
+    speaks the hatch's protocol over ordinary networking.
+    """
 
     @property
     def socket_path(self) -> str: ...
@@ -431,11 +439,13 @@ class Sandbox:
     def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
-        With a :class:`Hatch`, the hatch UDS is bound in and its path exported as
-        ``POSTERN_HATCH``; the guest reaches the host's allowlisted gRPC methods
-        by dialing ``unix:$POSTERN_HATCH`` with the generated stub (grpcio and
-        the stubs come from the bound environment). The guest shim applies
-        ``RLIMIT_NPROC`` before running the code.
+        With a :class:`Hatch`, the hatch UDS is bound in. A **dial** hatch (e.g.
+        `GrpcHatch`) exports its path as ``POSTERN_HATCH`` and the guest dials
+        ``unix:$POSTERN_HATCH`` with the generated stub. A **proxy** hatch
+        (`HttpHatch`, ``guest_proxy = True``) is instead fronted by an in-shim
+        loopback→UDS relay: the shim exports ``HTTP_PROXY`` so the guest's HTTP
+        clients egress through the allowlisted proxy with no code change. Either
+        way the guest shim applies ``RLIMIT_NPROC`` before running the code.
         """
         binds = ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
         env = {
@@ -443,12 +453,18 @@ class Sandbox:
             'POSTERN_NPROC': str(self._profile.rlimit_nproc),
             'POSTERN_AS': str(self._profile.rlimit_as or 0),
             'POSTERN_HATCH': '',
+            'POSTERN_PROXY_UDS': '',
         }
         argv = [self._profile.python, '-u', _GUEST_SHIM]
         if self._hatch is None:
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
         binds += ['--bind', self._hatch.socket_path, _GUEST_SOCK]
-        env['POSTERN_HATCH'] = _GUEST_SOCK
+        # A proxy hatch is reached via the shim's relay + HTTP_PROXY, not a direct
+        # dial, so it takes POSTERN_PROXY_UDS instead of POSTERN_HATCH.
+        if getattr(self._hatch, 'guest_proxy', False):
+            env['POSTERN_PROXY_UDS'] = _GUEST_SOCK
+        else:
+            env['POSTERN_HATCH'] = _GUEST_SOCK
         with self._hatch.accepting():
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
 
