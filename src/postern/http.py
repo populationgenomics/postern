@@ -494,11 +494,14 @@ class _SockReader:
     def readline(self, limit: int = 0) -> bytes:
         # ``limit`` caps how much is buffered while hunting for the newline, so a
         # line that never terminates (or a giant chunk-extension) can't be
-        # accumulated unboundedly — the caller's byte budget only counts what a
-        # line *contains*, not what it might grow to mid-read.
-        while b'\n' not in self._buf and self._fill():
+        # accumulated unboundedly. Check the cap *before* each blocking _fill —
+        # including against the bytes already buffered (the header-parse leftover)
+        # — so an over-limit line raises at once rather than blocking for more.
+        while b'\n' not in self._buf:
             if limit and len(self._buf) > limit:
                 raise ValueError('line exceeds limit')
+            if not self._fill():
+                break
         idx = self._buf.find(b'\n')
         if idx < 0:
             out = bytes(self._buf)
