@@ -17,6 +17,43 @@ def test_run_python_sealed():
     assert result.stdout.strip() == '4'
 
 
+def test_run_python_propagates_exit_status():
+    # The supervisor re-execs a fresh interpreter for the code; its exit status
+    # must flow back through the fork+exec+reap chain unchanged.
+    result = Sandbox().run_python('import sys; sys.exit(7)')
+    assert result.returncode == 7
+
+
+def test_run_bash_under_supervisor():
+    # A non-Python entrypoint runs in the same fork+exec shape as run_python.
+    result = Sandbox().run_bash('echo supervised')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == 'supervised'
+
+
+def test_run_arbitrary_argv_under_supervisor():
+    result = Sandbox().run(['echo', 'argv-works'])
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == 'argv-works'
+
+
+def test_run_bash_inherits_rlimit_nproc():
+    # The child applies RLIMIT_NPROC before exec, so bash inherits the cap across
+    # the exec — a non-Python entrypoint gets the backstop without managing it.
+    result = Sandbox(SandboxProfile(rlimit_nproc=8)).run_bash('ulimit -u')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '8'
+
+
+def test_run_python_address_space_limit_does_not_break_startup():
+    # RLIMIT_AS is applied after the re-exec'd interpreter is up (not before the
+    # execvp), so a cap doesn't abort CPython startup — regression guard for the
+    # fork+exec model, where a fresh interpreter's virtual size is large.
+    result = Sandbox(SandboxProfile(rlimit_as=1024 * 1024 * 1024)).run_python('print(sum(range(1000)))')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '499500'
+
+
 def test_seccomp_blocks_unshare():
     # unshare(CLONE_NEWUSER) needs no capability, so --cap-drop ALL would let it
     # through; only the seccomp filter stops it. A -1/EPERM proves the committed
