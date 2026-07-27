@@ -79,6 +79,10 @@ _HOP_BY_HOP = frozenset(
 _FRAMING = frozenset({b'content-length', b'transfer-encoding'})
 
 
+class _BadRequestError(Exception):
+    """A malformed guest request; answered with 400 rather than forwarded."""
+
+
 # --------------------------------------------------------------------------- #
 # Request / Response / Tunnel — the handler's data model                       #
 # --------------------------------------------------------------------------- #
@@ -349,22 +353,38 @@ class HttpHatch:
     def _serve_conn(self, conn: socket.socket) -> None:
         # A single hostile connection must never take a pool worker down.
         try:
+            # Bound the pre-response phase (header + request-body read) so a
+            # stalled/slowloris guest cannot pin a pool worker forever; cleared
+            # before the (possibly long-lived) forward/stream/tunnel phase.
+            conn.settimeout(self._timeout)
             head, leftover = _read_headers(conn)
             if head is None:
                 conn.close()
                 return
             request = self._parse_request(head, leftover, conn)
+            conn.settimeout(None)
             result = self._handler(request, self._make_forward())
             if isinstance(result, Tunnel):
                 conn.sendall(b'HTTP/1.1 200 Connection established' + _HEADER_END)
                 _splice(conn, result.upstream)  # opaque from here — TLS payload never inspected
             else:
                 _write_response(conn, result)
+        except _BadRequestError as exc:
+            with contextlib.suppress(OSError):
+                _write_response(conn, Response.text(400, 'Bad Request', f'{exc}\n'))
         except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
             with contextlib.suppress(OSError):
                 conn.close()
 
     def _parse_request(self, head: bytes, leftover: bytes, conn: socket.socket) -> Request:
+        # Any bare CR or LF in the header block (valid HTTP separates only with
+        # CRLF) is a request-smuggling / header-injection attempt: a bare-LF
+        # inside a header value would survive _parse_headers (which splits on
+        # CRLF) and be re-serialized to upstream as a *separate* header line,
+        # slipping a Transfer-Encoding/Host/auth past the name-based framing
+        # strip. Reject the whole request rather than forward ambiguous framing.
+        if b'\n' in head.replace(_CRLF, b'') or b'\r' in head.replace(_CRLF, b''):
+            raise _BadRequestError('malformed request: bare CR or LF in headers')
         request_line, _, header_block = head.partition(_CRLF)
         method, _, rest = request_line.decode('latin-1').partition(' ')
         target = rest.rsplit(' ', 1)[0].strip()  # drop the trailing "HTTP/1.1"
@@ -389,15 +409,22 @@ class HttpHatch:
             upstream.settimeout(None)
             if req.is_connect:
                 return Tunnel(upstream)
-            headers = _forward_request_headers(req.headers, len(req.body))
-            upstream.sendall(
-                f'{req.method} {req.origin_target} HTTP/1.1'.encode('latin-1')
-                + _CRLF
-                + _encode_headers(headers)
-                + _HEADER_END
-                + req.body
-            )
-            head, leftover = _read_headers(upstream)
+            # From here upstream must be closed on any failure, or its fd leaks
+            # (an allowlisted host that RSTs mid-exchange would otherwise walk
+            # the host proxy to EMFILE); the success path hands it to _closing.
+            try:
+                headers = _forward_request_headers(req.headers, len(req.body))
+                upstream.sendall(
+                    f'{req.method} {req.origin_target} HTTP/1.1'.encode('latin-1')
+                    + _CRLF
+                    + _encode_headers(headers)
+                    + _HEADER_END
+                    + req.body
+                )
+                head, leftover = _read_headers(upstream)
+            except OSError:
+                upstream.close()
+                return Response.bad_gateway()
             if head is None:
                 upstream.close()
                 return Response.bad_gateway('no response from upstream')
@@ -503,20 +530,25 @@ def _decode_body(
 def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
     total = 0
     while True:
-        size_line = reader.readline().strip()
-        if not size_line:
+        raw = reader.readline()
+        if not raw:  # EOF before a size line: truncated. Stop — do NOT spin on b''.
+            raise ValueError('truncated chunked body')
+        size_line = raw.strip()
+        if not size_line:  # tolerate a stray blank line between chunks
             continue
         size = int(size_line.split(b';', 1)[0], 16)
         if size == 0:
-            while reader.readline().strip():  # consume any trailers
+            while reader.readline().strip():  # consume any trailers (b'' at EOF ends it)
                 pass
             return
-        data = reader.read(size)
-        reader.read(2)  # trailing CRLF
-        total += len(data)
+        # Check the declared size up front so one huge chunk can't be buffered
+        # past the cap before the check (unlike Content-Length, which is bounded
+        # in _iter_fixed); max_bytes==0 means unbounded (the streaming path).
+        total += size
         if max_bytes and total > max_bytes:
             raise ValueError('body exceeds max_body_bytes')
-        yield data
+        yield reader.read(size)
+        reader.read(2)  # trailing CRLF
 
 
 def _iter_fixed(reader: _SockReader, remaining: int, max_bytes: int) -> Iterator[bytes]:

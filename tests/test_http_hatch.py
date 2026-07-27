@@ -253,6 +253,87 @@ def test_steer_https_to_http_refuses_connect_with_guidance(origin):
     assert b'ANTHROPIC_BASE_URL' in raw
 
 
+# -- regression: hostile input (adversarial review findings) ----------------- #
+def test_bare_lf_header_is_rejected_not_smuggled(origin):
+    # A bare LF inside a header value must not be re-serialized upstream as a
+    # separate header line (CL.TE request smuggling); reject with 400.
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(
+            f'GET http://{origin}/ HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'X-Foo: x\nTransfer-Encoding: chunked\r\n\r\n'
+        )
+        raw = _recv_all(sock)
+    hatch.close()
+    assert raw.split(b' ', 2)[1] == b'400'
+
+
+def test_truncated_chunked_request_does_not_hang(origin):
+    # A chunked request body that EOFs before a size line must not spin the
+    # worker at 100% CPU — the connection is torn down promptly.
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode() + b'Transfer-Encoding: chunked\r\n\r\n'
+        )
+        sock.shutdown(socket.SHUT_WR)  # truncate: no chunk ever arrives
+        assert sock.recv(4096) == b''  # server tears the connection down, no hang
+        sock.close()
+    hatch.close()
+
+
+def test_chunked_request_body_respects_max_body_bytes(origin):
+    # A single oversized declared chunk must be refused up front, not buffered.
+    hatch = HttpHatch(allow_hosts({origin}), max_body_bytes=1024)
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'Transfer-Encoding: chunked\r\n\r\n'
+            + b'100000\r\n'  # 1 MiB declared chunk >> the 1 KiB cap
+        )
+        assert sock.recv(4096) == b''  # rejected before the body is read
+        sock.close()
+    hatch.close()
+
+
+def test_stalled_guest_is_timed_out_not_pinned():
+    # A slowloris that sends a partial header then stalls must not hold a worker.
+    hatch = HttpHatch(allow_hosts(set()), connect_timeout=0.5)
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(b'GET http://x/ HTTP/1.1\r\nHost: x\r\n')  # no terminating blank line
+        assert sock.recv(4096) == b''  # read times out host-side, connection closed
+        sock.close()
+    hatch.close()
+
+
+def test_upstream_reset_after_accept_is_502_not_a_leak():
+    # If an allowed upstream accepts then closes before responding, the hatch
+    # answers 502 and does not leak the upstream fd (exercises the failure path).
+    dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    dead.bind(('127.0.0.1', 0))
+    dead.listen(1)
+    dead_hp = f'127.0.0.1:{dead.getsockname()[1]}'
+
+    def slam():
+        conn, _ = dead.accept()
+        conn.close()  # accept then immediately drop
+
+    threading.Thread(target=slam, daemon=True).start()
+    hatch = HttpHatch(allow_hosts({dead_hp}))
+    with hatch.accepting():
+        status, _ = _http_get(hatch, f'http://{dead_hp}/x', dead_hp)
+    hatch.close()
+    dead.close()
+    assert status == 502
+
+
 # -- guest-side relay end-to-end (real shim code) ---------------------------- #
 def _tcp_get(proxy_addr, url, host):
     sock = socket.create_connection(proxy_addr, timeout=10)
