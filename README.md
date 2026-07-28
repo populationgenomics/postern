@@ -163,6 +163,11 @@ Both proxy modes work: absolute-form for plain HTTP (fully visible), and
 payload, so per-message intervention needs an `http://` base URL or TLS
 termination). This proxy parses attacker-controlled HTTP, so it is the most
 security-sensitive host-side surface — with a bare handler you own the policy.
+The forwarded `Host` is re-derived from the policy-checked authority (a guest
+can't pass `allow_hosts` then steer a host-routed upstream elsewhere), and
+CONNECT authorities are canonicalized like absolute-form. `allow_hosts` is a
+real boundary; `deny_hosts` is convenience only — a name it doesn't list can
+still resolve to a blocked address, so don't build a boundary on it.
 
 ## Install
 

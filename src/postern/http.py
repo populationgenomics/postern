@@ -41,14 +41,20 @@ handler can intervene per message with `sse_events` / `encode_sse`:
 
 **HTTPS.** A CONNECT tunnel is opaque TLS — the proxy sees only ``host:port``,
 so per-message intervention is impossible without terminating TLS (a separate,
-opt-in concern). Nothing downgrades https→http on its own. To get plaintext for
-a cooperative client, point it at an ``http://`` base URL (e.g.
-``ANTHROPIC_BASE_URL``) and have your handler originate TLS upstream; or refuse
-CONNECT with a `Response` that says so — see `steer_https_to_http`.
+opt-in concern). Nothing downgrades https→http on its own; refuse CONNECT with a
+`Response` that says so — see `steer_https_to_http`. ``forward`` dials the
+upstream in **plaintext** (never ``ssl``-wrapped), so it reaches ``http://``
+origins only; originating TLS to an ``https``-only upstream (the http→https
+upgrade a cooperative ``ANTHROPIC_BASE_URL``-style client would want) needs a
+TLS-originating handler, not yet provided here.
 
 Trust model: every byte from the guest is attacker-controlled, so this is the
-most security-sensitive host-side surface. With a bare handler *you* own the
-policy; most callers should wrap `allow_hosts`/`deny_hosts`.
+most security-sensitive host-side surface. The ``Host`` header is re-derived
+from the policy-checked authority (a guest can't steer a host-routed upstream
+past `allow_hosts`), and CONNECT authorities are canonicalized like absolute-form
+targets. `allow_hosts` is a real boundary; `deny_hosts` is convenience only
+(a name it doesn't list can still resolve to a blocked address). With a bare
+handler *you* own the policy; most callers should wrap `allow_hosts`.
 """
 
 from __future__ import annotations
@@ -80,6 +86,10 @@ _HOP_BY_HOP = frozenset(
 # Framing headers we re-derive rather than copy (bodies are re-emitted
 # close-delimited, so a stale length/encoding would corrupt the stream).
 _FRAMING = frozenset({b'content-length', b'transfer-encoding'})
+# Host is re-derived from the policy-checked authority, never copied from the
+# guest — otherwise a guest dials an allowlisted host but sets Host: elsewhere
+# and a host-routed front end serves a backend of its choosing (RFC 9110 §7.2).
+_HOST = frozenset({b'host'})
 
 
 class _BadRequestError(Exception):
@@ -108,6 +118,18 @@ class Request:
 
     def header(self, name: str) -> str | None:
         return _get(self.headers, name)
+
+    def set_header(self, name: str, value: str) -> None:
+        """Set ``name`` to ``value``, dropping any existing copies.
+
+        Use this (not ``headers.append``) when injecting host-side state such as
+        an auth header: a bare append leaves a guest-supplied duplicate in place,
+        and many upstreams honour the last value, so the guest could override
+        what the handler set.
+        """
+        lowered = name.lower()
+        self.headers = [(k, v) for k, v in self.headers if k.lower() != lowered]
+        self.headers.append((name, value))
 
 
 @dataclasses.dataclass
@@ -171,7 +193,16 @@ def allow_hosts(allowed: Iterable[str]) -> Handler:
 
 
 def deny_hosts(denied: Iterable[str]) -> Handler:
-    """Forward everywhere except ``denied`` destinations (``host`` or ``host:port``)."""
+    """Forward everywhere except ``denied`` destinations (``host`` or ``host:port``).
+
+    Convenience, **not a destination boundary.** A name-based denylist can't stop
+    a determined guest: a name resolving to the same address (``http://x/`` whose
+    A record is the blocked IP) passes the string check untouched, and alternate
+    IP encodings (``2852039166``, ``0xa9fea9fe`` → ``169.254.169.254``) resolve to
+    a blocked address the string never matches. To actually stop SSRF/IMDS,
+    filter on the *resolved* address (a private-range block), or use `allow_hosts`
+    — an explicit allowlist a guest cannot expand.
+    """
     denied = frozenset(denied)
 
     def handler(req: Request, forward: Forward) -> Response | Tunnel:
@@ -423,7 +454,7 @@ class HttpHatch:
             # (an allowlisted host that RSTs mid-exchange would otherwise walk
             # the host proxy to EMFILE); the success path hands it to _closing.
             try:
-                headers = _forward_request_headers(req.headers, len(req.body))
+                headers = _forward_request_headers(req.headers, len(req.body), req.host, req.port)
                 upstream.sendall(
                     f'{req.method} {req.origin_target} HTTP/1.1'.encode('latin-1')
                     + _CRLF
@@ -620,8 +651,16 @@ def _write_response(conn: socket.socket, resp: Response) -> None:
     conn.close()
 
 
-def _forward_request_headers(headers: list[tuple[str, str]], body_len: int) -> list[tuple[str, str]]:
-    kept = [(k, v) for k, v in headers if k.lower().encode() not in _HOP_BY_HOP | _FRAMING]
+def _forward_request_headers(
+    headers: list[tuple[str, str]], body_len: int, host: str, port: int
+) -> list[tuple[str, str]]:
+    # Drop every guest-supplied Host and re-derive exactly one from the
+    # policy-checked authority (host/port that allow_hosts approved and forward
+    # dials), so the value the upstream routes on is the value that was
+    # authorized — closing the vhost-confusion bypass and the duplicate-Host
+    # desync in one move.
+    kept = [(k, v) for k, v in headers if k.lower().encode() not in _HOP_BY_HOP | _FRAMING | _HOST]
+    kept.append(('Host', host if port == 80 else f'{host}:{port}'))
     if body_len:
         kept.append(('Content-Length', str(body_len)))
     kept.append(('Connection', 'close'))  # so upstream EOFs the (close-delimited) response
@@ -659,10 +698,14 @@ def _get(headers: list[tuple[str, str]], name: str) -> str | None:
 
 
 def _split_authority(authority: str, *, default_port: int) -> tuple[str, int]:
-    host, sep, port = authority.rpartition(':')
-    if sep and host and port.isdigit():
-        return host, int(port)
-    return authority, default_port
+    # Canonicalize the CONNECT authority through the same parser as absolute-form
+    # (urlsplit lowercases the host, strips userinfo, unbrackets IPv6), so a
+    # handler policing on req.host sees one canonical form on both paths — no
+    # `CONNECT LOCALHOST` vs `http://LOCALHOST/` case/normalization gap.
+    parts = urllib.parse.urlsplit(f'//{authority}')
+    host = parts.hostname or authority
+    port = parts.port if parts.port is not None else default_port
+    return host, port
 
 
 def _pump(src: socket.socket, dst: socket.socket) -> None:

@@ -18,7 +18,16 @@ import threading
 import pytest
 
 import postern
-from postern.http import HttpHatch, Response, allow_hosts, deny_hosts, encode_sse, sse_events, steer_https_to_http
+from postern.http import (
+    HttpHatch,
+    Request,
+    Response,
+    allow_hosts,
+    deny_hosts,
+    encode_sse,
+    sse_events,
+    steer_https_to_http,
+)
 
 
 def _load_guest_shim():
@@ -251,6 +260,69 @@ def test_steer_https_to_http_refuses_connect_with_guidance(origin):
     hatch.close()
     assert raw.split(b' ', 2)[1] == b'405'
     assert b'ANTHROPIC_BASE_URL' in raw
+
+
+# -- security review: Host pinning + CONNECT canonicalization ---------------- #
+def test_host_header_is_pinned_to_the_dialed_authority(origin):
+    # A guest that passes the allowlist by dialing an allowed host must not then
+    # steer a host-routed front end elsewhere via a spoofed Host header.
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(f'GET http://{origin}/ HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n'.encode())
+        raw = _recv_all(sock)
+    hatch.close()
+    body = json.loads(raw.split(b'\r\n\r\n', 1)[1])
+    assert body['host'] == origin  # forwarded Host is the policy-checked authority
+    assert 'attacker' not in body['host']
+
+
+def test_duplicate_host_headers_are_all_replaced(origin):
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(
+            f'GET http://{origin}/ HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\nConnection: close\r\n\r\n'.encode()
+        )
+        raw = _recv_all(sock)
+    hatch.close()
+    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['host'] == origin
+
+
+def test_missing_host_is_synthesized(origin):
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(f'GET http://{origin}/ HTTP/1.1\r\nConnection: close\r\n\r\n'.encode())
+        raw = _recv_all(sock)
+    hatch.close()
+    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['host'] == origin
+
+
+def test_connect_authority_is_canonicalized_like_absolute_form():
+    # A handler sees one canonical req.host on both the absolute-form and CONNECT
+    # paths — no case/normalization gap that de-syncs a string-matching handler.
+    seen = []
+
+    def handler(req, _forward):
+        seen.append(req.host)
+        return Response.text(200, 'OK', 'noted')  # don't dial; just record
+
+    hatch = HttpHatch(handler)
+    with hatch.accepting():
+        _http_get(hatch, 'http://EXAMPLE.COM/', 'x')
+        sock = _proxy_conn(hatch)
+        sock.sendall(b'CONNECT EXAMPLE.COM:443 HTTP/1.1\r\nHost: x\r\n\r\n')
+        _recv_all(sock)
+    hatch.close()
+    assert set(seen) == {'example.com'}  # both lowercased
+
+
+def test_set_header_drops_guest_duplicates():
+    req = Request('GET', 'http://x/', [('X-Api-Key', 'guest'), ('x-api-key', 'guest2')], 'x', 80, is_connect=False)
+    req.set_header('X-Api-Key', 'SECRET')
+    values = [v for k, v in req.headers if k.lower() == 'x-api-key']
+    assert values == ['SECRET']  # both guest copies (any case) replaced by one
 
 
 # -- regression: hostile input (adversarial review findings) ----------------- #
