@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import ipaddress
 import os
 import socket
 import tempfile
@@ -175,6 +176,9 @@ class Tunnel:
 
 Forward = Callable[[Request], 'Response | Tunnel']
 Handler = Callable[[Request, Forward], 'Response | Tunnel']
+# A dial guard: given a *resolved* destination address, return True to block it.
+# Applied inside forward, after resolution and before connect (see HttpHatch).
+AddressGuard = Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]
 
 
 # --------------------------------------------------------------------------- #
@@ -211,6 +215,24 @@ def deny_hosts(denied: Iterable[str]) -> Handler:
         return forward(req)
 
     return handler
+
+
+def block_private() -> AddressGuard:
+    """A dial guard blocking any non-globally-routable destination address.
+
+    Pass as ``HttpHatch(handler, block=block_private())``. Unlike `deny_hosts`,
+    it filters the *resolved* address (loopback, link-local incl. the
+    ``169.254.169.254`` cloud-metadata endpoint, RFC1918, CGNAT, ``::1``, ULA,
+    ``fe80::/10``, reserved/multicast), so it can't be dodged by a name that
+    resolves to an internal IP or by an alternate numeric encoding — the real
+    SSRF/IMDS boundary. The guest is dialled at the exact address the guard
+    vetted (no re-resolution), closing the check-then-resolve rebinding window.
+    """
+
+    def blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return not ip.is_global
+
+    return blocked
 
 
 def steer_https_to_http(inner: Handler, *, hint: str = '') -> Handler:
@@ -316,6 +338,7 @@ class HttpHatch:
         self,
         handler: Handler,
         *,
+        block: AddressGuard | None = None,
         socket_path: str | os.PathLike[str] | None = None,
         max_workers: int = 16,
         connect_timeout: float = 10.0,
@@ -326,6 +349,11 @@ class HttpHatch:
         Args:
             handler: ``handler(request, forward) -> Response | Tunnel``. It owns
                 all policy — wrap `allow_hosts`/`deny_hosts` for the common case.
+            block: A dial guard (e.g. `block_private`) applied to the *resolved*
+                destination address inside ``forward``: if it returns True the
+                request is refused, and an allowed dial connects to the exact
+                vetted address (no re-resolution). The address-level SSRF/IMDS
+                boundary a name-based `deny_hosts` can't be.
             socket_path: Where to bind the UDS. Defaults to a fresh ``0700`` temp
                 dir (host-side isolation rests on that dir, per F9).
             max_workers: Concurrent guest connections; a CONNECT tunnel or an
@@ -334,6 +362,7 @@ class HttpHatch:
             max_body_bytes: Cap on a buffered request body.
         """
         self._handler = handler
+        self._block = block
         self._timeout = connect_timeout
         self._max_body = max_body_bytes
         if socket_path is None:
@@ -441,12 +470,42 @@ class HttpHatch:
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
         return Request(method, target, headers, host, port, is_connect=False, origin_target=origin, body=body)
 
-    def _make_forward(self) -> Forward:
-        def forward(req: Request) -> Response | Tunnel:
+    def _dial(self, host: str, port: int) -> socket.socket | Response:
+        """Connect to ``host:port``, or return a 403/502 Response.
+
+        With no ``block`` guard this is a plain ``create_connection`` (resolves
+        and tries every address, as before). With a guard, resolve once and dial
+        only a *vetted resolved address* — so the address the guard approved is
+        the address connected (no second resolution, no DNS-rebinding window),
+        and a name/encoding that resolves to a blocked address is refused.
+        """
+        if self._block is None:
             try:
-                upstream = socket.create_connection((req.host, req.port), timeout=self._timeout)
+                return socket.create_connection((host, port), timeout=self._timeout)
             except OSError:
                 return Response.bad_gateway()
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError:
+            return Response.bad_gateway('cannot resolve upstream')
+        allowed_seen = False
+        for info in infos:
+            ip = str(info[4][0])
+            if self._block(ipaddress.ip_address(ip)):
+                continue
+            allowed_seen = True
+            try:
+                return socket.create_connection((ip, port), timeout=self._timeout)
+            except OSError:
+                continue
+        return Response.bad_gateway() if allowed_seen else Response.forbidden(f'{host} resolves to a blocked address')
+
+    def _make_forward(self) -> Forward:
+        def forward(req: Request) -> Response | Tunnel:
+            dialed = self._dial(req.host, req.port)
+            if isinstance(dialed, Response):
+                return dialed
+            upstream = dialed
             upstream.settimeout(None)
             if req.is_connect:
                 return Tunnel(upstream)

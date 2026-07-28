@@ -8,6 +8,7 @@ server, not the sandbox.
 
 import http.server
 import importlib.util
+import ipaddress
 import json
 import os
 import pathlib
@@ -23,6 +24,7 @@ from postern.http import (
     Request,
     Response,
     allow_hosts,
+    block_private,
     deny_hosts,
     encode_sse,
     sse_events,
@@ -323,6 +325,38 @@ def test_set_header_drops_guest_duplicates():
     req.set_header('X-Api-Key', 'SECRET')
     values = [v for k, v in req.headers if k.lower() == 'x-api-key']
     assert values == ['SECRET']  # both guest copies (any case) replaced by one
+
+
+# -- block_private: address-level SSRF/IMDS boundary ------------------------- #
+def test_block_private_blocks_internal_allows_global():
+    blocked = block_private()
+    for ip in (
+        '169.254.169.254',  # cloud metadata
+        '127.0.0.1',
+        '10.0.0.1',
+        '172.16.0.1',
+        '192.168.1.1',
+        '100.64.0.1',  # CGNAT
+        '0.0.0.0',  # noqa: S104 — testing that unspecified is blocked
+        '::1',
+        'fe80::1',
+        'fc00::1',  # ULA
+    ):
+        assert blocked(ipaddress.ip_address(ip)), ip
+    for ip in ('8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:4700:4700::1111'):
+        assert not blocked(ipaddress.ip_address(ip)), ip
+
+
+def test_block_overrides_an_allowed_name_on_the_resolved_address(origin):
+    # block filters the *resolved* address, so it refuses the loopback origin
+    # even though its host:port is on the allowlist — defense in depth a
+    # name-based deny_hosts can't provide.
+    hatch = HttpHatch(allow_hosts({origin}), block=block_private())
+    with hatch.accepting():
+        status, body = _http_get(hatch, f'http://{origin}/x', origin)
+    hatch.close()
+    assert status == 403
+    assert b'blocked address' in body
 
 
 # -- regression: hostile input (adversarial review findings) ----------------- #
