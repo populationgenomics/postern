@@ -12,11 +12,15 @@ generated stubs needed. Like ``test_grpc_hatch``, it uses a raw-bytes generic
 handler instead of protoc output so it runs anywhere grpcio is installed.
 """
 
+import http.server
+import threading
+
 import grpc
 import pytest
 
 from postern import Sandbox, SandboxProfile, available
 from postern.grpc import GrpcHatch
+from postern.http import HttpHatch, allow_hosts
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
 
@@ -86,3 +90,45 @@ def test_guest_has_no_network_but_still_reaches_the_hatch():
     assert 'no-egress' in result.stdout
     assert 'EGRESS' not in result.stdout
     assert 'HATCH hi' in result.stdout
+
+
+class _Origin(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'origin-ok'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args, **_kwargs):
+        pass
+
+
+def test_guest_reaches_both_a_grpc_hatch_and_an_http_proxy_hatch():
+    # Both channels in one sandbox: dial the gRPC method AND egress via the HTTP
+    # proxy hatch (shim relay + HTTP_PROXY) to an allowlisted host origin. Also
+    # the first e2e of the HTTP-hatch relay path under bubblewrap.
+    origin = http.server.HTTPServer(('127.0.0.1', 0), _Origin)
+    threading.Thread(target=origin.serve_forever, daemon=True).start()
+    dest = f'127.0.0.1:{origin.server_address[1]}'
+
+    grpc_hatch = GrpcHatch(allowlist={_ALLOWED})
+    _install_echo(grpc_hatch._server)
+    http_hatch = HttpHatch(allow_hosts({dest}))
+
+    code = (
+        'import os, grpc, urllib.request\n'
+        "ch = grpc.insecure_channel('unix:' + os.environ['POSTERN_HATCH'])\n"
+        "stub = ch.unary_unary('/svc.Echo/Allowed', request_serializer=bytes, response_deserializer=bytes)\n"
+        "print('GRPC', stub(b'ping', timeout=15).decode())\n"
+        # HTTP_PROXY is exported by the shim's relay; urllib honours it.
+        f"print('HTTP', urllib.request.urlopen('http://{dest}/x', timeout=15).read().decode())\n"
+    )
+    result = Sandbox(SandboxProfile(), hatch=[grpc_hatch, http_hatch]).run_python(code)
+    grpc_hatch.close()
+    http_hatch.close()
+    origin.shutdown()
+    assert result.ok, result.stderr
+    assert 'GRPC ping' in result.stdout  # dial channel
+    assert 'HTTP origin-ok' in result.stdout  # proxy channel
