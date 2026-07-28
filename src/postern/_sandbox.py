@@ -38,7 +38,8 @@ if typing.TYPE_CHECKING:
     from typing_extensions import Self
 
 _GUEST_DIR = '/run/postern'
-_GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'
+_GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # a dial hatch (GrpcHatch) → POSTERN_HATCH
+_GUEST_PROXY_SOCK = f'{_GUEST_DIR}/proxy.sock'  # a proxy hatch (HttpHatch) → POSTERN_PROXY_UDS
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
 _GUEST_STUBS = f'{_GUEST_DIR}/stubs'
 _GUEST_WORKSPACE = '/workspace'
@@ -75,12 +76,25 @@ _PROC_RO_PATHS = (
 
 
 class Hatch(typing.Protocol):
-    """What `Sandbox` needs of a hatch: a UDS path and a serving context."""
+    """What `Sandbox` needs of a hatch: a UDS path and a serving context.
+
+    Two ways the guest reaches a hatch, selected by the optional ``guest_proxy``
+    attribute (absent/false → the first): a **dial** hatch (e.g. `GrpcHatch`)
+    binds its UDS at ``$POSTERN_HATCH`` for the guest to dial directly; a
+    **proxy** hatch (`HttpHatch`, ``guest_proxy = True``) is instead fronted by
+    an in-shim loopback→UDS relay with ``HTTP_PROXY`` pointed at it, so the guest
+    speaks the hatch's protocol over ordinary networking.
+    """
 
     @property
     def socket_path(self) -> str: ...
 
     def accepting(self) -> contextlib.AbstractContextManager[typing.Any]: ...
+
+
+def _is_proxy(hatch: Hatch) -> bool:
+    """Whether ``hatch`` is a proxy hatch (shim relay + HTTP_PROXY) not a dialled one."""
+    return bool(getattr(hatch, 'guest_proxy', False))
 
 
 def available() -> bool:
@@ -326,11 +340,30 @@ def _stub_binds(stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]
 
 
 class Sandbox:
-    """A hardened bubblewrap sandbox with an optional typed :class:`Hatch`."""
+    """A hardened bubblewrap sandbox with optional typed :class:`Hatch` channels.
 
-    def __init__(self, profile: SandboxProfile | None = None, *, hatch: Hatch | None = None) -> None:
+    ``hatch`` is opt-in and takes one hatch or a sequence: pass a `GrpcHatch` for
+    typed methods, an `HttpHatch` for brokered egress, both, or none (no channel
+    is opened). At most one of each kind.
+    """
+
+    def __init__(self, profile: SandboxProfile | None = None, *, hatch: Hatch | Sequence[Hatch] | None = None) -> None:
         self._profile = profile or SandboxProfile()
-        self._hatch = hatch
+        # A sandbox can carry both channels at once — e.g. a GrpcHatch for typed
+        # methods and an HttpHatch for brokered egress — so ``hatch`` accepts one
+        # hatch or a sequence. Each is opt-in: pass none and no channel is opened.
+        # At most one of each kind, since each maps to a single guest env var
+        # (POSTERN_HATCH / POSTERN_PROXY_UDS) and a single bound guest socket.
+        if hatch is None:
+            self._hatches: list[Hatch] = []
+        elif isinstance(hatch, (list, tuple)):
+            self._hatches = list(hatch)
+        else:
+            self._hatches = [typing.cast('Hatch', hatch)]
+        if sum(_is_proxy(h) for h in self._hatches) > 1:
+            raise ValueError('a sandbox takes at most one proxy hatch (HttpHatch)')
+        if sum(not _is_proxy(h) for h in self._hatches) > 1:
+            raise ValueError('a sandbox takes at most one dial hatch (e.g. GrpcHatch)')
         # The workspace persists for this Sandbox's lifetime and is bound
         # read-write at /workspace (the guest's cwd). An explicit profile path is
         # caller-owned; otherwise a private temp dir is created here and removed
@@ -431,10 +464,13 @@ class Sandbox:
     def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
-        With a :class:`Hatch`, the hatch UDS is bound in and its path exported as
-        ``POSTERN_HATCH``; the guest reaches the host's allowlisted gRPC methods
-        by dialing ``unix:$POSTERN_HATCH`` with the generated stub (grpcio and
-        the stubs come from the bound environment). The guest shim applies
+        Each configured :class:`Hatch` binds its own UDS in. A **dial** hatch
+        (e.g. `GrpcHatch`) exports its path as ``POSTERN_HATCH`` and the guest
+        dials ``unix:$POSTERN_HATCH`` with the generated stub. A **proxy** hatch
+        (`HttpHatch`, ``guest_proxy = True``) is instead fronted by an in-shim
+        loopback→UDS relay: the shim exports ``HTTP_PROXY`` so the guest's HTTP
+        clients egress through the allowlisted proxy with no code change. Both can
+        be present at once (distinct guest sockets). The guest shim applies
         ``RLIMIT_NPROC`` before running the code.
         """
         binds = ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
@@ -443,13 +479,22 @@ class Sandbox:
             'POSTERN_NPROC': str(self._profile.rlimit_nproc),
             'POSTERN_AS': str(self._profile.rlimit_as or 0),
             'POSTERN_HATCH': '',
+            'POSTERN_PROXY_UDS': '',
         }
         argv = [self._profile.python, '-u', _GUEST_SHIM]
-        if self._hatch is None:
-            return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
-        binds += ['--bind', self._hatch.socket_path, _GUEST_SOCK]
-        env['POSTERN_HATCH'] = _GUEST_SOCK
-        with self._hatch.accepting():
+        # Bind and serve each hatch on its own guest socket: a dial hatch at
+        # POSTERN_HATCH, a proxy hatch at POSTERN_PROXY_UDS (fronted by the shim's
+        # relay). Distinct paths so both can be present at once; with no hatches
+        # the ExitStack is a no-op and neither channel is opened.
+        with contextlib.ExitStack() as stack:
+            for hatch in self._hatches:
+                if _is_proxy(hatch):
+                    binds += ['--bind', hatch.socket_path, _GUEST_PROXY_SOCK]
+                    env['POSTERN_PROXY_UDS'] = _GUEST_PROXY_SOCK
+                else:
+                    binds += ['--bind', hatch.socket_path, _GUEST_SOCK]
+                    env['POSTERN_HATCH'] = _GUEST_SOCK
+                stack.enter_context(hatch.accepting())
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
 
     def verify(self, *, timeout: float = 30) -> None:
