@@ -432,6 +432,48 @@ def test_chunked_extension_line_is_capped(origin):
     assert rejected
 
 
+def test_hostless_target_is_refused_not_dialled_at_loopback(origin):
+    # `http://:PORT/x` (empty authority) and `GET /x` (origin-form) both leave
+    # host == '', which matches no entry in a name-based policy *and* which
+    # getaddrinfo resolves to loopback — so `deny_hosts` used to wave them
+    # through onto the host's own services. Both must be a 400.
+    port = int(origin.split(':')[1])
+    denied = {'127.0.0.1', 'localhost', '::1', origin}
+    hatch = HttpHatch(deny_hosts(denied))
+    with hatch.accepting():
+        for target in (f'http://:{port}/x', '/x', 'http:///x'):
+            status, body = _http_get(hatch, target, 'example.com')
+            assert status == 400, target
+            assert b'absolute-form' in body, target
+    hatch.close()
+
+
+def test_hostless_connect_authority_is_refused():
+    # `CONNECT` with no parsable host used to fall back to the raw authority as
+    # the "host" (`:443` → the host ':443') or to an empty one, which dialled
+    # loopback:443. No host parsed means malformed.
+    hatch = HttpHatch(deny_hosts({'127.0.0.1', 'localhost'}))
+    with hatch.accepting():
+        for authority in ('', ':443', '/x'):
+            sock = _proxy_conn(hatch)
+            sock.sendall(f'CONNECT {authority} HTTP/1.1\r\nHost: x\r\n\r\n'.encode())
+            raw = _recv_all(sock)
+            assert raw.split(b' ', 2)[1] == b'400', authority
+    hatch.close()
+
+
+def test_unparsable_port_is_a_400_not_a_bare_teardown():
+    # Reading urlsplit's .port raises ValueError for a non-numeric/out-of-range
+    # port; unguarded that escaped as a bare exception and dropped the guest's
+    # connection with no answer at all.
+    hatch = HttpHatch(allow_hosts(set()))
+    with hatch.accepting():
+        for target in ('http://x:99999/', 'http://x:notaport/'):
+            status, _ = _http_get(hatch, target, 'x')
+            assert status == 400, target
+    hatch.close()
+
+
 def test_negative_chunk_size_cannot_credit_the_body_budget(origin):
     # `int(b'-ff', 16)` is a *negative* size: as a budget delta it drove the
     # running total below zero (so max_body_bytes never fired again) and as a

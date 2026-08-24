@@ -466,10 +466,19 @@ class HttpHatch:
         headers = _parse_headers(header_block)
         if method.upper() == 'CONNECT':
             host, port = _split_authority(target, default_port=443)
+            if not host:
+                raise _BadRequestError('malformed CONNECT authority')
             return Request(method, target, headers, host, port, is_connect=True)
-        parts = urllib.parse.urlsplit(target)
+        parts = _urlsplit(target)
         host = parts.hostname or ''
         port = parts.port or (443 if parts.scheme == 'https' else 80)
+        # A proxy request-target must be absolute-form (RFC 9112 §3.2.2), and a
+        # hostless one is not a destination. An origin-form target (`GET /x`) or
+        # an empty authority (`http://:8080/x`) leaves host == '' — which matches
+        # no entry in a name-based policy *and* which getaddrinfo resolves to
+        # loopback, so it walked past `deny_hosts` onto the host's own services.
+        if not host:
+            raise _BadRequestError('proxy requests need an absolute-form target with a host')
         origin = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, '')) or '/'
         reader = _SockReader(leftover, conn)
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
@@ -779,15 +788,32 @@ def _get(headers: list[tuple[str, str]], name: str) -> str | None:
     return None
 
 
+def _urlsplit(url: str) -> urllib.parse.SplitResult:
+    """``urlsplit`` with ``.port`` pre-validated, so a bad port is a 400.
+
+    Reading ``.port`` raises ValueError for a non-numeric or out-of-range port;
+    unguarded that escapes as a bare exception and drops the guest's connection
+    with no answer at all.
+    """
+    parts = urllib.parse.urlsplit(url)
+    try:
+        _ = parts.port
+    except ValueError as exc:
+        raise _BadRequestError('malformed authority: bad port') from exc
+    return parts
+
+
 def _split_authority(authority: str, *, default_port: int) -> tuple[str, int]:
     # Canonicalize the CONNECT authority through the same parser as absolute-form
     # (urlsplit lowercases the host, strips userinfo, unbrackets IPv6), so a
     # handler policing on req.host sees one canonical form on both paths — no
-    # `CONNECT LOCALHOST` vs `http://LOCALHOST/` case/normalization gap.
-    parts = urllib.parse.urlsplit(f'//{authority}')
-    host = parts.hostname or authority
+    # `CONNECT LOCALHOST` vs `http://LOCALHOST/` case/normalization gap. There is
+    # deliberately no fall back to the raw authority when urlsplit finds no host:
+    # that turned `CONNECT :443` into the *host* ':443' and an empty authority
+    # into a loopback dial. No host parsed means malformed, and the caller 400s.
+    parts = _urlsplit(f'//{authority}')
     port = parts.port if parts.port is not None else default_port
-    return host, port
+    return (parts.hostname or ''), port
 
 
 def _pump(src: socket.socket, dst: socket.socket) -> None:
