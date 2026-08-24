@@ -432,6 +432,48 @@ def test_chunked_extension_line_is_capped(origin):
     assert rejected
 
 
+def test_oversized_response_chunk_streams_instead_of_buffering():
+    # `read(size)` used to materialise the whole *declared* chunk before yielding
+    # it, so an upstream chunk header was a host memory lever (64 MiB streamed
+    # inside a chunk declared as 4 GiB cost 68 MiB of host RSS while the guest
+    # saw only the headers). The bytes that have arrived must reach the guest
+    # while the chunk is still open.
+    sent = 128 * 1024
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+    host_port = f'127.0.0.1:{listener.getsockname()[1]}'
+    done = threading.Event()
+
+    def dribbling_origin():
+        conn, _ = listener.accept()
+        while b'\r\n\r\n' not in conn.recv(65536):
+            pass
+        conn.sendall(
+            b'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n'
+            b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+            b'ffffffff\r\n'  # declare 4 GiB, then send a fraction of it and stall
+        )
+        conn.sendall(b'B' * sent)
+        done.wait(10)  # hold the chunk open: nothing else is coming
+        conn.close()
+
+    threading.Thread(target=dribbling_origin, daemon=True).start()
+    hatch = HttpHatch(allow_hosts({host_port}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(10)
+        sock.sendall(f'GET http://{host_port}/big HTTP/1.1\r\nHost: {host_port}\r\n\r\n'.encode())
+        body = b''
+        while len(body) < sent:  # times out (test failure) if the host buffers
+            body += sock.recv(65536)
+        sock.close()
+    done.set()
+    hatch.close()
+    listener.close()
+    assert body.endswith(b'B' * 1024)
+
+
 def test_https_absolute_form_is_refused_not_dialled_in_cleartext():
     # `forward` never wraps TLS, so forwarding an `https://` absolute-form target
     # put the request — including a handler's injected credentials — on the wire

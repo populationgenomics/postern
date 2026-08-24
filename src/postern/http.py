@@ -146,7 +146,8 @@ class Response:
     """A response to send to the guest — synthetic, or returned by ``forward``.
 
     ``body`` is an iterable of byte chunks, consumed lazily and streamed to the
-    guest, so a forwarded SSE/chunked response is never buffered.
+    guest, so a forwarded SSE/chunked response is never buffered — not even
+    within one oversized upstream chunk, which is read out in slices.
     """
 
     status: int
@@ -679,6 +680,25 @@ def _chunk_size(field: bytes) -> int:
     return int(field, 16)
 
 
+def _read_chunk_data(reader: _SockReader, size: int) -> Iterator[bytes]:
+    """Yield exactly ``size`` bytes in slices; EOF before that is a truncation.
+
+    Slices, not one ``read(size)``: the declared chunk size is *upstream's*
+    number, not a bound this side controls, so materialising it made a chunk
+    header a host memory lever — on the response path max_bytes is 0 (uncapped
+    by design, responses stream), and 64 MiB inside a chunk declared as 4 GiB
+    cost 68 MiB of host RSS while the guest saw only the response headers. It
+    also stalled SSE behind any upstream framing events in large chunks.
+    """
+    remaining = size
+    while remaining > 0:
+        data = reader.read(min(65536, remaining))
+        if not data:  # EOF mid-chunk: the declared size will never arrive
+            raise ValueError('truncated chunked body')
+        remaining -= len(data)
+        yield data
+
+
 def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
     # ``total`` counts *everything consumed* — size lines, chunk data, and
     # trailers — against max_bytes, not just the declared data. Otherwise a
@@ -712,7 +732,7 @@ def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
                 if not trailer.strip():
                     return
         budget(size)
-        yield reader.read(size)
+        yield from _read_chunk_data(reader, size)
         reader.read(2)  # trailing CRLF
 
 
