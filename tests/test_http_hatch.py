@@ -242,6 +242,39 @@ def test_connect_tunnel_when_handler_forwards(origin):
     assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['path'] == '/tunnelled'
 
 
+def test_connect_carries_bytes_pipelined_with_the_request():
+    # A client that sends its first TLS flight in the same segment as the CONNECT
+    # had those bytes silently dropped — they were read past the header
+    # terminator into `leftover` and never handed to the tunnel.
+    got = []
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+    host_port = f'127.0.0.1:{listener.getsockname()[1]}'
+
+    def tunnel_target():
+        conn, _ = listener.accept()
+        conn.settimeout(4)
+        try:
+            got.append(conn.recv(65536))
+        except TimeoutError:
+            got.append(b'<nothing arrived>')
+        conn.close()
+
+    threading.Thread(target=tunnel_target, daemon=True).start()
+    hatch = HttpHatch(allow_hosts({host_port}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(f'CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n\r\n'.encode() + b'CLIENT-HELLO-PAYLOAD')
+        deadline = time.monotonic() + 5
+        while not got and time.monotonic() < deadline:
+            time.sleep(0.05)
+        sock.close()
+    hatch.close()
+    listener.close()
+    assert got == [b'CLIENT-HELLO-PAYLOAD']
+
+
 def test_connect_refused_when_handler_denies():
     hatch = HttpHatch(allow_hosts({'example.com:443'}))
     with hatch.accepting():

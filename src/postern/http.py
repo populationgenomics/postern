@@ -560,6 +560,13 @@ class HttpHatch:
             result = self._handler(request, self._make_forward())
             if isinstance(result, Tunnel):
                 conn.sendall(b'HTTP/1.1 200 Connection established' + _HEADER_END)
+                if request.is_connect and leftover:
+                    # An eager client puts its first TLS flight in the same
+                    # segment as the CONNECT. Those bytes were read past the
+                    # header terminator and then dropped on the floor, so the
+                    # handshake saw a truncated ClientHello. They are the
+                    # tunnel's opening bytes; hand them over before splicing.
+                    result.upstream.sendall(leftover)
                 _splice(conn, result.upstream)  # opaque from here — TLS payload never inspected
             else:
                 _write_response(conn, result)
