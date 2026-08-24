@@ -241,6 +241,24 @@ def test_sse_stream_is_intervened_per_event(origin):
     assert b'tick-' not in body  # every event was transformed
 
 
+def test_sse_events_caps_an_unterminated_event():
+    # An event's end is its blank line, so the parser has to buffer the block it
+    # is assembling. An upstream that never sends one grew that buffer until the
+    # host ran out of memory, however lazy the surrounding stream was.
+    def never_terminates():
+        while True:
+            yield b'data: ' + b'x' * 8192 + b'\n'  # no blank line, ever
+
+    with pytest.raises(ValueError, match='max_event_bytes'):
+        list(sse_events(never_terminates(), max_event_bytes=64 * 1024))
+
+
+def test_sse_events_cap_allows_a_large_complete_event():
+    big = 'y' * (200 * 1024)
+    events = list(sse_events([f'data: {big}\n\n'.encode()], max_event_bytes=64 * 1024))
+    assert [e.data for e in events] == [big]  # drained before the cap is consulted
+
+
 def test_sse_events_roundtrip_parses_multiple():
     raw = b'data: one\n\ndata: two\nevent: tick\n\n'
     events = list(sse_events([raw]))

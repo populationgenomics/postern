@@ -90,6 +90,10 @@ _HEXDIGITS = frozenset(b'0123456789abcdefABCDEF')
 # Request bodies are buffered (so a handler can inspect/rewrite them and forward
 # recomputes Content-Length); responses stream. Cap the buffered request body.
 _DEFAULT_MAX_BODY = 16 * 1024 * 1024
+# One SSE event this large is a stream that never terminates an event rather than
+# a message: sse_events must buffer a block until its blank line to know where it
+# ends, so an upstream that never sends one grows that buffer without limit.
+_MAX_SSE_EVENT_BYTES = 1024 * 1024
 # Hop-by-hop headers (RFC 7230 §6.1) a proxy must not forward.
 _HOP_BY_HOP = frozenset(
     {b'connection', b'proxy-connection', b'keep-alive', b'proxy-authorization', b'te', b'trailer', b'upgrade'}
@@ -350,8 +354,14 @@ class SseEvent:
     retry: int | None = None
 
 
-def sse_events(body: Iterable[bytes]) -> Iterator[SseEvent]:
-    """Parse a streaming ``text/event-stream`` body into events, lazily."""
+def sse_events(body: Iterable[bytes], *, max_event_bytes: int = _MAX_SSE_EVENT_BYTES) -> Iterator[SseEvent]:
+    """Parse a streaming ``text/event-stream`` body into events, lazily.
+
+    ``max_event_bytes`` bounds one *incomplete* event. Finding an event's end
+    means buffering up to its terminating blank line, so an upstream that never
+    sends one grows this buffer until the host runs out of memory — the stream is
+    lazy, but the block being assembled is not. Pass 0 to lift the cap.
+    """
     buf = ''
     for chunk in body:
         buf += chunk.decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '\n')
@@ -360,6 +370,8 @@ def sse_events(body: Iterable[bytes]) -> Iterator[SseEvent]:
             event = _parse_sse_block(block)
             if event is not None:
                 yield event
+        if max_event_bytes and len(buf) > max_event_bytes:
+            raise ValueError('SSE event exceeds max_event_bytes')
 
 
 def encode_sse(events: Iterable[SseEvent]) -> Iterator[bytes]:
