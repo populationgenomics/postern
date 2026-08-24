@@ -77,6 +77,11 @@ _MAX_HEADER_BYTES = 64 * 1024
 # A chunked size line (hex size + any chunk-extension) or trailer line this large
 # is abuse: cap it so a giant extension can't be buffered to dodge max_body_bytes.
 _MAX_CHUNK_LINE = 8 * 1024
+# A chunk-size is 1*HEXDIG (RFC 9112 §7.1); 16 digits already spans uint64, so
+# anything longer is abuse rather than a length.
+_MAX_CHUNK_SIZE_DIGITS = 16
+_HEXDIGITS = frozenset(b'0123456789abcdefABCDEF')
+
 # Request bodies are buffered (so a handler can inspect/rewrite them and forward
 # recomputes Content-Length); responses stream. Cap the buffered request body.
 _DEFAULT_MAX_BODY = 16 * 1024 * 1024
@@ -635,6 +640,22 @@ def _decode_body(
     return iter(())
 
 
+def _chunk_size(field: bytes) -> int:
+    """Parse a chunk-size strictly: 1*HEXDIG, no sign, no embedded whitespace.
+
+    ``int(b'-ff', 16)`` returns a *negative* size, and a negative size is corro-
+    sive twice over: as a budget delta it drives the running total below zero so
+    ``max_body_bytes`` never fires again, and as a ``read()`` length it consumes
+    nothing so the loop continues. One 17-byte size line then buys unbounded
+    host-side buffering. Only 1*HEXDIG is a chunk-size — reject the rest rather
+    than let ``int`` reinterpret it.
+    """
+    field = field.strip()  # tolerate the BWS some servers pad before a chunk-ext
+    if not field or len(field) > _MAX_CHUNK_SIZE_DIGITS or not _HEXDIGITS.issuperset(field):
+        raise ValueError('malformed chunk size')
+    return int(field, 16)
+
+
 def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
     # ``total`` counts *everything consumed* — size lines, chunk data, and
     # trailers — against max_bytes, not just the declared data. Otherwise a
@@ -646,6 +667,8 @@ def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
 
     def budget(delta: int) -> None:
         nonlocal total
+        if delta < 0:  # nothing may ever *credit* the budget back — see _chunk_size
+            raise ValueError('negative body budget')
         total += delta
         if max_bytes and total > max_bytes:
             raise ValueError('body exceeds max_body_bytes')
@@ -658,7 +681,7 @@ def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
         size_line = raw.strip()
         if not size_line:  # tolerate a stray blank line between chunks
             continue
-        size = int(size_line.split(b';', 1)[0], 16)
+        size = _chunk_size(size_line.split(b';', 1)[0])
         if size == 0:
             while True:  # consume any trailers (b'' at EOF ends it)
                 trailer = reader.readline(_MAX_CHUNK_LINE)

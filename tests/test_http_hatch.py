@@ -432,6 +432,63 @@ def test_chunked_extension_line_is_capped(origin):
     assert rejected
 
 
+def test_negative_chunk_size_cannot_credit_the_body_budget(origin):
+    # `int(b'-ff', 16)` is a *negative* size: as a budget delta it drove the
+    # running total below zero (so max_body_bytes never fired again) and as a
+    # read() length it consumed nothing (so the loop continued) — one 17-byte
+    # size line bought unbounded host-side buffering, pre-policy. Only 1*HEXDIG
+    # is a chunk-size; anything else is rejected outright.
+    hatch = HttpHatch(allow_hosts({origin}), max_body_bytes=1024)
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'Transfer-Encoding: chunked\r\n\r\n'
+            + b'-ffffffffffffff\r\n'  # negative, and small enough to fit Py_ssize_t
+            + b'\r\n'
+            + b'400000\r\n'  # 4 MiB, which the credited budget would have waved through
+        )
+        assert sock.recv(4096) == b''  # rejected, not buffered
+        sock.close()
+    hatch.close()
+
+
+@pytest.mark.parametrize('size_field', [b'-1', b'+1', b'0x10', b'1 0', b'f' * 17, b''])
+def test_malformed_chunk_size_is_rejected(origin, size_field):
+    # Sign, base prefix, embedded whitespace, an absurd digit count, an empty
+    # field: none is a chunk-size, and none may reach int(..., 16).
+    hatch = HttpHatch(allow_hosts({origin}), max_body_bytes=1024)
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'Transfer-Encoding: chunked\r\n\r\n'
+            + size_field
+            + b'\r\nquxx\r\n0\r\n\r\n'
+        )
+        assert sock.recv(4096) == b''
+        sock.close()
+    hatch.close()
+
+
+def test_chunk_extension_after_bws_still_parses(origin):
+    # Strictness must not break the servers that pad BWS before a chunk-ext.
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'Transfer-Encoding: chunked\r\n\r\n'
+            + b'4 ;name=value\r\nbody\r\n0\r\n\r\n'
+        )
+        raw = _recv_all(sock)
+    hatch.close()
+    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['received'] == 'body'
+
+
 def test_stalled_guest_is_timed_out_not_pinned():
     # A slowloris that sends a partial header then stalls must not hold a worker.
     hatch = HttpHatch(allow_hosts(set()), connect_timeout=0.5)
