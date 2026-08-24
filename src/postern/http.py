@@ -69,6 +69,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent import futures
@@ -367,7 +368,10 @@ class HttpHatch:
                 dir (host-side isolation rests on that dir, per F9).
             max_workers: Concurrent guest connections; a CONNECT tunnel or an
                 open SSE stream holds one for its lifetime, so size accordingly.
-            connect_timeout: Seconds to wait dialling an upstream destination.
+            connect_timeout: Seconds to wait dialling an upstream destination,
+                and the total budget for reading a guest's request line, headers
+                and body (an absolute deadline, so dripping the bytes slowly
+                does not extend it).
             max_body_bytes: Cap on a buffered request body.
         """
         self._handler = handler
@@ -426,14 +430,16 @@ class HttpHatch:
         # A single hostile connection must never take a pool worker down.
         try:
             # Bound the pre-response phase (header + request-body read) so a
-            # stalled/slowloris guest cannot pin a pool worker forever; cleared
-            # before the (possibly long-lived) forward/stream/tunnel phase.
-            conn.settimeout(self._timeout)
-            head, leftover = _read_headers(conn)
+            # stalled *or dripping* guest cannot pin a pool worker; cleared
+            # before the (possibly long-lived) forward/stream/tunnel phase. This
+            # is an absolute budget, not conn.settimeout's per-recv timer, which
+            # every arriving byte reset (see _Deadline).
+            deadline = _Deadline(self._timeout)
+            head, leftover = _read_headers(conn, deadline)
             if head is None:
                 conn.close()
                 return
-            request = self._parse_request(head, leftover, conn)
+            request = self._parse_request(head, leftover, conn, deadline)
             # Clear the deadline for the forward/stream/tunnel phase: a legitimate
             # long download, idle-gapped SSE stream, or CONNECT tunnel must not be
             # killed on a timer. The cost is that a guest which stops *reading* can
@@ -455,7 +461,7 @@ class HttpHatch:
             with contextlib.suppress(OSError):
                 conn.close()
 
-    def _parse_request(self, head: bytes, leftover: bytes, conn: socket.socket) -> Request:
+    def _parse_request(self, head: bytes, leftover: bytes, conn: socket.socket, deadline: _Deadline) -> Request:
         # Any bare CR or LF in the header block (valid HTTP separates only with
         # CRLF) is a request-smuggling / header-injection attempt: a bare-LF
         # inside a header value would survive _parse_headers (which splits on
@@ -495,7 +501,7 @@ class HttpHatch:
                 'cleartext http only); use CONNECT for HTTPS or an http:// base URL'
             )
         origin = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, '')) or '/'
-        reader = _SockReader(leftover, conn)
+        reader = _SockReader(leftover, conn, deadline)
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
         return Request(method, target, headers, host, port, is_connect=False, origin_target=origin, body=body)
 
@@ -585,17 +591,41 @@ class HttpHatch:
 # --------------------------------------------------------------------------- #
 # Wire helpers                                                                  #
 # --------------------------------------------------------------------------- #
+class _Deadline:
+    """An absolute budget for a read phase, re-armed before every recv.
+
+    ``socket.settimeout`` is a per-``recv`` timer, not a budget for the phase:
+    each byte that arrives resets it, so a guest dripping one byte every
+    (timeout - ε) held a pool worker indefinitely without ever tripping it —
+    64 KiB of headers, then a whole ``max_body_bytes`` of body, at any pace it
+    liked. Arm the socket with what is *left* of the budget instead, so the
+    phase ends on schedule however the bytes are spaced.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self._expiry = time.monotonic() + seconds
+
+    def arm(self, sock: socket.socket) -> None:
+        remaining = self._expiry - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('timed out reading the request')
+        sock.settimeout(remaining)
+
+
 class _SockReader:
     """A small buffered reader over ``initial`` bytes then a stream socket."""
 
-    def __init__(self, initial: bytes, sock: socket.socket) -> None:
+    def __init__(self, initial: bytes, sock: socket.socket, deadline: _Deadline | None = None) -> None:
         self._buf = bytearray(initial)
         self._sock = sock
+        self._deadline = deadline  # guest-request phase only; a response must not be timed
         self._eof = False
 
     def _fill(self) -> bool:
         if self._eof:
             return False
+        if self._deadline is not None:
+            self._deadline.arm(self._sock)
         chunk = self._sock.recv(65536)
         if not chunk:
             self._eof = True
@@ -631,10 +661,12 @@ class _SockReader:
         return out
 
 
-def _read_headers(sock: socket.socket) -> tuple[bytes | None, bytes]:
+def _read_headers(sock: socket.socket, deadline: _Deadline | None = None) -> tuple[bytes | None, bytes]:
     """Read to end-of-headers; return (header_bytes, bytes_read_past_them)."""
     buf = b''
     while _HEADER_END not in buf:
+        if deadline is not None:
+            deadline.arm(sock)
         chunk = sock.recv(65536)
         if not chunk:
             return (buf or None), b''

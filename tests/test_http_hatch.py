@@ -15,6 +15,7 @@ import pathlib
 import socket
 import stat
 import threading
+import time
 
 import pytest
 
@@ -622,6 +623,40 @@ def test_chunk_extension_after_bws_still_parses(origin):
         raw = _recv_all(sock)
     hatch.close()
     assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['received'] == 'body'
+
+
+def test_dripping_guest_hits_the_phase_deadline_not_the_per_read_timer():
+    # conn.settimeout is a per-recv timer that every arriving byte resets, so a
+    # guest dripping one header line per (timeout - eps) held a pool worker
+    # indefinitely without ever tripping it — 8s and counting against a 0.5s
+    # timeout. The pre-response phase needs an absolute budget.
+    hatch = HttpHatch(allow_hosts(set()), connect_timeout=1.0)
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(b'GET http://x/ HTTP/1.1\r\n')  # no terminating blank line
+        start = time.monotonic()
+        closed = False
+        while time.monotonic() - start < 8:
+            time.sleep(0.3)  # comfortably inside the per-recv timer, forever
+            try:
+                sock.sendall(b'X-Pad: y\r\n')
+            except OSError:
+                closed = True
+                break
+            sock.setblocking(False)
+            try:
+                closed = sock.recv(1) == b''
+            except BlockingIOError:
+                pass
+            finally:
+                sock.setblocking(True)
+            if closed:
+                break
+        elapsed = time.monotonic() - start
+        sock.close()
+    hatch.close()
+    assert closed, 'a dripping guest held the worker past the phase deadline'
+    assert elapsed < 5, f'torn down late ({elapsed:.1f}s) for a 1.0s budget'
 
 
 def test_stalled_guest_is_timed_out_not_pinned():
