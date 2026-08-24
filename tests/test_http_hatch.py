@@ -1054,6 +1054,46 @@ def test_a_non_socket_at_the_path_is_never_unlinked(short_dir):
     assert precious.read_text() == 'do not delete me'
 
 
+def test_start_after_close_says_so_instead_of_dropping_connections(origin):
+    # close() is terminal — the pool is shut down for good and an owned temp dir
+    # is gone — but start() rebound happily and then accepted every connection
+    # and silently dropped it (submit raised RuntimeError into a suppress()).
+    hatch = HttpHatch(allow_hosts({origin}))
+    hatch.start()
+    assert _http_get(hatch, f'http://{origin}/first', origin)[0] == 200
+    hatch.close()
+    with pytest.raises(RuntimeError, match='closed'):
+        hatch.start()
+
+
+def test_concurrent_start_binds_once(origin):
+    # Two threads calling run_python() on one shared hatch raced start(), and the
+    # loser's listener was orphaned with the path pointing at the winner's.
+    hatch = HttpHatch(allow_hosts({origin}))
+    barrier = threading.Barrier(4)
+
+    def racer():
+        barrier.wait()
+        hatch.start()
+
+    threads = [threading.Thread(target=racer) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    try:
+        assert _http_get(hatch, f'http://{origin}/raced', origin)[0] == 200
+    finally:
+        hatch.close()
+
+
+def test_close_is_idempotent(origin):
+    hatch = HttpHatch(allow_hosts({origin}))
+    hatch.start()
+    hatch.close()
+    hatch.close()  # must not blow up on the already-dropped pool/socket
+
+
 def test_hatch_reused_across_calls(origin):
     hatch = HttpHatch(allow_hosts({origin}))
     with hatch.accepting():

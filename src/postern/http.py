@@ -487,9 +487,15 @@ class HttpHatch:
         else:
             self._dir = None
             self._path = os.fspath(socket_path)
-        self._pool = futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='postern-http')
+        self._max_workers = max_workers
+        self._pool: futures.ThreadPoolExecutor | None = None  # built on start, dropped on close
         self._srv: socket.socket | None = None
         self._started = False
+        self._closed = False
+        # start()/close() mutate the socket, the pool and the temp dir together;
+        # two threads calling run_python() on one shared hatch raced them, and the
+        # loser's listener was orphaned with the path pointing at the winner's.
+        self._lifecycle = threading.Lock()
 
     @property
     def socket_path(self) -> str:
@@ -518,25 +524,36 @@ class HttpHatch:
             )
 
     def start(self) -> None:
-        """Start serving (idempotent). Serves until :meth:`close`."""
-        if self._started:
-            return
-        self._check_socket_dir()
-        # Clear a stale socket from a crashed run (it would EADDRINUSE), but only
-        # if that is what the path is: never unlink a caller's regular file.
-        with contextlib.suppress(FileNotFoundError):
-            if stat.S_ISSOCK(os.stat(self._path).st_mode):
-                os.unlink(self._path)
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(self._path)
-        srv.listen(128)
-        # Deterministic perms, not umask-dependent (F9): the guest runs as a
-        # non-root uid so must connect; host-side isolation rests on the 0700 dir.
-        with contextlib.suppress(OSError):
-            os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
-        self._srv = srv
-        self._started = True
-        threading.Thread(target=self._accept_loop, args=(srv,), daemon=True, name='postern-http-accept').start()
+        """Start serving (idempotent, and safe to call from several threads).
+
+        Serves until :meth:`close`, which is terminal — see there.
+        """
+        with self._lifecycle:
+            if self._started:
+                return
+            if self._closed:
+                raise RuntimeError('this hatch is closed; construct a new HttpHatch to serve again')
+            self._check_socket_dir()
+            # Clear a stale socket from a crashed run (it would EADDRINUSE), but
+            # only if that is what the path is: never unlink a caller's file.
+            with contextlib.suppress(FileNotFoundError):
+                if stat.S_ISSOCK(os.stat(self._path).st_mode):
+                    os.unlink(self._path)
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(self._path)
+            srv.listen(128)
+            # Deterministic perms, not umask-dependent (F9): the guest runs as a
+            # non-root uid so must connect; isolation rests on the 0700 dir.
+            with contextlib.suppress(OSError):
+                os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
+            # A fresh pool each time: close() shuts the old one down for good, and
+            # reusing it made a restarted hatch accept every connection and then
+            # silently drop it (submit raises RuntimeError, which was suppressed).
+            pool = futures.ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix='postern-http')
+            self._pool = pool
+            self._srv = srv
+            self._started = True
+        threading.Thread(target=self._accept_loop, args=(srv, pool), daemon=True, name='postern-http-accept').start()
 
     @contextlib.contextmanager
     def accepting(self) -> Generator[HttpHatch, None, None]:
@@ -544,14 +561,20 @@ class HttpHatch:
         self.start()
         yield self
 
-    def _accept_loop(self, srv: socket.socket) -> None:
+    def _accept_loop(self, srv: socket.socket, pool: futures.ThreadPoolExecutor) -> None:
+        # Hold the socket and pool this loop was started with, not self's current
+        # ones: a close()/start() pair swaps both, and a loop still winding down
+        # on the old socket must not hand work to the new pool.
         while True:
             try:
                 conn, _ = srv.accept()
             except OSError:
                 return  # socket closed by close()
-            with contextlib.suppress(RuntimeError):  # pool shut down mid-accept
-                self._pool.submit(self._serve_conn, conn)
+            try:
+                pool.submit(self._serve_conn, conn)
+            except RuntimeError:  # pool shut down mid-accept: don't strand the conn
+                conn.close()
+                return
 
     # -- one guest connection ------------------------------------------------ #
     def _serve_conn(self, conn: socket.socket) -> None:
@@ -731,13 +754,24 @@ class HttpHatch:
         return forward
 
     def close(self) -> None:
-        """Stop serving, drop the socket, and remove the owned temp dir."""
-        if self._srv is not None:
-            with contextlib.suppress(OSError):
-                self._srv.close()
-            self._srv = None
-        self._started = False
-        self._pool.shutdown(wait=False)
+        """Stop serving, drop the socket, and remove the owned temp dir.
+
+        Idempotent and **terminal**: the worker pool is shut down for good and an
+        owned temp dir is gone, so there is nothing left to bind. It used to look
+        restartable — start() rebound happily — and then accept every connection
+        and silently drop it, because submit() on the dead pool raised into a
+        suppress(). A later start() now says so instead.
+        """
+        with self._lifecycle:
+            self._closed = True
+            if self._srv is not None:
+                with contextlib.suppress(OSError):
+                    self._srv.close()
+                self._srv = None
+            self._started = False
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False)
         with contextlib.suppress(OSError):
             if stat.S_ISSOCK(os.stat(self._path).st_mode):
                 os.unlink(self._path)  # ours to remove; a caller's regular file is not
