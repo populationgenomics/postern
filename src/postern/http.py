@@ -163,6 +163,7 @@ class Request:
     is_connect: bool
     origin_target: str = '/'  # path?query sent upstream in origin-form (HTTP only)
     body: bytes = b''  # buffered request body; a handler may replace it before forwarding
+    tag: str = ''  # the hatch's ``tag`` — which hatch this arrived on, host-set
 
     @property
     def host_port(self) -> str:
@@ -401,6 +402,17 @@ class HttpHatch:
     reaches it via the shim's loopback relay + ``HTTP_PROXY``. Reused across many
     ``run_python`` calls: serves once on first :meth:`accepting`, until
     :meth:`close`.
+
+    **Reuse and attribution.** Requests carry no guest identity — the relay is a
+    byte pump and nothing on the wire says which sandbox a connection came from.
+    So one hatch shared between *mutually untrusted* guests cannot attribute a
+    request, cannot inject per-tenant credentials correctly, and cannot rate
+    limit one guest without limiting the rest (a hostile guest holding workers
+    denies egress to its neighbours). Reuse across sequential ``run_python``
+    calls in one trust domain is what the reuse above is for; to separate trust
+    domains, give each its own hatch and ``tag`` it — a hatch is a socket and a
+    thread pool, so per-guest hatches are cheap — and read `Request.tag` in the
+    handler.
     """
 
     # Reached via the shim's loopback→UDS relay + HTTP_PROXY, not a direct dial
@@ -416,6 +428,7 @@ class HttpHatch:
         max_workers: int = 16,
         connect_timeout: float = 10.0,
         max_body_bytes: int = _DEFAULT_MAX_BODY,
+        tag: str = '',
     ) -> None:
         """Create a hatch that runs ``handler`` for each guest request.
 
@@ -436,9 +449,14 @@ class HttpHatch:
                 and body (an absolute deadline, so dripping the bytes slowly
                 does not extend it).
             max_body_bytes: Cap on a buffered request body.
+            tag: An opaque label echoed on every `Request.tag` this hatch serves.
+                Nothing on the wire identifies the guest, so this is how a
+                handler tells trust domains apart: one tagged hatch each (see
+                "Reuse and attribution" above), not one hatch for all of them.
         """
         self._handler = handler
         self._block = block
+        self._tag = tag
         self._timeout = connect_timeout
         self._max_body = max_body_bytes
         if socket_path is None:
@@ -541,7 +559,7 @@ class HttpHatch:
             host, port = _split_authority(target, default_port=443)
             if not host:
                 raise _BadRequestError('malformed CONNECT authority')
-            return Request(method, target, headers, host, port, is_connect=True)
+            return Request(method, target, headers, host, port, is_connect=True, tag=self._tag)
         parts = _urlsplit(target)
         host = parts.hostname or ''
         port = parts.port or 80
@@ -566,7 +584,9 @@ class HttpHatch:
         origin = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, '')) or '/'
         reader = _SockReader(leftover, conn, deadline)
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
-        return Request(method, target, headers, host, port, is_connect=False, origin_target=origin, body=body)
+        return Request(
+            method, target, headers, host, port, is_connect=False, origin_target=origin, body=body, tag=self._tag
+        )
 
     def _dial(self, host: str, port: int) -> socket.socket | Response:
         """Connect to ``host:port``, or return a 403/502 Response.

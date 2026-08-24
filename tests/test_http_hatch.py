@@ -321,6 +321,29 @@ def test_connect_authority_is_canonicalized_like_absolute_form():
     assert set(seen) == {'example.com'}  # both lowercased
 
 
+def test_tag_reaches_the_handler_on_both_paths(origin):
+    # Nothing on the wire identifies the guest, so a handler separating trust
+    # domains needs one tagged hatch each; the tag must reach it either way in.
+    seen = []
+
+    def handler(req, _forward):
+        seen.append((req.tag, req.is_connect))
+        return Response.forbidden('no')
+
+    hatch = HttpHatch(handler, tag='tenant-a')
+    with hatch.accepting():
+        _http_get(hatch, f'http://{origin}/x', origin)
+        sock = _proxy_conn(hatch)
+        sock.sendall(f'CONNECT {origin} HTTP/1.1\r\nHost: {origin}\r\n\r\n'.encode())
+        _recv_all(sock)
+    hatch.close()
+    assert seen == [('tenant-a', False), ('tenant-a', True)]
+
+
+def test_tag_defaults_to_empty():
+    assert Request('GET', 'http://x/', [], 'x', 80, is_connect=False).tag == ''
+
+
 def test_set_header_drops_guest_duplicates():
     req = Request('GET', 'http://x/', [('X-Api-Key', 'guest'), ('x-api-key', 'guest2')], 'x', 80, is_connect=False)
     req.set_header('X-Api-Key', 'SECRET')
