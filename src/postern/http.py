@@ -165,6 +165,7 @@ class Request:
     origin_target: str = '/'  # path?query sent upstream in origin-form (HTTP only)
     body: bytes = b''  # buffered request body; a handler may replace it before forwarding
     tag: str = ''  # the hatch's ``tag`` — which hatch this arrived on, host-set
+    version: str = ''  # the guest's HTTP version token, e.g. 'HTTP/1.1'
 
     @property
     def host_port(self) -> str:
@@ -575,7 +576,7 @@ class HttpHatch:
                     result.upstream.sendall(leftover)
                 _splice(conn, result.upstream)  # opaque from here — TLS payload never inspected
             else:
-                _write_response(conn, result)
+                _write_response(conn, result, request)
         except _BadRequestError as exc:
             with contextlib.suppress(OSError):
                 _write_response(conn, Response.text(400, 'Bad Request', f'{exc}\n'))
@@ -594,13 +595,17 @@ class HttpHatch:
             raise _BadRequestError('malformed request: bare CR or LF in headers')
         request_line, _, header_block = head.partition(_CRLF)
         method, _, rest = request_line.decode('latin-1').partition(' ')
-        target = rest.rsplit(' ', 1)[0].strip()  # drop the trailing "HTTP/1.1"
+        # Split off the trailing "HTTP/1.1": the version decides whether the
+        # response to this guest can be chunk-framed (see _may_chunk).
+        split_line = rest.rsplit(' ', 1)
+        target = split_line[0].strip()
+        version = split_line[1].strip().upper() if len(split_line) == 2 else ''
         headers = _parse_headers(header_block)
         if method.upper() == 'CONNECT':
             host, port = _split_authority(target, default_port=443)
             if not host:
                 raise _BadRequestError('malformed CONNECT authority')
-            return Request(method, target, headers, host, port, is_connect=True, tag=self._tag)
+            return Request(method, target, headers, host, port, is_connect=True, tag=self._tag, version=version)
         parts = _urlsplit(target)
         host = parts.hostname or ''
         port = parts.port or 80
@@ -632,7 +637,16 @@ class HttpHatch:
         reader = _SockReader(leftover, conn, deadline)
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
         return Request(
-            method, target, headers, host, port, is_connect=False, origin_target=origin, body=body, tag=self._tag
+            method,
+            target,
+            headers,
+            host,
+            port,
+            is_connect=False,
+            origin_target=origin,
+            body=body,
+            tag=self._tag,
+            version=version,
         )
 
     def _dial(self, host: str, port: int) -> socket.socket | Response:
@@ -906,7 +920,10 @@ def _iter_fixed(reader: _SockReader, remaining: int, max_bytes: int) -> Iterator
     while remaining > 0:
         data = reader.read(min(65536, remaining))
         if not data:
-            return
+            # EOF short of the declared Content-Length. Returning here reported a
+            # truncated message as a complete one — the caller could not tell, and
+            # neither then could the guest. It is an error, so raise it.
+            raise ValueError('body shorter than its Content-Length')
         remaining -= len(data)
         yield data
 
@@ -928,15 +945,44 @@ def _closing(body: Iterator[bytes], sock: socket.socket) -> Iterator[bytes]:
             sock.close()
 
 
-def _write_response(conn: socket.socket, resp: Response) -> None:
-    """Write a response to the guest, close-delimited, streaming the body."""
+def _may_chunk(resp: Response, request: Request | None) -> bool:
+    """Whether this response to the guest can carry chunked framing.
+
+    It needs an HTTP/1.1 client to read it, and a message that is allowed a body
+    at all: 1xx/204/304, and any response to HEAD, are bodyless by definition, so
+    framing them would be the error rather than the fix.
+    """
+    if request is None or request.version != 'HTTP/1.1' or request.method.upper() == 'HEAD':
+        return False
+    return not (resp.status in (204, 304) or 100 <= resp.status < 200)
+
+
+def _write_response(conn: socket.socket, resp: Response, request: Request | None = None) -> None:
+    """Write a response to the guest, streaming the body.
+
+    Framed with ``Transfer-Encoding: chunked`` wherever the guest can read it, so
+    that a stream which dies mid-body is *detectable*. Close-delimited framing —
+    the only option before — made a truncated upstream response
+    indistinguishable from a complete one: either way the guest's client saw a
+    clean EOF and a short body, with the upstream's Content-Length stripped (it
+    has to be, since a handler may have replaced the body) and nothing else to
+    check against. If the body iterator now raises part-way, the terminating
+    chunk is never written and the client errors out — which is the point.
+    """
     headers = [(k, v) for k, v in resp.headers if k.lower().encode() not in _HOP_BY_HOP | _FRAMING]
-    headers.append(('Connection', 'close'))  # body is re-emitted close-delimited
+    headers.append(('Connection', 'close'))  # one request per connection, always
+    chunked = _may_chunk(resp, request)
+    if chunked:
+        headers.append(('Transfer-Encoding', 'chunked'))
     conn.sendall(
         f'HTTP/1.1 {resp.status} {resp.reason}'.encode('latin-1') + _CRLF + _encode_headers(headers) + _HEADER_END
     )
     for chunk in resp.body:
-        conn.sendall(chunk)
+        if not chunk:
+            continue  # a zero-length chunk would read as the terminator
+        conn.sendall(f'{len(chunk):x}'.encode('latin-1') + _CRLF + chunk + _CRLF if chunked else chunk)
+    if chunked:
+        conn.sendall(b'0' + _HEADER_END)  # reached only on a complete body
     conn.close()
 
 

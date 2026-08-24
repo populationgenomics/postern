@@ -115,11 +115,32 @@ def _recv_all(sock):
     return raw
 
 
-def _http_get(hatch, url, host):
+def _body(raw):
+    """The response body, de-chunked if the hatch framed it as chunked.
+
+    Raises on a body whose terminating chunk never arrived — which is exactly the
+    truncation that close-delimited framing used to hide.
+    """
+    head, _, body = raw.partition(b'\r\n\r\n')
+    if b'transfer-encoding: chunked' not in head.lower():
+        return body
+    out = b''
+    while True:
+        size_line, sep, body = body.partition(b'\r\n')
+        if not sep:
+            raise ValueError('chunked body ended without its terminating chunk')
+        size = int(size_line.split(b';')[0], 16)
+        if size == 0:
+            return out
+        out += body[:size]
+        body = body[size + 2 :]
+
+
+def _http_get(hatch, url, host, version='HTTP/1.1'):
     sock = _proxy_conn(hatch)
-    sock.sendall(f'GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode())
+    sock.sendall(f'GET {url} {version}\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode())
     raw = _recv_all(sock)
-    return int(raw.split(b' ', 2)[1]), raw.split(b'\r\n\r\n', 1)[1]
+    return int(raw.split(b' ', 2)[1]), _body(raw)
 
 
 # -- batteries: allow / deny ------------------------------------------------- #
@@ -191,7 +212,7 @@ def test_handler_can_rewrite_request_body(origin):
         )
         raw = _recv_all(sock)
     hatch.close()
-    echoed = json.loads(raw.split(b'\r\n\r\n', 1)[1])['received']
+    echoed = json.loads(_body(raw))['received']
     assert 'REDACTED' in echoed
     assert 'redactme' not in echoed
 
@@ -239,7 +260,7 @@ def test_connect_tunnel_when_handler_forwards(origin):
         sock.sendall(f'GET /tunnelled HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n'.encode())
         raw = _recv_all(sock)
     hatch.close()
-    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['path'] == '/tunnelled'
+    assert json.loads(_body(raw))['path'] == '/tunnelled'
 
 
 def test_connect_carries_bytes_pipelined_with_the_request():
@@ -310,7 +331,7 @@ def test_host_header_is_pinned_to_the_dialed_authority(origin):
         sock.sendall(f'GET http://{origin}/ HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n'.encode())
         raw = _recv_all(sock)
     hatch.close()
-    body = json.loads(raw.split(b'\r\n\r\n', 1)[1])
+    body = json.loads(_body(raw))
     assert body['host'] == origin  # forwarded Host is the policy-checked authority
     assert 'attacker' not in body['host']
 
@@ -324,7 +345,7 @@ def test_duplicate_host_headers_are_all_replaced(origin):
         )
         raw = _recv_all(sock)
     hatch.close()
-    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['host'] == origin
+    assert json.loads(_body(raw))['host'] == origin
 
 
 def test_missing_host_is_synthesized(origin):
@@ -334,7 +355,7 @@ def test_missing_host_is_synthesized(origin):
         sock.sendall(f'GET http://{origin}/ HTTP/1.1\r\nConnection: close\r\n\r\n'.encode())
         raw = _recv_all(sock)
     hatch.close()
-    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['host'] == origin
+    assert json.loads(_body(raw))['host'] == origin
 
 
 def test_connect_authority_is_canonicalized_like_absolute_form():
@@ -452,6 +473,96 @@ def test_bare_lf_header_is_rejected_not_smuggled(origin):
         raw = _recv_all(sock)
     hatch.close()
     assert raw.split(b' ', 2)[1] == b'400'
+
+
+def _truncating_origin(after):
+    """An origin that promises `after * 2` bytes of body and delivers half."""
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+
+    def serve():
+        conn, _ = listener.accept()
+        while b'\r\n\r\n' not in conn.recv(65536):
+            pass
+        conn.sendall(
+            f'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {after * 2}\r\n'
+            'Connection: close\r\n\r\n'.encode()
+        )
+        conn.sendall(b'T' * after)  # ...then hang up half way through
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener, f'127.0.0.1:{listener.getsockname()[1]}'
+
+
+def test_a_truncated_upstream_body_is_detectable_by_the_guest():
+    # Close-delimited framing made truncation invisible: the upstream's
+    # Content-Length has to be stripped (a handler may have replaced the body),
+    # so a short body plus a clean EOF looked exactly like a complete response.
+    # Chunked framing gives the guest something to miss.
+    listener, host_port = _truncating_origin(64)
+    hatch = HttpHatch(allow_hosts({host_port}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.sendall(f'GET http://{host_port}/x HTTP/1.1\r\nHost: {host_port}\r\n\r\n'.encode())
+        raw = _recv_all(sock)
+    hatch.close()
+    listener.close()
+    assert b'Transfer-Encoding: chunked' in raw
+    assert not raw.endswith(b'0\r\n\r\n'), 'a truncated body must not be terminated'
+    with pytest.raises(ValueError, match='terminating chunk'):
+        _body(raw)
+
+
+def test_a_complete_body_is_terminated(origin):
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        conn = _proxy_conn(hatch)
+        conn.sendall(f'GET http://{origin}/data HTTP/1.1\r\nHost: {origin}\r\n\r\n'.encode())
+        raw = _recv_all(conn)
+    hatch.close()
+    assert raw.endswith(b'0\r\n\r\n')
+    assert json.loads(_body(raw))['path'] == '/data'
+
+
+def test_http_1_0_guest_gets_close_delimited_framing(origin):
+    # A 1.0 client cannot read chunked, so it keeps the old framing.
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        conn = _proxy_conn(hatch)
+        conn.sendall(f'GET http://{origin}/data HTTP/1.0\r\nHost: {origin}\r\n\r\n'.encode())
+        raw = _recv_all(conn)
+    hatch.close()
+    assert b'Transfer-Encoding' not in raw
+    assert json.loads(_body(raw))['path'] == '/data'
+
+
+@pytest.mark.parametrize('status', [204, 304])
+def test_bodyless_statuses_are_not_chunk_framed(status):
+    def handler(_req, _forward):
+        return Response(status, 'No Content', [], [])
+
+    hatch = HttpHatch(handler)
+    with hatch.accepting():
+        conn = _proxy_conn(hatch)
+        conn.sendall(b'GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n')
+        raw = _recv_all(conn)
+    hatch.close()
+    assert b'Transfer-Encoding' not in raw
+
+
+def test_head_response_is_not_chunk_framed():
+    def handler(_req, _forward):
+        return Response(200, 'OK', [('Content-Type', 'text/plain')], [])
+
+    hatch = HttpHatch(handler)
+    with hatch.accepting():
+        conn = _proxy_conn(hatch)
+        conn.sendall(b'HEAD http://x/ HTTP/1.1\r\nHost: x\r\n\r\n')
+        raw = _recv_all(conn)
+    hatch.close()
+    assert b'Transfer-Encoding' not in raw
 
 
 def test_bare_cr_in_an_upstream_header_is_not_relayed_to_the_guest():
@@ -748,7 +859,7 @@ def test_chunk_extension_after_bws_still_parses(origin):
         )
         raw = _recv_all(sock)
     hatch.close()
-    assert json.loads(raw.split(b'\r\n\r\n', 1)[1])['received'] == 'body'
+    assert json.loads(_body(raw))['received'] == 'body'
 
 
 def test_dripping_guest_hits_the_phase_deadline_not_the_per_read_timer():
@@ -823,7 +934,7 @@ def _tcp_get(proxy_addr, url, host):
     sock = socket.create_connection(proxy_addr, timeout=10)
     sock.sendall(f'GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode())
     raw = _recv_all(sock)
-    return int(raw.split(b' ', 2)[1]), raw.split(b'\r\n\r\n', 1)[1]
+    return int(raw.split(b' ', 2)[1]), _body(raw)
 
 
 def test_guest_relay_bridges_loopback_to_hatch(origin):
