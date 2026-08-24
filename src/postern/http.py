@@ -46,7 +46,10 @@ opt-in concern). Nothing downgrades https→http on its own; refuse CONNECT with
 upstream in **plaintext** (never ``ssl``-wrapped), so it reaches ``http://``
 origins only; originating TLS to an ``https``-only upstream (the http→https
 upgrade a cooperative ``ANTHROPIC_BASE_URL``-style client would want) needs a
-TLS-originating handler, not yet provided here.
+TLS-originating handler, not yet provided here. An ``https://`` (or any
+non-``http``) *absolute-form* target is therefore refused with a 400 before the
+handler sees it, rather than dialled in the clear: forwarding it would have put a
+handler's injected credentials on the wire in plaintext at the guest's choosing.
 
 Trust model: every byte from the guest is attacker-controlled, so this is the
 most security-sensitive host-side surface. The ``Host`` header is re-derived
@@ -471,7 +474,7 @@ class HttpHatch:
             return Request(method, target, headers, host, port, is_connect=True)
         parts = _urlsplit(target)
         host = parts.hostname or ''
-        port = parts.port or (443 if parts.scheme == 'https' else 80)
+        port = parts.port or 80
         # A proxy request-target must be absolute-form (RFC 9112 §3.2.2), and a
         # hostless one is not a destination. An origin-form target (`GET /x`) or
         # an empty authority (`http://:8080/x`) leaves host == '' — which matches
@@ -479,6 +482,17 @@ class HttpHatch:
         # loopback, so it walked past `deny_hosts` onto the host's own services.
         if not host:
             raise _BadRequestError('proxy requests need an absolute-form target with a host')
+        # ``forward`` dials in cleartext and never wraps TLS, so an `https://`
+        # (or any non-http) absolute-form target is not something this hatch can
+        # honour — and honouring it *anyway* was an exfiltration channel the
+        # guest chose: a handler's injected `Authorization` went out in the clear
+        # to port 443 of an allowlisted host, readable by anyone on path. HTTPS
+        # goes through CONNECT (opaque) or an `http://` base URL; nothing else.
+        if parts.scheme != 'http':
+            raise _BadRequestError(
+                f'{parts.scheme or "scheme-relative"}:// targets are not forwarded (this hatch dials '
+                'cleartext http only); use CONNECT for HTTPS or an http:// base URL'
+            )
         origin = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, '')) or '/'
         reader = _SockReader(leftover, conn)
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))

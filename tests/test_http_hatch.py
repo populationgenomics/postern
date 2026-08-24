@@ -432,6 +432,57 @@ def test_chunked_extension_line_is_capped(origin):
     assert rejected
 
 
+def test_https_absolute_form_is_refused_not_dialled_in_cleartext():
+    # `forward` never wraps TLS, so forwarding an `https://` absolute-form target
+    # put the request — including a handler's injected credentials — on the wire
+    # in plaintext to port 443 of an allowlisted host, at the guest's choosing.
+    wire = []
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+    host_port = f'127.0.0.1:{listener.getsockname()[1]}'
+
+    def capture():
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return  # the listener was closed without anything ever dialling it
+        conn.settimeout(2)
+        try:
+            wire.append(conn.recv(65536))
+        except TimeoutError:
+            wire.append(b'')
+        conn.close()
+
+    threading.Thread(target=capture, daemon=True).start()
+    inner = allow_hosts({host_port})
+
+    def handler(req, forward):
+        req.set_header('Authorization', 'Bearer HOST-ONLY-SECRET')
+        return inner(req, forward)
+
+    hatch = HttpHatch(handler)
+    with hatch.accepting():
+        status, body = _http_get(hatch, f'https://{host_port}/v1/x', host_port)
+    hatch.close()
+    listener.close()
+    assert status == 400
+    assert b'CONNECT' in body  # actionable: use CONNECT or an http:// base URL
+    assert not wire, 'nothing may be dialled, let alone the credential in cleartext'
+
+
+@pytest.mark.parametrize('scheme', ['https', 'ftp', 'gopher', ''])
+def test_non_http_schemes_are_not_forwarded(scheme):
+    # Any non-http scheme is plaintext-dialled garbage at best; a scheme-relative
+    # target (`//host/x`) parses a host with no scheme at all, so pin to `http`.
+    hatch = HttpHatch(allow_hosts({'x'}))
+    target = f'{scheme}://x/y' if scheme else '//x/y'
+    with hatch.accepting():
+        status, _ = _http_get(hatch, target, 'x')
+    hatch.close()
+    assert status == 400
+
+
 def test_hostless_target_is_refused_not_dialled_at_loopback(origin):
     # `http://:PORT/x` (empty authority) and `GET /x` (origin-form) both leave
     # host == '', which matches no entry in a name-based policy *and* which
