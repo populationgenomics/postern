@@ -67,6 +67,7 @@ import dataclasses
 import ipaddress
 import os
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -441,7 +442,9 @@ class HttpHatch:
                 vetted address (no re-resolution). The address-level SSRF/IMDS
                 boundary a name-based `deny_hosts` can't be.
             socket_path: Where to bind the UDS. Defaults to a fresh ``0700`` temp
-                dir (host-side isolation rests on that dir, per F9).
+                dir (host-side isolation rests on that dir, per F9). A supplied
+                path must sit in a directory that is not group/world-writable,
+                since the socket itself must be 0666 for the guest to connect.
             max_workers: Concurrent guest connections; a CONNECT tunnel or an
                 open SSE stream holds one for its lifetime, so size accordingly.
             connect_timeout: Seconds to wait dialling an upstream destination,
@@ -474,12 +477,37 @@ class HttpHatch:
         return self._path
 
     # -- serving lifecycle (mirrors GrpcHatch) ------------------------------- #
+    def _check_socket_dir(self) -> None:
+        """Refuse a caller-supplied socket path in a dir others can write.
+
+        The socket has to be mode 0666 — the guest runs as a different uid and
+        must connect — so the confinement is entirely the parent directory's. The
+        owned default is a fresh 0700 tempdir; a caller-supplied path gets no
+        such guarantee, and in a group- or world-writable dir (``/tmp`` being the
+        obvious one, sticky bit notwithstanding — sticky stops deletion, not
+        connection) *any* local uid could then drive the hatch's egress and
+        collect whatever credentials the handler injects. Fail closed instead.
+        """
+        if self._dir is not None:
+            return  # our own 0700 tempdir
+        parent = os.path.dirname(os.path.abspath(self._path)) or '.'
+        mode = os.stat(parent).st_mode
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError(
+                f'{parent} is group/world-writable, so a 0666 hatch socket in it is reachable by any '
+                'local uid; use a directory only this process can write (or the default temp dir)'
+            )
+
     def start(self) -> None:
         """Start serving (idempotent). Serves until :meth:`close`."""
         if self._started:
             return
+        self._check_socket_dir()
+        # Clear a stale socket from a crashed run (it would EADDRINUSE), but only
+        # if that is what the path is: never unlink a caller's regular file.
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(self._path)  # a stale socket from a crashed run would EADDRINUSE
+            if stat.S_ISSOCK(os.stat(self._path).st_mode):
+                os.unlink(self._path)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(self._path)
         srv.listen(128)
@@ -665,7 +693,8 @@ class HttpHatch:
         self._started = False
         self._pool.shutdown(wait=False)
         with contextlib.suppress(OSError):
-            os.unlink(self._path)
+            if stat.S_ISSOCK(os.stat(self._path).st_mode):
+                os.unlink(self._path)  # ours to remove; a caller's regular file is not
         if self._dir is not None:
             with contextlib.suppress(OSError):
                 os.rmdir(self._dir)

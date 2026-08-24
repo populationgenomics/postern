@@ -12,8 +12,10 @@ import ipaddress
 import json
 import os
 import pathlib
+import shutil
 import socket
 import stat
+import tempfile
 import threading
 import time
 
@@ -780,6 +782,48 @@ def test_socket_perms_are_deterministic_and_guest_connectable():
         parent = stat.S_IMODE(os.stat(os.path.dirname(hatch.socket_path)).st_mode)
         assert parent == 0o700  # mkdtemp default keeps other host users out
     hatch.close()
+
+
+@pytest.fixture
+def short_dir():
+    # AF_UNIX paths cap around 104 bytes, and pytest's tmp_path on macOS eats
+    # most of that, so bind-for-real tests need a short private directory.
+    path = pathlib.Path(tempfile.mkdtemp(prefix='ph-'))
+    os.chmod(path, 0o700)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_socket_path_in_a_world_writable_dir_is_refused(short_dir):
+    # The socket must be 0666 for the guest (a different uid) to connect, so the
+    # confinement is the parent directory's alone. In /tmp-like perms any local
+    # uid could drive the hatch's egress and harvest injected credentials.
+    os.chmod(short_dir, 0o777)  # noqa: S103 — the exposure under test; mkdir's mode= is umask-masked
+    hatch = HttpHatch(allow_hosts(set()), socket_path=short_dir / 'hatch.sock')
+    with pytest.raises(ValueError, match='group/world-writable'):
+        hatch.start()
+    hatch.close()
+
+
+def test_socket_path_in_a_private_dir_is_accepted(short_dir):
+    hatch = HttpHatch(allow_hosts(set()), socket_path=short_dir / 'hatch.sock')
+    hatch.start()
+    assert stat.S_ISSOCK(os.stat(hatch.socket_path).st_mode)
+    hatch.close()
+
+
+def test_a_non_socket_at_the_path_is_never_unlinked(short_dir):
+    # Both start() and close() unlinked self._path unconditionally, so a
+    # caller-supplied path pointing at a real file had that file deleted.
+    precious = short_dir / 'precious'
+    precious.write_text('do not delete me')
+    hatch = HttpHatch(allow_hosts(set()), socket_path=precious)
+    with pytest.raises(OSError, match='in use'):  # EADDRINUSE: the path is occupied, as it should be
+        hatch.start()
+    hatch.close()
+    assert precious.read_text() == 'do not delete me'
 
 
 def test_hatch_reused_across_calls(origin):
