@@ -342,9 +342,29 @@ def test_block_private_blocks_internal_allows_global():
         '::1',
         'fe80::1',
         'fc00::1',  # ULA
+        '::',  # unspecified
+        '224.0.0.1',  # multicast
+        '255.255.255.255',  # broadcast
+        '198.18.0.1',  # benchmarking
+        '192.0.0.1',  # IETF protocol assignments
+        '2001:db8::1',  # documentation
+        '2002::1',  # 6to4
+        '2001::1',  # Teredo
+        '100::1',  # discard-only
+        '64:ff9b:1::a9fe:a9fe',  # local-use NAT64 (RFC 8215)
+        '::ffff:127.0.0.1',  # IPv4-mapped loopback
+        '::ffff:169.254.169.254',  # IPv4-mapped metadata endpoint
+        '64:ff9b::a9fe:a9fe',  # the metadata endpoint via NAT64 — is_global said True
     ):
         assert blocked(ipaddress.ip_address(ip)), ip
-    for ip in ('8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:4700:4700::1111'):
+    for ip in (
+        '8.8.8.8',
+        '1.1.1.1',
+        '93.184.216.34',
+        '2606:4700:4700::1111',
+        '::ffff:8.8.8.8',  # a mapped *global* v4 is still just 8.8.8.8
+        '64:ff9b::808:808',  # NAT64-only networks must still reach the internet
+    ):
         assert not blocked(ipaddress.ip_address(ip)), ip
 
 

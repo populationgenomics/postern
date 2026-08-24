@@ -96,6 +96,48 @@ _HOP_BY_HOP = frozenset(
 # Framing headers we re-derive rather than copy (bodies are re-emitted
 # close-delimited, so a stale length/encoding would corrupt the stream).
 _FRAMING = frozenset({b'content-length', b'transfer-encoding'})
+# Destination space `block_private()` refuses: everything that is not globally
+# routable unicast. Enumerated rather than delegated to ipaddress.is_global —
+# see block_private for why.
+_BLOCKED_V4 = tuple(
+    ipaddress.IPv4Network(cidr)
+    for cidr in (
+        '0.0.0.0/8',  # "this host on this network" — and the bare 0.0.0.0
+        '10.0.0.0/8',  # RFC 1918
+        '100.64.0.0/10',  # CGNAT
+        '127.0.0.0/8',  # loopback
+        '169.254.0.0/16',  # link-local, incl. the 169.254.169.254 metadata endpoint
+        '172.16.0.0/12',  # RFC 1918
+        '192.0.0.0/24',  # IETF protocol assignments
+        '192.0.2.0/24',  # documentation
+        '192.88.99.0/24',  # 6to4 relay anycast
+        '192.168.0.0/16',  # RFC 1918
+        '198.18.0.0/15',  # benchmarking
+        '198.51.100.0/24',  # documentation
+        '203.0.113.0/24',  # documentation
+        '224.0.0.0/4',  # multicast
+        '240.0.0.0/4',  # reserved, incl. the 255.255.255.255 broadcast
+    )
+)
+# IPv6 global unicast; everything outside it (loopback, ULA, link-local,
+# multicast, unspecified, discard, local-use NAT64) is refused wholesale.
+_V6_GLOBAL_UNICAST = ipaddress.IPv6Network('2000::/3')
+# The carve-outs *inside* global unicast that are not real destinations.
+_BLOCKED_V6 = tuple(
+    ipaddress.IPv6Network(cidr)
+    for cidr in (
+        '2001::/32',  # Teredo
+        '2001:20::/28',  # ORCHIDv2
+        '2001:db8::/32',  # documentation
+        '2002::/16',  # 6to4
+    )
+)
+# Prefixes that embed an IPv4 address in their low 32 bits (an exact /96 each):
+# unwrap and judge the address inside rather than the wrapper.
+_V4_EMBEDDING_V6 = (
+    ipaddress.IPv6Network('::ffff:0:0/96'),  # IPv4-mapped
+    ipaddress.IPv6Network('64:ff9b::/96'),  # NAT64 well-known prefix (RFC 6052)
+)
 # Host is re-derived from the policy-checked authority, never copied from the
 # guest — otherwise a guest dials an allowlisted host but sets Host: elsewhere
 # and a host-routed front end serves a backend of its choosing (RFC 9110 §7.2).
@@ -227,6 +269,23 @@ def deny_hosts(denied: Iterable[str]) -> Handler:
     return handler
 
 
+def _blocked_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether ``ip`` is outside the globally-routable unicast space."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        for prefix in _V4_EMBEDDING_V6:
+            if ip in prefix:
+                # Judge the *embedded* destination, not its wrapper. Blocking
+                # these prefixes outright would break an IPv6-only host behind
+                # NAT64, where every name resolves through 64:ff9b::/96;
+                # trusting them is a hole, since 64:ff9b::a9fe:a9fe is the
+                # metadata endpoint. Both /96s embed the v4 in the low 32 bits.
+                return _blocked_address(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+        if ip not in _V6_GLOBAL_UNICAST:
+            return True  # loopback, unspecified, ULA, link-local, multicast, ...
+        return any(ip in net for net in _BLOCKED_V6)
+    return any(ip in net for net in _BLOCKED_V4)
+
+
 def block_private() -> AddressGuard:
     """A dial guard blocking any non-globally-routable destination address.
 
@@ -237,12 +296,16 @@ def block_private() -> AddressGuard:
     resolves to an internal IP or by an alternate numeric encoding — the real
     SSRF/IMDS boundary. The guest is dialled at the exact address the guard
     vetted (no re-resolution), closing the check-then-resolve rebinding window.
+
+    The blocked space is enumerated here rather than delegated to
+    ``ipaddress.is_global``, which called the NAT64 well-known prefix global —
+    so ``64:ff9b::a9fe:a9fe``, the metadata endpoint as a translator sees it,
+    went straight through — and whose classifications have shifted more than
+    once across the 3.10+ range this package supports. An address that embeds
+    another (IPv4-mapped, NAT64) is judged on what it embeds, so a NAT64-only
+    network still reaches the internet while its translated IMDS stays shut.
     """
-
-    def blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        return not ip.is_global
-
-    return blocked
+    return _blocked_address
 
 
 def steer_https_to_http(inner: Handler, *, hint: str = '') -> Handler:
