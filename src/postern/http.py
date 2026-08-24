@@ -168,7 +168,13 @@ class Request:
 
     @property
     def host_port(self) -> str:
-        return f'{self.host}:{self.port}'
+        """``host:port``, with an IPv6 literal bracketed so it is unambiguous.
+
+        Policy matches on this, and `::1:80` could be read as either host `::1`
+        port 80 or a host literally named `::1:80` — so an allowlist entry for an
+        IPv6 destination had no unambiguous spelling. It is `[::1]:80`.
+        """
+        return f'{_bracket(self.host)}:{self.port}'
 
     def header(self, name: str) -> str | None:
         return _get(self.headers, name)
@@ -584,7 +590,7 @@ class HttpHatch:
         # CRLF) and be re-serialized to upstream as a *separate* header line,
         # slipping a Transfer-Encoding/Host/auth past the name-based framing
         # strip. Reject the whole request rather than forward ambiguous framing.
-        if b'\n' in head.replace(_CRLF, b'') or b'\r' in head.replace(_CRLF, b''):
+        if _has_bare_cr_or_lf(head):
             raise _BadRequestError('malformed request: bare CR or LF in headers')
         request_line, _, header_block = head.partition(_CRLF)
         method, _, rest = request_line.decode('latin-1').partition(' ')
@@ -617,6 +623,12 @@ class HttpHatch:
                 'cleartext http only); use CONNECT for HTTPS or an http:// base URL'
             )
         origin = urllib.parse.urlunsplit(('', '', parts.path or '/', parts.query, '')) or '/'
+        # This goes into the upstream request line verbatim, where a space would
+        # split it into a bogus extra token ("GET /a b HTTP/1.1") and a control
+        # byte would be re-serialized into framing. urlsplit already drops
+        # tab/CR/LF; refuse the rest of SP/CTL rather than emit an ambiguous line.
+        if any(byte < 0x21 or byte == 0x7F for byte in origin.encode('latin-1')):
+            raise _BadRequestError('malformed request-target: space or control character')
         reader = _SockReader(leftover, conn, deadline)
         body = b''.join(_decode_body(reader, headers, allow_eof=False, max_bytes=self._max_body))
         return Request(
@@ -674,13 +686,14 @@ class HttpHatch:
                     + _HEADER_END
                     + req.body
                 )
-                head, leftover = _read_headers(upstream)
+                vetted = _read_response_head(upstream)
             except OSError:
                 upstream.close()
                 return Response.bad_gateway()
-            if head is None:
+            if isinstance(vetted, Response):  # unusable head; the 502 says why
                 upstream.close()
-                return Response.bad_gateway('no response from upstream')
+                return vetted
+            head, leftover = vetted
             status, reason, resp_headers = _parse_status_line(head)
             if status in (204, 304) or 100 <= status < 200:
                 upstream.close()
@@ -936,11 +949,48 @@ def _forward_request_headers(
     # authorized — closing the vhost-confusion bypass and the duplicate-Host
     # desync in one move.
     kept = [(k, v) for k, v in headers if k.lower().encode() not in _HOP_BY_HOP | _FRAMING | _HOST]
-    kept.append(('Host', host if port == 80 else f'{host}:{port}'))
+    kept.append(('Host', _authority(host, port)))
     if body_len:
         kept.append(('Content-Length', str(body_len)))
     kept.append(('Connection', 'close'))  # so upstream EOFs the (close-delimited) response
     return kept
+
+
+def _read_response_head(upstream: socket.socket) -> tuple[bytes, bytes] | Response:
+    """Read the upstream response head, or a 502 explaining why it is unusable."""
+    head, leftover = _read_headers(upstream)
+    if head is None:
+        return Response.bad_gateway('no response from upstream')
+    if _has_bare_cr_or_lf(head):
+        # The guest side has always rejected this; the upstream side was trusted.
+        # It shouldn't be: a lone CR inside a response header value is
+        # re-serialized to the guest verbatim, and a client that terminates on
+        # bare CR then reads headers the origin never sent.
+        return Response.bad_gateway('bare CR or LF in upstream headers')
+    return head, leftover
+
+
+def _has_bare_cr_or_lf(head: bytes) -> bool:
+    """Whether a header block holds a CR or LF outside a CRLF pair.
+
+    Such a byte survives _parse_headers (which splits on CRLF) sitting inside a
+    name or value, and is then re-serialized onto the *other* side's wire, where
+    a parser that treats a lone CR or LF as a line terminator sees a header — or
+    a message — that was never sent. Ambiguous framing is not forwardable in
+    either direction.
+    """
+    stripped = head.replace(_CRLF, b'')
+    return b'\n' in stripped or b'\r' in stripped
+
+
+def _bracket(host: str) -> str:
+    """An IPv6 literal wrapped in brackets (RFC 3986); anything else unchanged."""
+    return f'[{host}]' if ':' in host else host  # urlsplit hands IPv6 back unbracketed
+
+
+def _authority(host: str, port: int) -> str:
+    """``host[:port]`` for a Host header: ``:80`` elided, IPv6 bracketed."""
+    return _bracket(host) if port == 80 else f'{_bracket(host)}:{port}'
 
 
 def _parse_status_line(head: bytes) -> tuple[int, str, list[tuple[str, str]]]:

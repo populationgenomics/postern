@@ -454,6 +454,54 @@ def test_bare_lf_header_is_rejected_not_smuggled(origin):
     assert raw.split(b' ', 2)[1] == b'400'
 
 
+def test_bare_cr_in_an_upstream_header_is_not_relayed_to_the_guest():
+    # The guest side has always rejected bare CR/LF; the upstream side was
+    # trusted. A lone CR inside a response header value was re-serialized to the
+    # guest verbatim, so a client terminating on bare CR read a header the origin
+    # never sent — response splitting, inbound.
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+    host_port = f'127.0.0.1:{listener.getsockname()[1]}'
+
+    def splitting_origin():
+        conn, _ = listener.accept()
+        while b'\r\n\r\n' not in conn.recv(65536):
+            pass
+        conn.sendall(
+            b'HTTP/1.1 200 OK\r\nX-Ok: v\rSet-Cookie: injected=1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi'
+        )
+        conn.close()
+
+    threading.Thread(target=splitting_origin, daemon=True).start()
+    hatch = HttpHatch(allow_hosts({host_port}))
+    with hatch.accepting():
+        status, _ = _http_get(hatch, f'http://{host_port}/x', host_port)
+    hatch.close()
+    listener.close()
+    assert status == 502
+
+
+def test_ipv6_authority_is_bracketed():
+    # `::1:8080` is ambiguous — host ::1 port 8080, or a host named `::1:8080`? —
+    # so an IPv6 destination had no unambiguous spelling in a policy, and the
+    # forwarded Host header was malformed.
+    assert Request('GET', 'http://x/', [], '::1', 8080, is_connect=False).host_port == '[::1]:8080'
+    assert Request('GET', 'http://x/', [], '::1', 80, is_connect=False).host_port == '[::1]:80'
+    assert Request('GET', 'http://x/', [], 'x.com', 80, is_connect=False).host_port == 'x.com:80'
+
+
+@pytest.mark.parametrize('target', ['http://x/a b', 'http://x/a\x00b', 'http://x/q?a=b c'])
+def test_request_target_with_space_or_control_is_refused(target):
+    # origin_target lands in the upstream request line verbatim: a space splits
+    # it into a bogus extra token ("GET /a b HTTP/1.1").
+    hatch = HttpHatch(allow_hosts({'x'}))
+    with hatch.accepting():
+        status, _ = _http_get(hatch, target, 'x')
+    hatch.close()
+    assert status == 400
+
+
 def test_truncated_chunked_request_does_not_hang(origin):
     # A chunked request body that EOFs before a size line must not spin the
     # worker at 100% CPU — the connection is torn down promptly.
