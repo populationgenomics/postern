@@ -846,6 +846,24 @@ def test_malformed_chunk_size_is_rejected(origin, size_field):
     hatch.close()
 
 
+def test_chunk_not_terminated_by_crlf_is_rejected(origin):
+    # `reader.read(2)` skipped the chunk's trailing CRLF on faith. If the chunk
+    # ends elsewhere the declared size did not describe the data, and the two
+    # skipped bytes came out of the next size line instead — desync, quietly.
+    hatch = HttpHatch(allow_hosts({origin}))
+    with hatch.accepting():
+        sock = _proxy_conn(hatch)
+        sock.settimeout(4)
+        sock.sendall(
+            f'POST http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n'.encode()
+            + b'Transfer-Encoding: chunked\r\n\r\n'
+            + b'4\r\nbodyXX0\r\n\r\n'  # 'XX' where the CRLF belongs
+        )
+        assert sock.recv(4096) == b''
+        sock.close()
+    hatch.close()
+
+
 def test_chunk_extension_after_bws_still_parses(origin):
     # Strictness must not break the servers that pad BWS before a chunk-ext.
     hatch = HttpHatch(allow_hosts({origin}))

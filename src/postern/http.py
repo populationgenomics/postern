@@ -877,6 +877,20 @@ def _read_chunk_data(reader: _SockReader, size: int) -> Iterator[bytes]:
         yield data
 
 
+def _consume_trailers(reader: _SockReader, budget: Callable[[int], None]) -> None:
+    """Drain the trailer section following the terminating 0-chunk.
+
+    Trailer lines count against the byte budget like everything else: they are
+    free-form and unbounded in number, so a flood of them is the cheapest way to
+    make the hatch read forever otherwise.
+    """
+    while True:
+        trailer = reader.readline(_MAX_CHUNK_LINE)
+        budget(len(trailer))
+        if not trailer.strip():  # a blank line — or EOF — ends the trailers
+            return
+
+
 def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
     # ``total`` counts *everything consumed* — size lines, chunk data, and
     # trailers — against max_bytes, not just the declared data. Otherwise a
@@ -904,14 +918,17 @@ def _iter_chunked(reader: _SockReader, max_bytes: int) -> Iterator[bytes]:
             continue
         size = _chunk_size(size_line.split(b';', 1)[0])
         if size == 0:
-            while True:  # consume any trailers (b'' at EOF ends it)
-                trailer = reader.readline(_MAX_CHUNK_LINE)
-                budget(len(trailer))
-                if not trailer.strip():
-                    return
+            _consume_trailers(reader, budget)
+            return
         budget(size)
         yield from _read_chunk_data(reader, size)
-        reader.read(2)  # trailing CRLF
+        # Verify the trailing CRLF rather than skipping two bytes on faith. A
+        # chunk that ends somewhere else means the size we were given did not
+        # describe the data we read, so the framing is already wrong — and
+        # blind-skipping let it stay wrong quietly, with the two bytes coming out
+        # of the *next* size line.
+        if reader.read(2) != _CRLF:
+            raise ValueError('chunk not terminated by CRLF')
 
 
 def _iter_fixed(reader: _SockReader, remaining: int, max_bytes: int) -> Iterator[bytes]:
