@@ -1,0 +1,753 @@
+"""The stream hatch: a raw bidirectional byte stream over the sandbox UDS.
+
+Where `GrpcHatch` grants the guest a set of typed methods, `StreamHatch` gives it
+**one socket** and nothing else. Per accepted connection a handler you supply
+decides what the guest's bytes are spliced to — a host-side subprocess's stdio,
+an upstream socket, or nothing.
+
+    handler(stream) -> Process | Upstream | None
+
+* ``stream`` — the accepted connection (``stream.conn``) and the name of the
+  hatch it arrived on (``stream.hatch``).
+* return `Process` to splice a subprocess's stdin/stdout to the guest, `Upstream`
+  to splice a connected socket, or ``None`` to refuse (the guest sees EOF).
+* the hatch owns the plumbing after the verdict: both directions, half-close
+  propagation, terminate-then-kill teardown, and reaping.
+
+This exists for the protocols that are neither typed RPC nor request/response.
+The motivating case is **git**: git's native wire protocol is pkt-line over a raw bidirectional
+stream, and `ext::` carries it over a command's stdin/stdout, so a byte pump
+reaches a UDS (`postern._stream_connect`, bound into the guest as
+``$POSTERN_CONNECT``, is that pump).
+
+    from postern import Sandbox, SandboxProfile
+    from postern.stream import StreamHatch, git_url, splice_subprocess
+
+    hatch = StreamHatch(splice_subprocess(['git', 'upload-pack', '/srv/repo.git']), name='repo')
+    sandbox = Sandbox(SandboxProfile(), hatch=hatch)
+    sandbox.run(['git', '-c', 'protocol.ext.allow=always', 'clone', git_url('repo'), 'work'])
+
+**Why a socket and not a brokered HTTP proxy.** git can be reached through an
+HTTP forward proxy with a host-side handler policing each request, and that works.
+A bound stream socket is better in four ways, and the first is the whole reason
+this module exists:
+
+1. *Capability by descriptor, not policy by parser.* Through a proxy the guest
+   names a URL, so "only this one repository" means parsing and validating
+   request targets in a handler — a parser sitting in the policy path, fed
+   attacker-controlled input. Here the socket **is** the capability: one socket
+   per resource makes the wrong resource unrepresentable, and nothing parses
+   anything. The service is fixed too — a hatch bound to ``git upload-pack``
+   cannot be talked into ``receive-pack``, so read-only is read-only by
+   construction rather than by a rule about verbs.
+2. *No body buffering.* A proxy that lets a handler inspect request bodies has to
+   buffer them, and therefore has to cap them. A raw stream streams; there is no
+   ceiling and no cap to tune.
+3. *No protocol translation.* The host side is "run a subprocess, splice its
+   stdio" rather than a bridge that must decode chunked framing and re-emit
+   headers to reach the same subprocess.
+4. *It works with `Sandbox.run`.* A dial hatch needs no in-guest relay — the
+   socket is just a file — so a bare ``git`` entrypoint reaches it, not only a
+   `run_python` guest. A proxy has to be fronted by something inside the guest
+   that speaks TCP, which a raw entrypoint has no way to start.
+
+Trust model: every byte the guest sends is attacker-controlled, and here those
+bytes are handed to a host-side process. The batteries are built so guest input
+can only ever be a subprocess's **stdin** — never its argv, env, cwd, or the
+destination of a dial, all of which are fixed when the hatch is constructed. That
+is the whole reason to prefer a socket per resource over a parser. `Process` also
+defaults its subprocess to a scrubbed environment and a discarded stderr, because
+both are host state the guest must not read (see `splice_subprocess`). Stdlib-only
+— no extra to install.
+
+What the socket itself tells the guest: nothing useful. It arrives at
+``/run/postern/<name>.sock``, so the host-side path is not in the environment, and
+``SO_PEERCRED`` from inside reads ``(0, 65534, 65534)`` — the host process's pid is
+not mapped into the guest's pid namespace and its uid is not mapped into the
+guest's user namespace, so both come back as the unmapped placeholders. (The host
+*path* is still visible in ``/proc/self/mountinfo``, as every bwrap bind source is,
+including the workspace's; that is a pre-existing property of binding anything in,
+not of this hatch, and it is an information leak rather than a reachable path.)
+
+An unbounded number of connections buys a hostile guest very little: ``max_conns``
+gates *accepting*, so beyond the cap its dials sit in the kernel backlog costing
+the host no descriptors, and past the backlog they are simply refused. What it can
+do is hold ``max_conns`` slots — and each slot's subprocess — for as long as its
+connections live, so size the cap for the workload and rely on the outer
+``Sandbox.run(timeout=...)`` as the backstop that EOFs every connection at once.
+
+That backstop is only a backstop if a dead guest actually frees the slot, which
+takes two things beyond the EOF: teardown that signals the command's whole
+*process group* (a background child it left behind would otherwise keep the
+stdout pipe open, so the splice would wait for an EOF that can never come), and a
+forward pump that stops waiting on that pipe once the command itself has exited.
+Both are here; without them one connection could cost a slot, a subprocess and a
+non-exitable worker thread permanently, and ``max_conns`` of them killed the hatch
+for the worker's whole life rather than the run's.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import os
+import select
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Generator, Sequence
+from concurrent import futures
+
+from postern._sandbox import guest_env_var, guest_socket_path, validate_guest_name
+
+_CHUNK = 65536
+# Concurrent connections a hatch serves at once (see StreamHatch.__init__ for why
+# this gates accepting rather than dispatch).
+_DEFAULT_MAX_CONNS = 8
+# How long to wait for a subprocess to die after terminate(), and for the guest to
+# close after we half-close, before forcing the issue.
+_DEFAULT_GRACE = 5.0
+# The guest path Sandbox binds postern._stream_connect at. Defined here so git_url
+# and the sandbox agree on one string; Sandbox owns the bind itself.
+_GUEST_CONNECT = '/run/postern/connect.py'
+# Everything a host-side subprocess gets of the host's environment. The subprocess
+# is the thing chewing on guest bytes, so it must not inherit the trusted worker's
+# secrets (the same reasoning as _sandbox.bwrap_env).
+_MINIMAL_PATH = '/usr/local/bin:/usr/bin:/bin'
+
+
+# --------------------------------------------------------------------------- #
+# Stream / Process / Upstream — the handler's data model                       #
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class Stream:
+    """One accepted guest connection handed to the handler.
+
+    ``conn`` is the raw socket. The hatch splices it for you according to the
+    verdict you return, so a handler normally never touches it — read from it only
+    to consume a preamble, and note that any policy derived from those bytes is a
+    parser back in the policy path, which is exactly what one socket per resource
+    exists to avoid.
+
+    ``hatch`` is the hatch's guest name, so one handler can serve several hatches
+    and still know which capability was dialled.
+    """
+
+    conn: socket.socket
+    hatch: str
+
+
+@dataclasses.dataclass
+class Process:
+    """Handler verdict: splice this subprocess's stdin/stdout to the guest.
+
+    The subprocess must have been created with ``stdin=PIPE, stdout=PIPE``. The
+    hatch pumps both directions, closes its stdin when the guest half-closes (so a
+    ``git upload-pack`` sees a real EOF), then terminates, kills and reaps it.
+
+    That contract is checked here rather than asserted downstream: without both
+    pipes the splice raises before it can start, and an exception on that path
+    used to leave the subprocess unreaped — so a guest that reconnected in a loop
+    accumulated host processes without bound, ``max_conns`` notwithstanding.
+
+    Create the subprocess with ``start_new_session=True`` if you build the `Popen`
+    yourself (`splice_subprocess` does). Teardown then reaches the whole process
+    group, so a command that leaves a background child behind cannot strand it —
+    or strand the pipe the splice is waiting on.
+    """
+
+    proc: subprocess.Popen[bytes]
+    # The command's process group, captured here and not at teardown: by then
+    # ``poll()`` has reaped the leader, so ``getpgid`` on its pid is ESRCH (or
+    # worse, a recycled pid) — while the *group* is still alive and still holding
+    # the stdout pipe. ``None`` when the command is not its own group leader, i.e.
+    # when a handler built the `Popen` without ``start_new_session=True`` and the
+    # group is the worker's own: signalling that would signal the worker.
+    pgid: int | None = dataclasses.field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.proc.stdin is None or self.proc.stdout is None:
+            with contextlib.suppress(Exception):
+                _reap(self.proc, 0.0)
+            raise ValueError('Process(proc) requires a Popen created with stdin=PIPE and stdout=PIPE')
+        with contextlib.suppress(OSError, AttributeError):
+            if os.getpgid(self.proc.pid) == self.proc.pid:
+                self.pgid = self.proc.pid
+
+
+@dataclasses.dataclass
+class Upstream:
+    """Handler verdict: splice this connected socket to the guest, both ways."""
+
+    sock: socket.socket
+
+
+Handler = Callable[[Stream], 'Process | Upstream | None']
+
+
+# --------------------------------------------------------------------------- #
+# Batteries — the common cases built on the core                               #
+# --------------------------------------------------------------------------- #
+def splice_subprocess(
+    argv: Sequence[str],
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    env: dict[str, str] | None = None,
+    stderr: int | None = subprocess.DEVNULL,
+) -> Handler:
+    r"""Run ``argv`` per connection and splice its stdio to the guest.
+
+    The capability is the exact argv, fixed here and unreachable from the guest:
+    guest bytes become the process's **stdin** and nothing else, so there is no
+    quoting, no injection, and no way to reach a different repository or a
+    different service. ``shell=False`` always.
+
+    Args:
+        argv: The command, as a list (never a string through a shell).
+        env: Environment for the process. The default is a fixed minimal ``PATH``
+            (``_MINIMAL_PATH``) — *not* the host's environment, and not even the
+            worker's ``PATH``, which routinely names the operator's home
+            directory and tool installs and would both leak that to a process fed
+            attacker-controlled stdin and let ambient host state decide which
+            binary ``argv[0]`` resolves to. Pass an explicit dict to add what the
+            command needs, e.g. ``{'PATH': ..., 'GIT_PROTOCOL': 'version=2'}``.
+        cwd: Working directory for the process. Defaults to ``/`` rather than
+            inheriting the worker's cwd, so the capability does not depend on
+            where the worker happens to have been started.
+        stderr: Where the process's **fd 2** goes; discarded by default. It must
+            not be merged into the stream: a command's diagnostics quote host
+            state (``fatal: '/srv/secrets/repo.git' does not appear to be a git
+            repository``), so relaying them would hand the guest a map of the host
+            filesystem. Point it at a host-side log or pipe to keep it.
+
+            This covers fd 2 and nothing more. A command that multiplexes its own
+            diagnostics onto **stdout** routes around it, and git does: ``git
+            upload-archive`` reports exactly the ``does not appear to be a git
+            repository`` message above on its pkt-line sideband, host path
+            included. Where the command has such a channel, keep the host path out
+            of it — pass ``cwd`` and a bare basename in ``argv`` rather than an
+            absolute path.
+
+    Note:
+        The command's own **stdin language** is part of the capability, and is the
+        one thing this function cannot check for you. A fixed argv means guest
+        bytes never become *this* process's argv — it does not mean they cannot
+        become a *downstream* process's argv or a shell command, if the command
+        you chose offers that. ``git upload-pack`` does not. ``sqlite3``
+        (``.shell``/``.system``/``.import``), ``psql`` (``\!``, ``COPY … FROM
+        PROGRAM``), ``mysql`` (``system``), ``ftp``, ``gdb`` and ``ed`` all do, and
+        splicing any of them hands the guest host command execution however
+        read-only the flags look. Choose a command whose stdin grants nothing
+        beyond the capability you meant to grant.
+    """
+    argv = list(argv)
+    process_env = dict(env) if env is not None else {'PATH': _MINIMAL_PATH}
+
+    def handler(_stream: Stream) -> Process:
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell; guest bytes only ever reach stdin
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            cwd=cwd if cwd is not None else '/',
+            env=process_env,
+            # Its own process group, so teardown reaps everything the command
+            # started and not just the command (see _reap). Without this a child
+            # that leaves a background process behind strands both that process
+            # and the stdout pipe the splice is waiting on — permanently.
+            start_new_session=True,
+        )
+        return Process(proc)
+
+    return handler
+
+
+def splice_tcp(host: str, port: int, *, timeout: float = 10.0) -> Handler:
+    """Dial ``host:port`` per connection and splice it to the guest.
+
+    The destination is fixed here, so — unlike a proxy policing a guest-named
+    host — no guest input reaches the dial and there is nothing to resolve-and-pin
+    against a rebinding race: the guest cannot name a destination at all. A refused dial is
+    reported as a closed connection, which is all a raw stream can say.
+
+    ``timeout`` bounds the *dial* only. ``create_connection`` leaves it set on the
+    socket it returns, so it is cleared before splicing: otherwise it silently
+    became an idle read/write deadline on the spliced stream, tearing down any
+    exchange quiet for ``timeout`` seconds — and dropping the unsent tail of a
+    ``sendall`` that hit it — with nothing but an EOF to show the guest.
+    """
+
+    def handler(_stream: Stream) -> Upstream | None:
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+        except OSError:
+            return None
+        sock.settimeout(None)
+        return Upstream(sock)
+
+    return handler
+
+
+def git_url(name: str = 'stream', *, python: str = 'python3') -> str:
+    """The ``ext::`` URL a guest uses to reach the stream hatch called ``name``.
+
+    git has no unix-socket transport, but `ext::` carries its native protocol over
+    an arbitrary command's stdin/stdout, so the bound-in connector reaches the
+    hatch. git gates `ext::` behind ``protocol.ext.allow`` because an ``ext::``
+    URL is command execution, and hostile fetched content (a submodule URL) could
+    smuggle one in. Inside the sandbox that gate protects nothing — the guest is
+    already running untrusted code with the connector bound in — so enable it per
+    invocation and leave the host's git config alone:
+
+        git -c protocol.ext.allow=always clone <git_url('repo')> work
+
+    The URL passes no ``%s``/``%S``/``%G``, so git sends no service or repository
+    line: the host fixed both when it bound the hatch.
+    """
+    validate_guest_name(name)
+    return f'ext::{python} {_GUEST_CONNECT} {guest_socket_path(name)}'
+
+
+# --------------------------------------------------------------------------- #
+# The hatch                                                                     #
+# --------------------------------------------------------------------------- #
+class StreamHatch:
+    """Serve a raw bidirectional stream over the sandbox UDS, per-connection.
+
+    Conforms to postern's ``Hatch`` protocol (``socket_path`` + ``accepting()``),
+    so it drops into ``Sandbox(hatch=...)`` where a `GrpcHatch` would. It is a
+    **named dial** hatch: the guest reaches it as an ordinary file at
+    ``/run/postern/<name>.sock``, exported as ``$POSTERN_HATCH_<NAME>``. Because
+    each hatch is named, a sandbox can carry several — one per resource, which is
+    the point. Reused across many runs: serves once on first :meth:`accepting`,
+    until :meth:`close`.
+    """
+
+    # Ask `Sandbox` to bind the in-guest stdio↔UDS connector at $POSTERN_CONNECT:
+    # the protocols a stream hatch carries (git's ext:: transport for one) reach a
+    # byte stream rather than a socket, so something in-guest has to bridge them.
+    guest_connector = True
+
+    def __init__(
+        self,
+        handler: Handler,
+        *,
+        name: str = 'stream',
+        socket_path: str | os.PathLike[str] | None = None,
+        max_conns: int = _DEFAULT_MAX_CONNS,
+        backlog: int = 64,
+        grace: float = _DEFAULT_GRACE,
+    ) -> None:
+        """Create a hatch that runs ``handler`` for each guest connection.
+
+        Args:
+            handler: ``handler(stream) -> Process | Upstream | None``. It owns all
+                policy — wrap `splice_subprocess`/`splice_tcp` for the common case.
+            name: The capability's name in the guest: its socket is bound at
+                ``/run/postern/<name>.sock`` and exported as
+                ``POSTERN_HATCH_<NAME>``. A Python identifier, because it becomes
+                both a path component and an environment variable name.
+            socket_path: Where to bind the host-side UDS. Defaults to a fresh
+                ``0700`` temp dir (host-side isolation rests on that dir, per F9).
+                **The socket itself is chmod'd 0666**, deterministically rather
+                than by umask, because the guest runs as an unrelated uid and has
+                to be able to connect. So the containing directory is the entire
+                host-side access control: pass a path only in a directory no other
+                local uid can traverse. A stable path somewhere convenient
+                (``/tmp/myservice.sock``) publishes the capability — a host
+                ``git upload-pack``, an upstream dial — to every user on the box.
+            max_conns: Concurrent connections served. This gates **accepting**,
+                not merely dispatch to a worker pool, and the difference matters: a
+                stream connection is long-lived by definition (a clone runs for as
+                long as it runs), so a queue of already-accepted connections would
+                be a queue of host file descriptors — a guest that opens thousands
+                walks the host to EMFILE while doing no work. At the cap the
+                accept loop simply stops accepting, leaving connections in the
+                kernel backlog where they cost the host nothing. The default is
+                deliberately small: each served connection can hold a subprocess,
+                two pipes, a socket and two threads for its whole lifetime, so
+                this is the real bound on what one guest can pin.
+            backlog: ``listen`` backlog. Past ``max_conns + backlog`` pending
+                connections the kernel refuses the guest's dial, which is the
+                correct answer rather than a host-side queue.
+            grace: Seconds to wait for a subprocess to exit after ``terminate()``
+                before ``kill()``, and for the guest to close after we half-close.
+                Bounds teardown; it is not a limit on the stream's lifetime.
+        """
+        validate_guest_name(name)
+        self._handler = handler
+        self._name = name
+        self._grace = grace
+        self._backlog = backlog
+        if socket_path is None:
+            self._dir: str | None = tempfile.mkdtemp(prefix='postern-stream-')
+            self._path = os.path.join(self._dir, 'hatch.sock')
+        else:
+            self._dir = None
+            self._path = os.fspath(socket_path)
+        self._pool = futures.ThreadPoolExecutor(max_workers=max_conns, thread_name_prefix='postern-stream')
+        self._slots = threading.Semaphore(max_conns)
+        self._srv: socket.socket | None = None
+        self._started = False
+        self._closing = False
+        # Live connections and the verdict behind each, so close() can tear them
+        # down rather than merely stop accepting new ones.
+        self._lock = threading.Lock()
+        self._live: dict[socket.socket, Process | Upstream | None] = {}
+
+    @property
+    def socket_path(self) -> str:
+        return self._path
+
+    @property
+    def guest_name(self) -> str:
+        """This hatch's name in the guest — how `Sandbox` derives socket and env var."""
+        return self._name
+
+    @property
+    def guest_env_var(self) -> str:
+        """The environment variable naming this hatch's socket inside the sandbox."""
+        return guest_env_var(self._name)
+
+    # -- serving lifecycle (mirrors GrpcHatch) ------------------------------- #
+    def start(self) -> None:
+        """Start serving (idempotent). Serves until :meth:`close`."""
+        if self._started:
+            return
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self._path)  # a stale socket from a crashed run would EADDRINUSE
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self._path)
+        srv.listen(self._backlog)
+        # Deterministic perms, not umask-dependent (F9): the guest runs as a
+        # non-root uid so must connect; host-side isolation rests on the 0700 dir.
+        with contextlib.suppress(OSError):
+            os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
+        self._srv = srv
+        self._started = True
+        self._closing = False
+        threading.Thread(target=self._accept_loop, args=(srv,), daemon=True, name='postern-stream-accept').start()
+
+    @contextlib.contextmanager
+    def accepting(self) -> Generator[StreamHatch, None, None]:
+        """Ensure the hatch is serving for the block; it stays up for reuse."""
+        self.start()
+        yield self
+
+    def _accept_loop(self, srv: socket.socket) -> None:
+        while True:
+            # Take the slot *before* accepting: an unaccepted connection sits in
+            # the kernel backlog and costs the host no descriptor, whereas an
+            # accepted-and-queued one costs one for as long as the queue is deep.
+            self._slots.acquire()
+            if self._closing:
+                return
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return  # socket closed by close(); the slot dies with the loop
+            try:
+                self._pool.submit(self._serve_conn, conn)
+            except RuntimeError:  # pool shut down mid-accept
+                with contextlib.suppress(OSError):
+                    conn.close()
+                self._slots.release()
+                return
+
+    # -- one guest connection ------------------------------------------------ #
+    def _serve_conn(self, conn: socket.socket) -> None:
+        # A single hostile connection must never take a pool worker down, and must
+        # always give its slot back — otherwise the hatch bleeds capacity.
+        verdict: Process | Upstream | None = None
+        try:
+            verdict = self._handler(Stream(conn, self._name))
+            self._track(conn, verdict)
+            if isinstance(verdict, Process):
+                _splice_process(conn, verdict, self._grace)
+            elif isinstance(verdict, Upstream):
+                _splice_sockets(conn, verdict.sock, self._grace)
+            else:
+                # A refusal. A raw stream has no way to say "no", so the guest gets
+                # end-of-stream and nothing else — in particular no diagnostic,
+                # which on this surface would only ever be host state.
+                _finish(conn, self._grace)
+        except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
+            _finish(conn, self._grace)
+        finally:
+            # Whatever the verdict was, and however this ended, it must not outlive
+            # the connection: an exception raised anywhere above used to abandon a
+            # subprocess unreaped, which let a guest reconnecting in a loop grow the
+            # host's process table without bound (max_conns bounds concurrent
+            # splices, not abandoned children).
+            self._untrack(conn, verdict)
+            _dispose(verdict, self._grace)
+            with contextlib.suppress(OSError):
+                conn.close()
+            self._slots.release()
+
+    # -- live-connection bookkeeping, so close() can mean something ---------- #
+    def _track(self, conn: socket.socket, verdict: Process | Upstream | None) -> None:
+        with self._lock:
+            if self._closing:
+                # close() already ran; do not let a verdict slip past its teardown.
+                _dispose(verdict, self._grace)
+                raise ConnectionAbortedError('hatch closed')
+            self._live[conn] = verdict
+
+    def _untrack(self, conn: socket.socket, verdict: Process | Upstream | None) -> None:
+        with self._lock:
+            self._live.pop(conn, None)
+        del verdict  # only the dict entry is dropped here; _dispose does the work
+
+    def close(self) -> None:
+        """Stop serving, tear down everything in flight, and drop the socket.
+
+        Every live connection is shut down and every verdict behind it disposed of
+        (a subprocess group reaped, an upstream socket closed), because nothing else
+        will: ``ThreadPoolExecutor`` workers have been non-daemon since 3.9 and
+        ``shutdown(wait=False)`` does not interrupt one, so a pump blocked on a pipe
+        or an upstream that never speaks would hold its subprocess *and* stop the
+        host worker process from exiting at all.
+        """
+        with self._lock:
+            self._closing = True
+            live = list(self._live.items())
+            self._live.clear()
+        if self._srv is not None:
+            # shutdown() *before* close(): on Linux, closing a listening socket
+            # another thread is blocked in accept() on does not wake that thread,
+            # so the accept loop parked there for the life of the process — one
+            # leaked thread and stack per closed hatch, which a worker that builds
+            # a hatch per job leaks its way to a thread limit with.
+            with contextlib.suppress(OSError):
+                self._srv.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                self._srv.close()
+            self._srv = None
+        self._started = False
+        self._slots.release()  # unblock an accept loop parked on the cap
+        for conn, verdict in live:
+            # Shut the socket down first: that is what unblocks a pump parked in
+            # recv or sendall on it, so its thread can finish and be joined.
+            with contextlib.suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
+            _dispose(verdict, self._grace)
+        self._pool.shutdown(wait=False)
+        with contextlib.suppress(OSError):
+            os.unlink(self._path)
+        if self._dir is not None:
+            with contextlib.suppress(OSError):
+                os.rmdir(self._dir)
+
+
+# --------------------------------------------------------------------------- #
+# Splicing                                                                      #
+# --------------------------------------------------------------------------- #
+def _dispose(verdict: Process | Upstream | None, grace: float) -> None:
+    """Release whatever a verdict was holding. Idempotent, never raises."""
+    if isinstance(verdict, Process):
+        with contextlib.suppress(Exception):
+            _reap(verdict.proc, grace, verdict.pgid)
+    elif isinstance(verdict, Upstream):
+        with contextlib.suppress(OSError):
+            verdict.sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            verdict.sock.close()
+
+
+def _finish(guest: socket.socket, grace: float) -> None:
+    """End the guest's stream cleanly: half-close, then drain what it still sends.
+
+    Closing an ``AF_UNIX`` socket while bytes remain unread in its receive queue
+    makes the kernel set ``ECONNRESET`` on the *peer* (``unix_release_sock``), so
+    the guest's next read fails with a reset instead of reporting end-of-stream —
+    and a client such as git reads that as a protocol error, not as "the exchange
+    is over". Draining first turns the close into an orderly one. ``grace`` bounds
+    the drain, so a guest that keeps writing forever gives up its slot anyway (at
+    the price of the reset it brought on itself).
+
+    Waits with ``select`` rather than a socket timeout: the other direction may
+    still be sending on this same socket from another thread, and ``settimeout``
+    is per-socket, so it would put a deadline on a legitimately slow ``sendall``.
+    """
+    with contextlib.suppress(OSError):
+        guest.shutdown(socket.SHUT_WR)
+    deadline = time.monotonic() + grace
+    with contextlib.suppress(OSError):
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not select.select([guest], [], [], remaining)[0]:
+                return  # the guest has gone quiet; stop waiting on it
+            if not guest.recv(_CHUNK):
+                return
+
+
+def _pump_to_socket(src: socket.socket, dst: socket.socket) -> None:
+    """Copy ``src`` -> ``dst`` until EOF, then half-close ``dst``'s write side."""
+    try:
+        while True:
+            chunk = src.recv(_CHUNK)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            dst.shutdown(socket.SHUT_WR)
+
+
+def _splice_sockets(guest: socket.socket, upstream: socket.socket, grace: float) -> None:
+    """Relay bytes both ways between two connected sockets until both close."""
+    reverse = threading.Thread(target=_pump_to_socket, args=(guest, upstream), daemon=True)
+    reverse.start()
+    _pump_to_socket(upstream, guest)
+    reverse.join(grace)
+    if not reverse.is_alive():
+        # The reverse pump owns the read side, so only drain once it is done — and
+        # only then, or the upstream's early death would leave the guest a reset.
+        _finish(guest, grace)
+    for sock in (guest, upstream):
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+def _pump_to_stdin(guest: socket.socket, proc: subprocess.Popen[bytes], grace: float) -> None:
+    """Copy the guest's bytes into ``proc``'s stdin, closing it at EOF.
+
+    Closing stdin is the load-bearing part: it is how a half-closing guest (or one
+    that abruptly died, which is indistinguishable and must behave the same) tells
+    ``git upload-pack`` the request is over, so the process exits of its own accord
+    instead of waiting on a peer that is gone.
+
+    If the *command* stops reading first, the guest may still be mid-sentence, so
+    this thread — the only reader of the socket — drains it before returning, and
+    the exchange ends in an orderly close rather than a reset (see :func:`_finish`).
+    """
+    stdin = proc.stdin
+    assert stdin is not None  # noqa: S101 — Process's contract is stdin=PIPE
+    drain = True
+    try:
+        while True:
+            chunk = guest.recv(_CHUNK)
+            if not chunk:
+                drain = False  # already at end-of-stream: nothing left to discard
+                break
+            stdin.write(chunk)
+            stdin.flush()
+    except OSError:
+        pass  # the process closed stdin first, or the guest vanished
+    finally:
+        with contextlib.suppress(OSError):
+            stdin.close()
+    if drain:
+        _finish(guest, grace)
+
+
+def _splice_process(guest: socket.socket, verdict: Process, grace: float) -> None:
+    """Splice ``proc``'s stdio to ``guest``, then terminate and reap it.
+
+    The process's stdout drives the exchange: when it closes, the command has said
+    everything it will say, so we half-close towards the guest and tear down. The
+    handler's contract is that the command exits on stdin EOF (``git
+    upload-pack``/``receive-pack`` do); terminate-then-kill is the backstop for one
+    that does not, so a hostile or abandoned connection can never leave a host
+    process running once the exchange is over.
+    """
+    proc = verdict.proc
+    stdout = proc.stdout
+    assert stdout is not None  # noqa: S101 — Process's contract is stdout=PIPE
+    # Read the pipe fd directly rather than through Popen's BufferedReader: a
+    # stream must forward each write as it lands (git's sideband progress, an
+    # interactive protocol), and a buffered read would wait to fill a block.
+    out_fd = stdout.fileno()
+    reverse = threading.Thread(target=_pump_to_stdin, args=(guest, proc, grace), daemon=True)
+    reverse.start()
+    try:
+        while True:
+            # Wake periodically instead of blocking in read() for ever: EOF on this
+            # pipe needs *every* holder of its write end to be gone, so a command
+            # that left a background child behind would otherwise park this thread
+            # (and its slot, and its subprocess) permanently — even after the guest
+            # died. Once the command itself has exited, whatever still holds the
+            # pipe is not part of this stream, and _reap's group kill collects it.
+            if not select.select([out_fd], [], [], grace)[0]:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = os.read(out_fd, _CHUNK)
+            if not chunk:
+                break
+            guest.sendall(chunk)
+    except (OSError, ValueError):
+        pass  # the guest died mid-pack; the teardown below is unchanged
+    finally:
+        with contextlib.suppress(OSError):
+            guest.shutdown(socket.SHUT_WR)
+        _reap(proc, grace, verdict.pgid)
+        # The half-close above is what ends the guest's side, so the reverse pump
+        # reaches EOF on its own and drains the socket cleanly; give it that chance
+        # before closing, since closing under it is what causes a reset.
+        reverse.join(grace)
+        with contextlib.suppress(OSError):
+            guest.close()
+
+
+def _signal_group(proc: subprocess.Popen[bytes], pgid: int | None, sig: int) -> None:
+    """Signal ``pgid`` if there is one; otherwise just ``proc``.
+
+    ``splice_subprocess`` starts the command in its own session, so the command
+    *is* its group leader and the group is exactly the command's descendants.
+    ``pgid`` is ``None`` for a `Popen` a handler built without
+    ``start_new_session=True``: that process shares the worker's own group, and
+    signalling that group would signal the worker.
+    """
+    if pgid is not None:
+        with contextlib.suppress(OSError, AttributeError):
+            os.killpg(pgid, sig)
+            return
+    with contextlib.suppress(OSError, ValueError):
+        proc.send_signal(sig)
+
+
+def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) -> None:
+    """Terminate, then kill, then wait — never leave a child of the host running.
+
+    Signals the process *group*, not the process: a command that leaves a
+    background child behind otherwise strands it, and — because that child
+    inherited the stdout pipe — strands the splice waiting for EOF on it too, so
+    the connection's slot never came back even after the guest died. Both leaked
+    for the worker's lifetime and survived :meth:`StreamHatch.close`.
+    """
+    if proc.poll() is None:
+        _signal_group(proc, pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            _signal_group(proc, pgid, signal.SIGKILL)
+    else:
+        # Already exited, but anything it started is still in its group.
+        _signal_group(proc, pgid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=grace)
+    for pipe in (proc.stdin, proc.stdout):
+        if pipe is not None:
+            with contextlib.suppress(OSError):
+                pipe.close()
+
+
+# Re-exported for callers that build guest command lines by hand.
+__all__ = [
+    'Handler',
+    'Process',
+    'Stream',
+    'StreamHatch',
+    'Upstream',
+    'git_url',
+    'guest_env_var',
+    'guest_socket_path',
+    'splice_subprocess',
+    'splice_tcp',
+]
