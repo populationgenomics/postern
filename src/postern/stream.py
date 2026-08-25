@@ -9,8 +9,11 @@ or nothing.
 
 * ``stream`` — the accepted connection (``stream.conn``) and the name of the
   hatch it arrived on (``stream.hatch``).
-* return `Process` to hand the connection to a subprocess as its stdin and
-  stdout, or ``None`` to refuse (the guest sees EOF).
+* return ``Process(argv)`` to hand the connection to a subprocess as its stdin
+  and stdout, or ``None`` to refuse (the guest sees EOF). The verdict *describes*
+  the command and the hatch spawns it, which is what lets the connection be put
+  into ordinary-stdio shape before there is a child to race
+  (`Process.from_popen` is the escape hatch, and says what it costs).
 * the hatch owns the *lifecycle* after the verdict — waiting for the command, then
   terminate-then-kill teardown and reaping the process group. It does not own the
   data path: the socket **is** the command's stdio, so the kernel moves the bytes.
@@ -97,6 +100,18 @@ forward pump that stops waiting on that pipe once the command itself has exited.
 Both are here; without them one connection could cost a slot, a subprocess and a
 non-exitable worker thread permanently, and ``max_conns`` of them killed the hatch
 for the worker's whole life rather than the run's.
+
+**Platform.** Linux is the only platform postern sandboxes *on* (bubblewrap), but
+a `StreamHatch` is host-side and runs anywhere, so the host half is exercised on
+macOS too — and process-group teardown needs a way to observe the command's exit
+without reaping it. There are two, ``waitid(..., WNOWAIT)`` and
+``kqueue``/``NOTE_EXIT``, and between them they cover Linux, macOS and the BSDs
+(see ``_WAITID``). On a platform with neither, teardown can still signal the
+command but not its group, so a command that leaves a background child behind
+leaves that child holding the guest's socket: the guest never reaches
+end-of-stream. That is a real functional gap rather than a theoretical one — it
+is what macOS did before the kqueue tier, and two of the teardown tests failed
+there while the Linux container stayed green.
 """
 
 from __future__ import annotations
@@ -104,7 +119,9 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import fcntl
 import os
+import select
 import selectors
 import signal
 import socket
@@ -142,13 +159,50 @@ _FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 _ACCEPT_RETRY_DELAY = 0.05
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
-# waitid lets us observe an exit without reaping it. Reached through getattr because
-# typeshed marks it unavailable on darwin, where CPython in fact provides it; None
-# would mean falling back to poll(), which reaps and so forfeits the group signal.
+# Observing the command's exit *without reaping it* is what keeps its pid — and
+# so the process group id captured at spawn — provably ours until teardown has
+# signalled the group. No single interface is portable, so there are three tiers.
+#
+# 1. ``os.waitid(..., WNOWAIT)``. typeshed marks it unavailable on darwin, hence
+#    the getattr — and typeshed is not simply wrong: its presence on macOS is
+#    *build-dependent*. Measured absent on Apple's system 3.9.6 and on pyenv's
+#    3.10/3.11; present on a uv-managed 3.13.12, where it is also fully correct
+#    end to end (leader stays a zombie, the captured pgid stays addressable,
+#    ``killpg`` still reaches a child the command left behind).
+# 2. ``kqueue``/``EVFILT_PROC``/``NOTE_EXIT`` on darwin and the BSDs, measured
+#    equivalent to tier 1. This tier exists because without it every macOS
+#    interpreter lacking ``os.waitid`` fell straight to tier 3, where
+#    ``test_teardown_reaches_the_whole_process_group`` and
+#    ``test_a_child_left_behind_does_not_hold_the_connection_open`` do not pass
+#    vacuously — they *fail*, the second with the guest timing out because it
+#    never reaches end-of-stream. The whole suite was only ever run on Linux.
+# 3. ``Popen.poll()``/``wait()``. These reap, which releases the leader's pid, so
+#    `_reap` then declines to signal a group it can no longer prove is ours: a
+#    background child survives holding the guest's socket. A platform that gets
+#    here has no process-group teardown; see the module docstring.
 _WAITID = getattr(os, 'waitid', None)
 _P_PID = getattr(os, 'P_PID', 0)
 _WEXITED = getattr(os, 'WEXITED', 0)
 _WNOWAIT = getattr(os, 'WNOWAIT', 0)
+_KQUEUE = getattr(select, 'kqueue', None)
+_KQ_FILTER_PROC = getattr(select, 'KQ_FILTER_PROC', None)
+_KQ_NOTE_EXIT = getattr(select, 'KQ_NOTE_EXIT', None)
+# File status flags to clear before handing the connection over as a command's
+# stdio. They live on the *open file description*, which the child's fds 0 and 1
+# are dup2's of, so whatever is set here is what the command runs with.
+_HANDOVER_CLEAR_FL = 0
+for _name in ('O_NONBLOCK', 'O_ASYNC', 'O_APPEND', 'O_DIRECT', 'O_NOATIME'):
+    _HANDOVER_CLEAR_FL |= getattr(os, _name, 0)
+# F_SETSIG. Not in the fcntl module on every platform, and only consulted when
+# O_ASYNC is set, but zeroed with the owner so no stale signal number survives.
+_F_SETSIG = getattr(fcntl, 'F_SETSIG', None)
+# Linux-only, hence the getattr; harmless where absent.
+_SO_PASSCRED = getattr(socket, 'SO_PASSCRED', None)
+# Socket options whose value is a `struct timeval`, whose width differs by platform
+# (16 bytes on Linux LP64, 12 on darwin). Never hard-coded: the length the kernel
+# reports for the current value is the length written back.
+_TIMEOUT_OPTS = (socket.SO_RCVTIMEO, socket.SO_SNDTIMEO)
+_TIMEVAL_MAX = 32
 # Everything a host-side subprocess gets of the host's environment. The subprocess
 # is the thing chewing on guest bytes, so it must not inherit the trusted worker's
 # secrets (the same reasoning as _sandbox.bwrap_env).
@@ -168,6 +222,23 @@ class Stream:
     parser back in the policy path, which is exactly what one socket per resource
     exists to avoid.
 
+    **The socket is handed over, not lent.** A `Process` verdict makes it the
+    command's stdin and stdout, so it is normalised at handover — blocking, no
+    signal-driven I/O, no socket timeouts — and anything a handler configured on
+    it is undone. Do not rely on such settings persisting, and in particular do
+    not reach for :meth:`socket.socket.settimeout` to bound a preamble read:
+    CPython implements it by setting ``O_NONBLOCK``, which lives on the open file
+    description the command's fds 0 and 1 are dup2's of, so before normalisation
+    it silently truncated the command's response (measured: 219 KiB of 4 MiB
+    delivered, and the guest read it as a clean end-of-stream). Use
+    :meth:`read_preamble`, which waits on readability and touches no flags.
+
+    Bounding that read matters for more than tidiness: the hatch cannot shut a
+    connection down until the handler has returned, so a handler that blocks
+    for ever on a guest that connects and sends nothing costs a slot for the
+    hatch's whole life. ``max_conns`` of those is a hatch a guest has silenced
+    with nothing but ``connect()``.
+
     ``hatch`` is the hatch's guest name, so one handler can serve several hatches
     and still know which capability was dialled.
     """
@@ -175,19 +246,52 @@ class Stream:
     conn: socket.socket
     hatch: str
 
+    def read_preamble(self, max_bytes: int, timeout: float) -> bytes:
+        """Read up to ``max_bytes``, waiting at most ``timeout`` seconds in total.
+
+        The flag-free way to consume a preamble: readiness comes from a selector
+        rather than from a socket timeout, so the connection's file status flags
+        are exactly as the command will need them (see the class docstring, and
+        `_drain`, which avoids ``settimeout`` for a related reason). Returns what
+        arrived — short, or empty on timeout or immediate end-of-stream — rather
+        than raising, because on this surface a guest that says nothing is not an
+        error, it is a refusal waiting to be made.
+        """
+        deadline = time.monotonic() + timeout
+        buf = bytearray()
+        with contextlib.suppress(OSError, ValueError):
+            while len(buf) < max_bytes and (remaining := deadline - time.monotonic()) > 0:
+                if not _readable(self.conn, remaining):
+                    break
+                chunk = self.conn.recv(max_bytes - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+        return bytes(buf)
+
 
 @dataclasses.dataclass
 class Process:
-    """Handler verdict: this subprocess owns the connection; wait for it and reap it.
+    """Handler verdict: run ``argv`` with the connection as its stdin and stdout.
 
-    The socket **is** the command's stdin and stdout — ``Popen(argv,
-    stdin=stream.conn, stdout=stream.conn)``, because `subprocess` accepts
-    anything with a ``fileno()``. The kernel moves the bytes; there is no
-    host-side pump, no thread per direction, and nothing in this process on the
-    data path at all. Half-close propagates natively: the guest's
-    ``shutdown(SHUT_WR)`` is an EOF on the command's stdin, which is how ``git
-    upload-pack`` learns the request is over, and the command's exit is the EOF
-    the guest reads.
+    **Declarative on purpose.** The verdict describes the command; the hatch
+    spawns it. That inversion is not ergonomics, it is the only way the
+    descriptor hygiene can be structural: the connection has to be put into
+    ordinary-stdio shape *before* ``Popen``, and a verdict that arrives holding an
+    already-spawned `Popen` is too late to fix. Measured — with the normalisation
+    sited after ``Popen``, half a millisecond of delay in the parent (one lost
+    timeslice) took a 4 MiB response down to 219 KiB on 10 of 10 attempts. Owning
+    the spawn also means ``start_new_session=True`` is guaranteed rather than
+    remembered, so teardown always has a process group of its own to signal, and
+    the pipe/stderr contract is checked in one place instead of being a rule a
+    handler has to know.
+
+    The socket **is** the command's stdin and stdout, so the kernel moves the
+    bytes: there is no host-side pump, no thread per direction, and nothing in
+    this process on the data path at all. Half-close propagates natively — the
+    guest's ``shutdown(SHUT_WR)`` is an EOF on the command's stdin, which is how
+    ``git upload-pack`` learns the request is over, and the command's exit is the
+    EOF the guest reads.
 
     The hatch's remaining job is lifecycle: wait for the command, then terminate,
     kill and reap its process group.
@@ -197,34 +301,129 @@ class Process:
     host that splices a command like that has already granted the guest something
     that does not play by the rules. That is the same category as a command that
     writes host state to its stdout, not a new one.
+
+    Args:
+        argv: The command, as a list (never a string through a shell).
+            ``None`` is reserved for :meth:`from_popen`.
+        cwd: Working directory; defaults to ``/``. See `splice_subprocess`.
+        env: Environment; defaults to a fixed minimal ``PATH``. See
+            `splice_subprocess`, which documents why the worker's own environment
+            is not inherited.
+        stderr: Where fd 2 goes; discarded by default. ``PIPE`` and ``STDOUT``
+            are both refused — see `splice_subprocess`.
     """
 
-    proc: subprocess.Popen[bytes]
-    # The command's process group, captured here and not at teardown: by then
-    # ``poll()`` has reaped the leader, so ``getpgid`` on its pid is ESRCH (or
-    # worse, a recycled pid) — while the *group* is still alive, and here still
-    # holding a descriptor for the guest's socket. ``None`` when the command is not
-    # its own group leader, i.e. when a handler built the `Popen` without
-    # ``start_new_session=True`` and the group is the worker's own: signalling that
-    # would signal the worker.
+    argv: Sequence[str] | None = None
+    cwd: str | os.PathLike[str] | None = None
+    env: dict[str, str] | None = None
+    stderr: int | None = subprocess.DEVNULL
+
+    # Populated when the hatch attaches this verdict to a connection, or up front
+    # by from_popen. Public because teardown tests and handlers that want the pid
+    # need it; None until then.
+    proc: subprocess.Popen[bytes] | None = dataclasses.field(default=None, init=False)
+    # The command's process group, captured at spawn and not at teardown: by then
+    # the leader may have been reaped, so ``getpgid`` on its pid is ESRCH (and on
+    # darwin it is ESRCH for a zombie regardless) — while the *group* is still
+    # alive, and here still holding a descriptor for the guest's socket. ``None``
+    # when the command is not its own group leader, i.e. an adopted `Popen` built
+    # without ``start_new_session=True``, whose group is the worker's own:
+    # signalling that would signal the worker.
     pgid: int | None = dataclasses.field(default=None, init=False)
     _disposed: bool = dataclasses.field(default=False, init=False, repr=False)
     _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        # Before the contract check, not after: the check's own reject path has to
-        # be able to signal the group it is about to abandon.
+        if self.argv is None:
+            return  # from_popen, or a Process() the hatch will refuse at attach
+        self.argv = list(self.argv)
+        if not self.argv:
+            raise ValueError('Process(argv) requires a command')
+        _check_stderr(self.stderr)
+
+    @classmethod
+    def from_popen(cls, proc: subprocess.Popen[bytes]) -> Process:
+        """Adopt a `Popen` you spawned yourself: you own the descriptor hygiene.
+
+        The escape hatch for what ``argv``/``cwd``/``env``/``stderr`` do not
+        cover — ``pass_fds``, ``user=``/``group=`` to run a command as a
+        per-tenant uid, an rlimit in ``preexec_fn``. It cannot give the same
+        guarantee the declarative form does: by the time this verdict reaches the
+        hatch the child is already running, so the connection cannot be
+        normalised without racing it. The hatch therefore *validates* instead —
+        a connection that is not in ordinary-stdio shape is refused with the
+        reason named, which is loud rather than silently corrupt, but it is late:
+        the child may already have died on ``EAGAIN``. So put the socket in
+        ordinary shape (or simply never touch it) before you spawn.
+
+        Spawn with ``stdin=stream.conn.fileno(), stdout=stream.conn.fileno()`` and
+        ``start_new_session=True``; without the latter ``pgid`` is ``None`` and
+        teardown can only signal the command itself, so a background child it
+        leaves behind keeps the guest's connection open.
+        """
+        verdict = cls()
+        verdict.proc = proc
+        verdict._capture_pgid()
+        held = [name for name in ('stdin', 'stdout', 'stderr') if getattr(proc, name) is not None]
+        if held:
+            # Reap before raising: this path abandons the child otherwise, and a
+            # guest reconnecting in a loop then grows the host's process table.
+            verdict.dispose(_REJECT_GRACE)
+            raise ValueError(
+                f"Process.from_popen(proc) requires the connection as the command's stdio, but {held} "
+                f'{"is" if len(held) == 1 else "are"} a pipe. Nothing pumps a pipe: pass '
+                'stdin=stream.conn.fileno(), stdout=stream.conn.fileno() and a file or DEVNULL for stderr.'
+            )
+        return verdict
+
+    def _capture_pgid(self) -> None:
+        """Record the group id while the leader is certainly still alive."""
+        if self.proc is None:
+            return
         with contextlib.suppress(OSError, AttributeError):
             if os.getpgid(self.proc.pid) == self.proc.pid:
                 self.pgid = self.proc.pid
-        held = [name for name in ('stdin', 'stdout', 'stderr') if getattr(self.proc, name) is not None]
-        if held:
-            self.dispose(_REJECT_GRACE)
-            raise ValueError(
-                f"Process(proc) requires the connection as the command's stdio, but {held} "
-                f'{"is" if len(held) == 1 else "are"} a pipe. Nothing pumps a pipe: pass '
-                'stdin=stream.conn, stdout=stream.conn and a file or DEVNULL for stderr.'
-            )
+
+    def _attach(self, conn: socket.socket, grace: float) -> None:
+        """Make ``conn`` this verdict's command's stdio. Called only by the hatch.
+
+        Normalise, then spawn. In that order and with nothing in between, which is
+        the property `Process`'s docstring exists to explain.
+        """
+        if self.proc is not None:
+            abnormal = _abnormal_stdio(conn)
+            if abnormal:
+                self.dispose(grace)
+                raise ValueError(
+                    f'the connection is not in ordinary-stdio shape ({", ".join(abnormal)}), and this '
+                    'verdict already spawned its command, so it cannot be normalised without racing '
+                    'the child. Leave the connection alone before Popen, or use Process(argv=...) and '
+                    'let the hatch spawn it.'
+                )
+            return
+        if self.argv is None:
+            raise ValueError('Process() requires argv, or use Process.from_popen(popen)')
+        _normalise_stdio(conn)
+        fd = conn.fileno()
+        self.proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell; guest bytes only ever reach stdin
+            list(self.argv),
+            # The descriptor, not the socket object: `subprocess` accepts anything
+            # with a fileno(), but typeshed's _FILE does not admit a socket. Passing
+            # the fd is the same call and says what it means — this descriptor
+            # becomes the command's 0 and 1, dup'd before the close_fds sweep, and
+            # the socket object stays ours to close.
+            stdin=fd,
+            stdout=fd,
+            stderr=self.stderr,
+            cwd=self.cwd if self.cwd is not None else '/',
+            env=dict(self.env) if self.env is not None else {'PATH': _MINIMAL_PATH},
+            # Its own process group, so teardown reaps everything the command
+            # started and not just the command. Without this a child left behind
+            # inherits the guest's socket and keeps the connection open after the
+            # command is gone — the guest never sees EOF and the slot never returns.
+            start_new_session=True,
+        )
+        self._capture_pgid()
 
     def dispose(self, grace: float) -> None:
         """Terminate, kill and reap the command's process group. Idempotent.
@@ -233,14 +432,17 @@ class Process:
         of what is in flight, and the per-connection ``finally`` disposes of what it
         was handed, and both may reach the same verdict. Letting both reap meant the
         second pass signalled a process group whose leader had already been waited —
-        a pid the kernel may reuse, and `splice_subprocess` mints a session leader
-        per connection, so one connection's stale ``SIGKILL`` could land on another's
-        command.
+        a pid the kernel may reuse, and every verdict mints a session leader, so one
+        connection's stale ``SIGKILL`` could land on another's command.
+
+        A verdict that never reached :meth:`_attach` has nothing to reap.
         """
         with self._lock:
             if self._disposed:
                 return
             self._disposed = True
+        if self.proc is None:
+            return
         with contextlib.suppress(Exception):
             _reap(self.proc, grace, self.pgid)
 
@@ -311,50 +513,15 @@ def splice_subprocess(
         read-only the flags look. Choose a command whose stdin grants nothing
         beyond the capability you meant to grant.
     """
-    if stderr == subprocess.PIPE:
-        raise ValueError(
-            'stderr=subprocess.PIPE is not supported: nothing drains it, so the command deadlocks. '
-            'Use DEVNULL (the default), or pass a file/fd to keep the diagnostics.'
-        )
-    if stderr == subprocess.STDOUT:
-        # stdout *is* the guest's socket, so this is the one setting that relays the
-        # command's diagnostics — host paths included — straight to the guest, which
-        # is precisely what this argument exists to prevent.
-        raise ValueError(
-            'stderr=subprocess.STDOUT is not supported: stdout is the guest socket, so merging fd 2 '
-            'into it hands the guest the command diagnostics (host paths included). '
-            'Use DEVNULL (the default), or pass a file/fd to keep them host-side.'
-        )
+    # Eagerly, so a bad stderr fails when the hatch is built rather than on the
+    # first connection; `Process` checks the same thing for a directly-built verdict.
+    _check_stderr(stderr)
     argv = list(argv)
-    process_env = dict(env) if env is not None else {'PATH': _MINIMAL_PATH}
+    if not argv:
+        raise ValueError('splice_subprocess(argv) requires a command')
 
-    def handler(stream: Stream) -> Process:
-        # The command's fds 0 and 1 are dup2's of *this* open file description, so
-        # its file status flags are shared: a wrapping handler that bounded its own
-        # preamble read with conn.settimeout() left the socket O_NONBLOCK, and the
-        # command then took EAGAIN on a large write and exited — a silently
-        # truncated response the guest reads as a clean end-of-stream. Restore
-        # blocking mode so that trap is unrepresentable.
-        os.set_blocking(stream.conn.fileno(), True)
-        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell; guest bytes only ever reach stdin
-            argv,
-            # The descriptor, not the socket object: `subprocess` accepts anything
-            # with a fileno(), but typeshed's _FILE does not admit a socket. Passing
-            # the fd is the same call and says what it means — this descriptor
-            # becomes the command's 0 and 1, dup'd before the close_fds sweep, and
-            # the socket object stays ours to close.
-            stdin=stream.conn.fileno(),
-            stdout=stream.conn.fileno(),
-            stderr=stderr,
-            cwd=cwd if cwd is not None else '/',
-            env=process_env,
-            # Its own process group, so teardown reaps everything the command
-            # started and not just the command. Without this a child left behind
-            # inherits the guest's socket and keeps the connection open after the
-            # command is gone — the guest never sees EOF and the slot never returns.
-            start_new_session=True,
-        )
-        return Process(proc)
+    def handler(_stream: Stream) -> Process:
+        return Process(argv, cwd=cwd, env=env, stderr=stderr)
 
     return handler
 
@@ -621,6 +788,11 @@ class StreamHatch:
             # workers are non-daemon the host process can no longer exit either.
             self._track(conn, None)
             verdict = self._handler(Stream(conn, self._name))
+            if verdict is not None:
+                # Normalise-then-spawn, the one place a connection becomes a
+                # command's stdio. Inside the try, so a refused verdict is
+                # contained to this connection like any other handler failure.
+                verdict._attach(conn, self._grace)  # noqa: SLF001 — the hatch owns the verdict's lifecycle
             self._track(conn, verdict)
             if verdict is None:
                 # A refusal. A raw stream has no way to say "no", so the guest gets
@@ -711,6 +883,112 @@ class StreamHatch:
 # --------------------------------------------------------------------------- #
 # Splicing                                                                      #
 # --------------------------------------------------------------------------- #
+def _check_stderr(stderr: int | None) -> None:
+    """Refuse the two ``stderr`` values that cannot work on this surface.
+
+    ``PIPE`` deadlocks: nothing drains it, so a command that fills the 64 KiB pipe
+    blocks in ``write(2)`` for ever and never exits, pinning the connection's slot
+    until :meth:`StreamHatch.close`.
+
+    ``STDOUT`` discloses: stdout *is* the guest's socket, so merging fd 2 into it
+    relays the command's diagnostics — which quote host state — straight to the
+    guest. Measured: a guest received ``fatal: '/srv/secrets/customer-a/repo.git'
+    does not appear to be a git repository``, which is verbatim the disclosure the
+    ``stderr`` argument exists to prevent.
+    """
+    if stderr == subprocess.PIPE:
+        raise ValueError(
+            'stderr=subprocess.PIPE is not supported: nothing drains it, so the command deadlocks. '
+            'Use DEVNULL (the default), or pass a file/fd to keep the diagnostics.'
+        )
+    if stderr == subprocess.STDOUT:
+        raise ValueError(
+            'stderr=subprocess.STDOUT is not supported: stdout is the guest socket, so merging fd 2 '
+            'into it hands the guest the command diagnostics (host paths included). '
+            'Use DEVNULL (the default), or pass a file/fd to keep them host-side.'
+        )
+
+
+def _normalise_stdio(conn: socket.socket) -> None:
+    """Put ``conn`` in the shape ordinary (non-pty) stdin/stdout has. Never raises.
+
+    A command's fds 0 and 1 are ``dup2``s of *this* open file description, so its
+    file status flags and its socket options are shared, not copied: whatever a
+    handler configured on the connection is what the command runs with. Ordinary
+    stdio is blocking, has no signal-driven I/O and has no I/O timeouts, so that
+    is what the command gets — undoing anything the handler set rather than
+    forbidding handlers from setting it.
+
+    Enumerated by measurement rather than from the manual: every option below was
+    confirmed to reach a child that reports its own fd 0. The three that change
+    behaviour are ``O_NONBLOCK`` (a handler's ``settimeout`` — 219 KiB of a 4 MiB
+    response delivered, and read by the guest as a clean end-of-stream),
+    ``SO_RCVTIMEO`` (the command's read fails ``EAGAIN`` mid-request — 8 of 16
+    bytes echoed) and ``SO_SNDTIMEO`` (the same on the way out). The rest reach
+    the child but were measured inert on ``AF_UNIX`` — ``O_ASYNC`` delivers no
+    ``SIGIO`` even with an owner set, ``SO_RCVLOWAT`` does not gate a stream read,
+    ``SO_OOBINLINE`` and ``SO_PASSCRED`` change nothing a plain-reading command
+    can see — and are cleared anyway, because their inertness is a detail of one
+    kernel's ``AF_UNIX`` implementation and not a property worth depending on.
+
+    Deliberately **not** normalised:
+
+    * ``SO_LINGER`` — close semantics carry the disposition signal (an unread
+      receive queue at last-close is what resets the guest, and it is the only
+      failure signal a stream with no framing of its own has). Changing how the
+      socket closes would change what the guest is told, so this one is left
+      exactly as it is found.
+    * ``SO_RCVBUF``/``SO_SNDBUF``, ``SO_MARK``, ``SO_PRIORITY`` — sizes and
+      routing hints. A pipe has a buffer size too, so these are not surprises,
+      and a handler that tunes them presumably means to.
+    * ``SO_PEEK_OFF`` — affects ``MSG_PEEK`` only, which ordinary stdio never uses.
+    """
+    fd = conn.fileno()
+    with contextlib.suppress(OSError, ValueError):
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        if flags & _HANDOVER_CLEAR_FL:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~_HANDOVER_CLEAR_FL)
+    # Only meaningful while O_ASYNC is set, which it no longer is; zeroed so no
+    # stale owner or signal number survives the handover.
+    with contextlib.suppress(OSError, ValueError):
+        fcntl.fcntl(fd, fcntl.F_SETOWN, 0)
+    if _F_SETSIG is not None:
+        with contextlib.suppress(OSError, ValueError):
+            fcntl.fcntl(fd, _F_SETSIG, 0)
+    for opt in _TIMEOUT_OPTS:
+        with contextlib.suppress(OSError, ValueError):
+            current = conn.getsockopt(socket.SOL_SOCKET, opt, _TIMEVAL_MAX)
+            if any(current):
+                conn.setsockopt(socket.SOL_SOCKET, opt, bytes(len(current)))
+    flag_opts = [(socket.SO_RCVLOWAT, 1), (socket.SO_OOBINLINE, 0)]
+    if _SO_PASSCRED is not None:
+        flag_opts.append((_SO_PASSCRED, 0))
+    for opt, value in flag_opts:
+        with contextlib.suppress(OSError, ValueError):
+            conn.setsockopt(socket.SOL_SOCKET, opt, value)
+
+
+def _abnormal_stdio(conn: socket.socket) -> list[str]:
+    """Which of the normalised properties ``conn`` is not in. Never raises.
+
+    Only reached for an adopted `Popen`, where the child is already running and
+    normalising would race it (see `Process.from_popen`). Reports rather than
+    repairs, so the failure is named instead of silent.
+    """
+    bad: list[str] = []
+    with contextlib.suppress(OSError, ValueError):
+        flags = fcntl.fcntl(conn.fileno(), fcntl.F_GETFL)
+        for name in ('O_NONBLOCK', 'O_ASYNC', 'O_APPEND', 'O_DIRECT', 'O_NOATIME'):
+            bit = getattr(os, name, 0)
+            if bit and flags & bit:
+                bad.append(name)
+    for name, opt in zip(('SO_RCVTIMEO', 'SO_SNDTIMEO'), _TIMEOUT_OPTS, strict=True):
+        with contextlib.suppress(OSError, ValueError):
+            if any(conn.getsockopt(socket.SOL_SOCKET, opt, _TIMEVAL_MAX)):
+                bad.append(name)
+    return bad
+
+
 def _dispose(verdict: Process | None, grace: float) -> None:
     """Release whatever a verdict was holding. Idempotent, never raises."""
     if verdict is not None:
@@ -797,20 +1075,60 @@ def _await_command(verdict: Process) -> None:
 
     Waits **without reaping**, which is what lets teardown still collect the
     command's process group afterwards: reaping releases the leader's pid, and a
-    group id is only valid while that pid is allocated, so a plain ``wait()`` here
+    group id is only reusable once that pid is free, so a plain ``wait()`` here
     would leave :func:`_reap` correctly declining to signal a group it can no
     longer prove is ours — and a child the command left behind would inherit the
-    guest's socket and keep the connection open for ever. ``waitid(..., WNOWAIT)``
-    reports the exit and leaves the child waitable.
+    guest's socket and keep the connection open for ever. Both
+    ``waitid(..., WNOWAIT)`` and ``kqueue``/``NOTE_EXIT`` report the exit and leave
+    the child waitable; see ``_WAITID`` for which platform gets which, and why
+    there are two.
     """
     proc = verdict.proc
+    if proc is None:  # never attached; nothing to wait for
+        return
     if _WAITID is not None:
         try:
             _WAITID(_P_PID, proc.pid, _WEXITED | _WNOWAIT)
         except OSError:
             proc.wait()  # interrupted, or no such child: fall back
         return
-    proc.wait()  # pragma: no cover - waitid is POSIX-wide in practice
+    if _kq_exited(proc.pid, None) is not None:
+        return
+    proc.wait()
+
+
+def _kq_exited(pid: int, timeout: float | None) -> bool | None:
+    """Whether ``pid`` has exited, via ``kqueue``, **without reaping it**.
+
+    ``None`` means kqueue cannot answer here (not this platform, or registration
+    failed), so the caller falls through to the reaping fallback. ``timeout=None``
+    blocks until the exit; ``0`` polls.
+
+    Only ever called with our own child's pid, and only while it is unreaped:
+    which matters, because ``EVFILT_PROC`` reports an immediate ``NOTE_EXIT`` for a
+    pid that does not exist at all (measured), so on any other pid a ``True`` here
+    would be meaningless. `Popen` holds the pid until something waits it, so
+    within this module "registration says exited" and "our child exited" coincide.
+    """
+    if _KQUEUE is None or _KQ_FILTER_PROC is None or _KQ_NOTE_EXIT is None:
+        return None
+    try:
+        kq = _KQUEUE()
+    except OSError:  # pragma: no cover - only if the platform lies about kqueue
+        return None
+    try:
+        event = select.kevent(
+            pid,
+            filter=_KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=_KQ_NOTE_EXIT,
+        )
+        try:
+            return bool(kq.control([event], 1, timeout))
+        except OSError:
+            return None
+    finally:
+        kq.close()
 
 
 def _signal_group(proc: subprocess.Popen[bytes], pgid: int | None, sig: int) -> None:
@@ -836,18 +1154,22 @@ def _exited(proc: subprocess.Popen[bytes]) -> bool:
     ``poll()`` reaps, and reaping releases the leader's pid. A process group's id
     stays valid only while that pid is still allocated, which an unreaped zombie
     guarantees and a reaped child does not, so a group kill issued after a ``poll()``
-    can land on a recycled pid — and `splice_subprocess` mints a new session leader
-    per connection, so the recycled pid is plausibly another connection's command.
-    ``waitid(..., WNOWAIT)`` reports the exit and leaves the child waitable.
+    can land on a recycled pid — and every verdict mints a new session leader per
+    connection, so the recycled pid is plausibly another connection's command.
+    ``waitid(..., WNOWAIT)`` and ``kqueue``/``NOTE_EXIT`` both report the exit and
+    leave the child waitable; ``poll()`` is the last resort and reaps.
     """
     if proc.returncode is not None:
         return True
-    if _WAITID is None:  # pragma: no cover - waitid is POSIX-wide in practice
-        return proc.poll() is not None  # weaker: this reaps, so no group signal follows
-    try:
-        return _WAITID(_P_PID, proc.pid, _WEXITED | os.WNOHANG | _WNOWAIT) is not None
-    except OSError:
-        return proc.poll() is not None
+    if _WAITID is not None:
+        try:
+            return _WAITID(_P_PID, proc.pid, _WEXITED | os.WNOHANG | _WNOWAIT) is not None
+        except OSError:
+            return proc.poll() is not None
+    kq = _kq_exited(proc.pid, 0)
+    if kq is not None:
+        return kq
+    return proc.poll() is not None  # weaker: this reaps, so no group signal follows
 
 
 def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) -> None:

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import postern.stream as stream_module
 from postern import Sandbox, SandboxProfile
 from postern._sandbox import GUEST_CONNECT
 from postern.stream import (
@@ -132,11 +133,12 @@ def test_no_signal_is_ever_sent_to_an_already_reaped_group() -> None:
     the leader's ``returncode`` at the moment of each ``killpg``.
     """
     seen: list[tuple[int, int, int | None]] = []
-    procs: list[subprocess.Popen[bytes]] = []
+    verdicts: list[Process] = []
     real_killpg = os.killpg
 
     def spy(pgid: int, sig: int) -> None:
-        seen.append((pgid, sig, procs[0].returncode if procs else None))
+        live = verdicts[0].proc if verdicts else None
+        seen.append((pgid, sig, live.returncode if live is not None else None))
         real_killpg(pgid, sig)
 
     base = splice_subprocess(['cat'])
@@ -144,7 +146,7 @@ def test_no_signal_is_ever_sent_to_an_already_reaped_group() -> None:
     def handler(stream: Stream) -> Process:
         verdict = base(stream)
         assert isinstance(verdict, Process)
-        procs.append(verdict.proc)
+        verdicts.append(verdict)
         return verdict
 
     os.killpg = spy
@@ -210,41 +212,55 @@ def test_grace_zero_still_reaps() -> None:
 
     ``wait(timeout=0.0)`` is a single ``WNOHANG`` poll that necessarily loses the
     race against the signal it just sent, which is why the final ``wait()`` is
-    untimed. On the reviewed revision this particular path happened to survive
-    anyway, because the double dispose it also had reaped on its second pass; the
-    discriminating case for the same cause is
-    :func:`test_process_contract_rejection_reaps_the_group`, where there is no
-    second pass. Kept because the invariant is what matters, not the symptom.
+    untimed.
+
+    This test used to be vacuous, and the inverted `Process` contract is what made
+    it so: its handler built a ``Popen`` holding pipes, which ``__post_init__``
+    rejected *before* the verdict was ever accepted, so every reap in it ran at
+    ``_REJECT_GRACE`` and never at the hatch's ``grace``. Instrumenting ``_reap``
+    showed six calls, all at 0.5 — it was
+    :func:`test_process_contract_rejection_reaps_the_group` six times over, and
+    the ``grace=0.0`` path had no coverage at all. A declarative verdict is
+    accepted, so the hatch's ``grace`` is the one that reaches ``_reap``.
 
     Driven through ``close()`` rather than by disconnecting: a command that writes
     nothing and ignores stdin EOF holds its slot by design (there is deliberately
     no per-connection lifetime cap), so ``close()`` is what makes the reap run.
     """
-    procs: list[subprocess.Popen[bytes]] = []
+    verdicts: list[Process] = []
 
     def handler(_stream: Stream) -> Process:
-        proc = subprocess.Popen(
-            [sys.executable, '-c', 'import time; time.sleep(300)'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        procs.append(proc)
-        return Process(proc)
+        verdict = Process([sys.executable, '-c', 'import time; time.sleep(300)'])
+        verdicts.append(verdict)
+        return verdict
 
+    graces: list[float] = []
+    real_reap = stream_module._reap
+
+    def spy(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) -> None:
+        graces.append(grace)
+        real_reap(proc, grace, pgid)
+
+    stream_module._reap = spy
     hatch = StreamHatch(handler, name='z', max_conns=6, grace=0.0)
     hatch.start()
     conns = []
     try:
         for _ in range(6):
             conns.append(_dial(hatch))
-        assert _wait_until(lambda: len(procs) == 6), f'only {len(procs)} of 6 connections were served'
+        assert _wait_until(lambda: sum(v.proc is not None for v in verdicts) == 6), (
+            f'only {sum(v.proc is not None for v in verdicts)} of 6 connections were served'
+        )
     finally:
         hatch.close()
+        stream_module._reap = real_reap
         for conn in conns:
             conn.close()
-    pids = [p.pid for p in procs]
+    # The point of the test: the reap really ran at the hatch's grace, not at the
+    # contract-rejection budget. Without this the whole test can pass vacuously.
+    assert graces, 'no reap ran at all'
+    assert all(g == 0.0 for g in graces), f'grace=0.0 never reached _reap: {graces}'
+    pids = [v.proc.pid for v in verdicts if v.proc is not None]
     assert _wait_until(lambda: not [pid for pid in pids if _is_zombie(pid)], timeout=30), (
         f'unreaped zombies at grace=0.0: {[pid for pid in pids if _is_zombie(pid)]}'
     )
@@ -259,7 +275,7 @@ def test_process_contract_rejection_reaps_the_group() -> None:
         start_new_session=True,
     )
     with pytest.raises(ValueError, match=r'requires the connection as the command'):
-        Process(proc)
+        Process.from_popen(proc)
     pid = proc.pid
     assert _wait_until(lambda: not _is_zombie(pid), timeout=15), f'rejected Popen left a zombie: {pid}'
     assert proc.poll() is not None, 'rejected Popen was never waited'

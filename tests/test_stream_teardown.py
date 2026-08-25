@@ -138,13 +138,13 @@ def test_a_verdict_handed_to_a_closing_hatch_is_still_reaped() -> None:
     abandoned ones, so a guest reconnecting in a loop would otherwise grow the
     host's process table without bound.
     """
-    started: list[int] = []
+    started: list[Process] = []
     hatch = StreamHatch(splice_subprocess(['sh', '-c', 'exec sleep 30']), name='r', max_conns=4, grace=0.5)
 
     def handler(stream: Stream) -> Process:
         verdict = splice_subprocess(['sh', '-c', 'exec sleep 30'])(stream)
         assert isinstance(verdict, Process)
-        started.append(verdict.proc.pid)
+        started.append(verdict)
         hatch._closing = True
         return verdict
 
@@ -156,8 +156,9 @@ def test_a_verdict_handed_to_a_closing_hatch_is_still_reaped() -> None:
         conn = socket.socket(socket.AF_UNIX)
         conn.connect(hatch.socket_path)
         conn.close()
-        assert _wait_until(lambda: len(started) == 1), 'the command never started'
-        assert _wait_until(lambda: not _alive(started[0])), f'the closing path abandoned pid {started[0]}'
+        assert _wait_until(lambda: bool(started) and started[0].proc is not None), 'the command never started'
+        pid = started[0].proc.pid  # type: ignore[union-attr]
+        assert _wait_until(lambda: not _alive(pid)), f'the closing path abandoned pid {pid}'
     finally:
         hatch.close()
 
@@ -186,7 +187,7 @@ def test_process_refuses_pipes() -> None:
     )
     try:
         with pytest.raises(ValueError, match=r'requires the connection as the command'):
-            Process(proc)
+            Process.from_popen(proc)
     finally:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             proc.kill()

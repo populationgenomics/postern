@@ -8,6 +8,7 @@ connector the sandbox binds in) is covered here too, on any platform with git.
 """
 
 import contextlib
+import dataclasses
 import os
 import pathlib
 import socket
@@ -81,6 +82,16 @@ def _exchange(hatch, payload):
     raw = _recv_all(sock)
     sender.join(_DEADLINE)
     return raw
+
+
+def _reaped(verdict):
+    """Whether the hatch has finished with this verdict's command.
+
+    Reads ``returncode`` rather than calling ``poll()``: poll *is* the reap, so a
+    test that polls sets ``returncode`` itself and `_reap` then declines to signal
+    the process group — switching off part of what is under test.
+    """
+    return verdict.proc is not None and verdict.proc.returncode is not None
 
 
 def _until(predicate, deadline=_DEADLINE):
@@ -206,23 +217,25 @@ def test_max_conns_stops_accepting_rather_than_queueing_fds():
 
 # -- abrupt guest death ------------------------------------------------------ #
 def test_guest_reset_mid_splice_reaps_the_subprocess_and_frees_the_slot():
-    procs = []
+    verdicts = []
     base = splice_subprocess(['cat'])
 
     def handler(stream):
         verdict = base(stream)
         assert isinstance(verdict, Process)
-        procs.append(verdict.proc)
+        verdicts.append(verdict)
         return verdict
 
     with _serving(StreamHatch(handler, max_conns=1, grace=1.0)) as hatch:
         sock = _dial(hatch)
         sock.sendall(b'half a request')
-        assert _until(lambda: bool(procs))
+        # The verdict describes the command; the hatch spawns it, so `proc` appears
+        # a moment after the handler returns.
+        assert _until(lambda: bool(verdicts) and verdicts[0].proc is not None)
         # RST rather than a clean FIN: the guest was killed, not closed.
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
         sock.close()
-        assert _until(lambda: procs[0].poll() is not None)  # no host process left running
+        assert _until(lambda: _reaped(verdicts[0]))  # no host process left running
         assert _exchange(hatch, b'after') == b'after'  # the single slot came back
 
 
@@ -232,13 +245,13 @@ def test_subprocess_that_ignores_stdin_eof_is_terminated_at_teardown():
     # there is no separate signal to notice, which is deliberate: the old pump
     # guessed the exchange was over when stdout closed, and guessing wrong is what
     # truncated responses. So `close()` is what ends it, via terminate-then-kill.
-    procs = []
+    verdicts = []
     base = splice_subprocess(['sh', '-c', 'exec sleep 60'])
 
     def handler(stream):
         verdict = base(stream)
         assert isinstance(verdict, Process)
-        procs.append(verdict.proc)
+        verdicts.append(verdict)
         return verdict
 
     hatch = StreamHatch(handler, grace=1.0)
@@ -247,11 +260,12 @@ def test_subprocess_that_ignores_stdin_eof_is_terminated_at_teardown():
     conn.settimeout(_DEADLINE)
     conn.connect(hatch.socket_path)
     try:
-        assert _until(lambda: bool(procs))
-        assert procs[0].poll() is None  # still running: nothing has ended it
+        assert _until(lambda: bool(verdicts) and verdicts[0].proc is not None)
+        assert not _reaped(verdicts[0])  # still running: nothing has ended it
         hatch.close()
-        assert _until(lambda: procs[0].poll() is not None)
-        assert procs[0].returncode != 0  # signalled, not a clean exit
+        assert _until(lambda: _reaped(verdicts[0]))
+        assert verdicts[0].proc is not None
+        assert verdicts[0].proc.returncode != 0  # signalled, not a clean exit
     finally:
         conn.close()
         hatch.close()
@@ -452,12 +466,17 @@ def test_connector_pumps_stdio_to_the_hatch():
 # -- verdict types ----------------------------------------------------------- #
 def test_verdicts_are_plain_data():
     # The connection is the command's stdio, so a verdict holds no pipes at all.
+    declared = Process(['cat'], cwd='/tmp', env={'PATH': '/bin'})  # noqa: S108 — never opened
+    assert declared.argv == ['cat']
+    assert declared.proc is None  # nothing is spawned until the hatch attaches it
+    assert dataclasses.is_dataclass(declared)
+
     left, right = socket.socketpair()
     proc = subprocess.Popen(
         [sys.executable, '-c', 'pass'], stdin=right.fileno(), stdout=right.fileno(), start_new_session=True
     )
     try:
-        assert Process(proc).proc is proc
+        assert Process.from_popen(proc).proc is proc
     finally:
         proc.wait(timeout=30)
         left.close()
