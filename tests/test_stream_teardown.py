@@ -1,19 +1,16 @@
 """Teardown invariants for the stream hatch: nothing outlives its connection.
 
-Each of these is a regression test for a way a hostile guest could make the host
-keep something — a subprocess, a slot, a thread, the ability to exit — after its
-connection was over. They need no bubblewrap: the guest is only ever a socket
-client, and the host side is where all of this happens.
+Each test pins one thing a hostile guest must not be able to make the host keep —
+a subprocess, a slot, a thread, the ability to exit — after its connection is over.
+No bubblewrap needed: the guest is only ever a socket client.
 
-The command under test deliberately leaves a background child holding its stdout.
-Nothing exotic — a wrapper that starts a sidecar behaves this way — and the point
-is that the hatch must cope with a command it did not write. Liveness of that
-child is observed through a **heartbeat file** rather than its pid: when its
-parent exits it is reparented to whatever is PID 1 (which, under
-``tests/docker/run.sh``, is pytest itself, and does not reap), so a killed child
-can linger as a zombie that ``kill(pid, 0)`` still calls alive. A stale heartbeat
-is unambiguous. Every test asserts the child *appeared* before asserting it went
-away, so none of them can pass by the command having failed to start.
+The command under test leaves a background child holding its stdout, because the
+hatch must cope with a command it did not write. That child's liveness is observed
+through a **heartbeat file** rather than its pid: when its parent exits it is
+reparented to whatever is PID 1 (under ``tests/docker/run.sh``, pytest itself, which
+does not reap), so a killed child can linger as a zombie that ``kill(pid, 0)`` still
+calls alive. Every test asserts the child *appeared* before asserting it went away,
+so none can pass by the command having failed to start.
 """
 
 from __future__ import annotations
@@ -38,8 +35,7 @@ def _command(heartbeat: pathlib.Path) -> list[str]:
     """``/bin/sh`` reading stdin to EOF, having left a child holding its stdout.
 
     POSIX shell only: ``exec -a`` is a bashism that dash — Debian's and Ubuntu's
-    ``/bin/sh``, and so CI's — rejects outright, which would make every assertion
-    below vacuously true.
+    ``/bin/sh``, and so CI's — rejects outright.
     """
     return [
         '/bin/sh',
@@ -92,12 +88,9 @@ def test_teardown_reaches_the_whole_process_group(heartbeat: pathlib.Path) -> No
 def test_a_child_left_behind_does_not_hold_the_connection_open(heartbeat: pathlib.Path) -> None:
     """A child that inherited the guest's socket must not outlive the command.
 
-    The hazard moved rather than went away when the host-side pump did. It used to
-    be a *pipe*: a surviving child held the stdout pipe open, so the pump waited for
-    an EOF that could never come and the slot never returned. Now the socket itself
-    is the command's stdio, so a surviving child holds the *guest's connection*
-    open — the guest never reads end-of-stream, and the run hangs until its timeout.
-    Either way the fix is the same: teardown signals the process group.
+    The socket is the command's stdio, so a surviving child holds the *guest's
+    connection* open: the guest never reads end-of-stream and the run hangs until its
+    timeout. Teardown signals the process group.
     """
     hatch = StreamHatch(splice_subprocess(_command(heartbeat)), name='p', max_conns=1, grace=1.0)
     hatch.start()
@@ -131,12 +124,10 @@ def test_a_child_left_behind_does_not_hold_the_connection_open(heartbeat: pathli
 def test_a_verdict_handed_to_a_closing_hatch_is_still_reaped() -> None:
     """A verdict the hatch cannot use must still be disposed of, not abandoned.
 
-    With no splice function there is far less between the handler returning and the
-    command being waited, but the window is not empty: a handler that returns while
-    `close` is running has its verdict refused by the bookkeeping, and that path has
-    to reap what it declines. ``max_conns`` bounds concurrent commands, not
-    abandoned ones, so a guest reconnecting in a loop would otherwise grow the
-    host's process table without bound.
+    A handler that returns while `close` is running has its verdict refused by the
+    bookkeeping, and that path has to reap what it declines: ``max_conns`` bounds
+    concurrent commands, not abandoned ones, so a guest reconnecting in a loop would
+    otherwise grow the host's process table without bound.
     """
     started: list[Process] = []
     hatch = StreamHatch(splice_subprocess(['sh', '-c', 'exec sleep 30']), name='r', max_conns=4, grace=0.5)
@@ -214,9 +205,9 @@ def test_close_tears_down_an_in_flight_splice(heartbeat: pathlib.Path) -> None:
 def test_the_worker_process_can_still_exit(tmp_path: pathlib.Path) -> None:
     """A splice blocked on a stranded pipe must not wedge the whole worker.
 
-    ``ThreadPoolExecutor`` workers have been non-daemon since 3.9 and
-    ``shutdown(wait=False)`` does not interrupt one, so a pump this hatch cannot
-    unblock is a pump that stops the interpreter from ever exiting.
+    ``ThreadPoolExecutor`` workers are non-daemon and ``shutdown(wait=False)`` does
+    not interrupt one, so a worker this hatch cannot unblock stops the interpreter
+    from ever exiting.
     """
     src = str(pathlib.Path(__file__).resolve().parent.parent / 'src')
     argv = _command(tmp_path / 'heartbeat')

@@ -1,8 +1,4 @@
-"""Regressions from the third review of the stream hatch.
-
-Both of these are about the same thing from two directions: exit observation that
-must not reap, and teardown that must not stop at the leader.
-"""
+"""Exit observation that must not reap, and teardown that must not stop at the leader."""
 
 from __future__ import annotations
 
@@ -41,10 +37,9 @@ def _beating(path: pathlib.Path, stale_after: float = 2.5) -> bool:
 def test_a_term_ignoring_group_member_does_not_survive_teardown(tmp_path: pathlib.Path) -> None:
     """Escalation is keyed on the group, not on the leader's exit.
 
-    The leader dies well inside ``grace``, so the old code reaped it and never sent
-    the group ``SIGKILL`` — and the member that ignored ``SIGTERM`` went on holding a
-    dup of the guest's socket in its own session, outliving the hatch and this
-    process. Nothing exotic: a sidecar with a ``SIGTERM`` handler behaves this way.
+    A group member that ignores ``SIGTERM`` — a sidecar with a handler — survives a
+    leader that dies well inside ``grace``, and it holds a dup of the guest's socket
+    in its own session.
     """
     heartbeat = tmp_path / 'heartbeat'
     argv = [
@@ -75,9 +70,8 @@ def test_a_term_ignoring_group_member_does_not_survive_teardown(tmp_path: pathli
 def test_the_escalation_test_is_not_vacuous(tmp_path: pathlib.Path) -> None:
     """The command really does leave a member that ignores SIGTERM.
 
-    Without this the test above passes whenever the shell fails to fork the
-    subshell, or ``trap`` fails to take, which is the shape of every vacuous test
-    this branch has produced.
+    Without this the test above passes whenever the shell fails to fork the subshell
+    or ``trap`` fails to take.
     """
     heartbeat = tmp_path / 'heartbeat'
     proc = subprocess.Popen(
@@ -108,12 +102,10 @@ def test_the_escalation_test_is_not_vacuous(tmp_path: pathlib.Path) -> None:
 def test_await_command_never_waits_on_a_pid_that_is_no_longer_ours() -> None:
     """``EVFILT_PROC`` registers happily against a recycled pid.
 
-    ``_kq_exited`` documents its precondition — our own child, still unreaped — and
-    ``_exited`` enforces it with a ``returncode`` check. ``_await_command`` did not,
-    so a `Popen` that something else had already waited (``close()`` racing this
-    connection, or a handler adopting a finished process) was registered by raw pid:
-    once that pid is recycled the wait succeeds against a stranger and blocks for
-    *its* lifetime.
+    So a `Popen` something else has already waited (``close()`` racing this
+    connection, or a handler adopting a finished process) must not be registered by
+    raw pid: once that pid is recycled the wait succeeds against a stranger and
+    blocks for *its* lifetime.
     """
     finished = subprocess.Popen(['/bin/sh', '-c', 'exit 0'], start_new_session=True)
     finished.wait()
@@ -160,10 +152,7 @@ def test_an_adopted_popen_with_stderr_merged_into_the_guest_socket_is_refused() 
     `_check_stderr` refuses this at construction, but only for a verdict that
     declares its command: ``subprocess`` keeps no record of the ``stderr`` argument
     it was given, so ``proc.stderr`` is ``None`` whether it was ``DEVNULL`` or
-    ``STDOUT`` and `from_popen`'s pipe check cannot see the difference. Measured
-    before this: the guest received ``HOST /srv/secrets/repo.git``, which is exactly
-    the disclosure the ``stderr`` argument exists to prevent, arriving through the
-    escape hatch.
+    ``STDOUT`` and `from_popen`'s pipe check cannot see the difference.
     """
     leak = 'HOST /srv/secrets/customer-a/repo.git'
     verdicts: list[Process] = []
@@ -212,14 +201,12 @@ def test_a_process_with_no_argv_still_checks_stderr() -> None:
 # A verdict describes one connection                                           #
 # --------------------------------------------------------------------------- #
 def test_a_reused_verdict_is_refused_without_disturbing_the_first_connection() -> None:
-    """A cached verdict used to splice connection 2 to nothing, silently.
+    """A cached verdict must be refused, and connection 1 must not notice.
 
     ``Process(argv)`` looks like an immutable description, so a handler that returns
-    a module-level constant is the obvious mistake. The second connection found
-    ``proc`` already set, took the adopted branch, and was attached to no command at
-    all: no end-of-stream, and its pool worker parked on the *first* connection's
-    command until that exited (measured). It must be refused instead — and the
-    first connection must not notice.
+    a module-level constant is the obvious mistake. Unrefused, the second connection
+    is attached to no command at all and its pool worker parks on the *first*
+    connection's command.
     """
     shared = Process(['cat'])
     hatch = StreamHatch(lambda _stream: shared, name='once', max_conns=4, grace=0.5)
@@ -249,13 +236,12 @@ def test_a_reused_verdict_is_refused_without_disturbing_the_first_connection() -
 
 
 def test_proc_cannot_be_assigned_to_reach_the_adopted_path() -> None:
-    """``v = Process(); v.proc = popen`` skipped every check in ``from_popen``.
+    """``v = Process(); v.proc = popen`` must not reach the adopted path.
 
-    It was accepted with pipes nothing pumps: the command deadlocked filling one
-    while the guest waited for bytes that never came. The field is read-only now, so
-    the bypass does not typecheck and does not run; assigning the private field
-    behind it still reaches the hatch, which refuses a command it was not asked to
-    adopt.
+    That route skips every check in ``from_popen`` and would be accepted holding
+    pipes nothing pumps. ``proc`` is read-only, so the bypass does not typecheck;
+    assigning the private field behind it still reaches the hatch, which refuses a
+    command it was not asked to adopt.
     """
     proc = subprocess.Popen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
@@ -288,10 +274,8 @@ def test_proc_cannot_be_assigned_to_reach_the_adopted_path() -> None:
 def test_a_refusal_does_not_cost_the_whole_grace() -> None:
     """A guest that connects and says nothing must not hold a slot for ``grace``.
 
-    The drain waited the full ``grace`` for a *first* byte, so connect-and-say-
-    nothing cost a slot for five seconds by default — the same "nothing but
-    ``connect()`` and no data" shape that pre-handler tracking closed elsewhere,
-    renewable indefinitely. Measured before: 9.5 s to serve two of them.
+    Waiting the full ``grace`` for a *first* byte the guest never sends is a slot it
+    takes with nothing but ``connect()``, renewably.
     """
     hatch = StreamHatch(lambda _stream: None, name='fast', max_conns=1, grace=5.0)
     hatch.start()
@@ -314,9 +298,8 @@ def test_a_refusal_still_drains_queued_bytes_so_the_guest_reads_eof() -> None:
 
     Closing an ``AF_UNIX`` socket with bytes unread in its receive queue resets the
     *peer* (``unix_release_sock``), and a client such as git reads a reset as a
-    protocol error rather than as "the exchange is over". So a refusal has to
-    consume what the guest already sent. The neutered case below is what makes this
-    test worth its lines: without the drain the same guest gets ECONNRESET.
+    protocol error rather than as "the exchange is over". So a refusal has to consume
+    what the guest already sent.
     """
     hatch = StreamHatch(lambda _stream: None, name='orderly', max_conns=1, grace=5.0)
     hatch.start()
@@ -336,8 +319,7 @@ def test_the_drain_is_what_prevents_that_reset(monkeypatch: pytest.MonkeyPatch) 
     """Neuter the drain and the guest above must read a reset instead of EOF.
 
     Linux-gated because the reset is ``unix_release_sock``'s doing: on darwin the
-    same unread queue at last close gives the peer a plain end-of-stream, so the
-    drain has nothing to prove there. Linux is the platform postern sandboxes on.
+    same unread queue at last close gives the peer a plain end-of-stream.
     """
     monkeypatch.setattr(stream_module, '_drain', lambda *_args: None)
     hatch = StreamHatch(lambda _stream: None, name='reset', max_conns=1, grace=5.0)

@@ -1,14 +1,13 @@
 """End-to-end: sealed sandbox + stream hatch, reached from both entrypoints.
 
-The host-side suite (``test_stream_hatch``) proves the hatch; this proves the
-*wiring*: that the socket really arrives inside the jail under its name, that a
-guest with no network reaches it and nothing else, and — the part that only a
-stream hatch can do — that a **bare argv** entrypoint gets the capability, not
-just guest Python. The clone here is a real ``git clone`` running inside
-bubblewrap against a real ``git upload-pack`` on the host.
+Where ``test_stream_hatch`` covers the hatch, this covers the *wiring*: the socket
+arrives inside the jail under its name, a guest with no network reaches it and
+nothing else, and a **bare argv** entrypoint gets the capability, not just guest
+Python. The clone is a real ``git clone`` inside bubblewrap against a real ``git
+upload-pack`` on the host.
 
-Requires Linux + bubblewrap (skipped elsewhere); the git tests additionally need
-git on the host, which the default profile binds read-only into the guest.
+Requires Linux + bubblewrap (skipped elsewhere); the git tests additionally need git
+on the host, which the default profile binds read-only into the guest.
 """
 
 import os
@@ -91,9 +90,8 @@ def test_guest_has_no_network_but_still_reaches_the_stream_hatch():
 
 @requires_git
 def test_bare_argv_entrypoint_clones_through_the_hatch(origin_repo):
-    # What a dial hatch can do that a proxied one cannot: `git` is the entrypoint,
-    # there is no shim and nothing in-guest to relay through, and the clone still
-    # works because the hatch is a file the guest opens.
+    # `git` is the entrypoint: no shim, nothing in-guest to relay through, and the
+    # clone works because the hatch is a file the guest opens.
     hatch = StreamHatch(splice_subprocess(['git', 'upload-pack', str(origin_repo)]), name='repo')
     sandbox = Sandbox(SandboxProfile(), hatch=hatch)
     result = sandbox.run(
@@ -129,16 +127,11 @@ def test_a_bare_entrypoint_without_the_hatch_reaches_nothing():
     assert not result.ok
 
 
-# Guest code: drive the bound-in connector as a *subprocess*, full duplex, with
-# bulk bytes in both directions at once. This is the shape the host-side suite
-# cannot cover — `test_large_payload_streams_without_a_ceiling` passes 8 MiB only
-# because its client is two-threaded, so nothing there exercises
-# `postern._stream_connect` itself, which is what the sandbox actually binds in
-# and what every real guest (git included) goes through. A blocking send inside
-# the connector's selector loop deadlocks the whole cycle here: the connector
-# stops draining its receive side, the host's forward pump fills the socket
-# buffer, the command's stdout pipe fills, the command stops reading stdin, and
-# the host's reverse pump stops reading the socket, so the send never completes.
+# Guest code: drive the bound-in connector as a *subprocess*, full duplex, with bulk
+# bytes in both directions at once. This exercises `postern._stream_connect`, which
+# is what the sandbox binds in and what every real guest (git included) goes
+# through; a connector that stops draining its receive side while sending deadlocks
+# the whole cycle.
 _DUPLEX_GUEST = """
 import os, subprocess, sys, threading
 
@@ -180,8 +173,8 @@ print('ECHOED', len(got), 'OF', payload)
 def test_bulk_bytes_move_both_ways_through_the_bound_in_connector() -> None:
     """Full-duplex bulk through the real connector, inside the jail.
 
-    ``cat`` rather than git: git's phases are mostly half-duplex, which is exactly
-    why a clone passing says nothing about the full-duplex case.
+    ``cat`` rather than git: git's phases are mostly half-duplex, so a clone passing
+    says nothing about the full-duplex case.
     """
     size = 64 * 1024 * 1024
     hatch = StreamHatch(splice_subprocess(['cat']), name='duplex', grace=5.0)

@@ -143,8 +143,8 @@ def test_connector_is_bound_once_for_many_hatches():
 
 # -- run() gets the same wiring as run_python() ----------------------------- #
 def test_hatch_wiring_is_independent_of_the_entrypoint():
-    # run() previously bound no hatch at all; both entrypoints now share one
-    # wiring helper, so a bare argv has the same capabilities as guest Python.
+    # Both entrypoints share one wiring helper, so a bare argv has the same
+    # capabilities as guest Python.
     sandbox = Sandbox(hatch=[_FakeNamedHatch('repo'), _FakeHatch()])
     binds, env = sandbox._hatch_wiring()
     sandbox.close()

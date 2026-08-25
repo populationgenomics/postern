@@ -110,9 +110,7 @@ def test_subprocess_stdio_is_spliced_both_ways():
 
 
 def test_large_payload_streams_without_a_ceiling():
-    # No body buffering anywhere on this path: 8 MiB through `cat` with no cap
-    # configured (a proxy that let a handler inspect bodies would have had to
-    # buffer it, and so would have had to cap it).
+    # No body buffering anywhere on this path: 8 MiB through `cat`, no cap configured.
     payload = os.urandom(8 * 1024 * 1024)
     with _serving(StreamHatch(splice_subprocess(['cat']))) as hatch:
         assert _exchange(hatch, payload) == payload
@@ -241,10 +239,8 @@ def test_guest_reset_mid_splice_reaps_the_subprocess_and_frees_the_slot():
 
 def test_subprocess_that_ignores_stdin_eof_is_terminated_at_teardown():
     # The handler's contract is that the command exits on stdin EOF. One that does
-    # not owns its connection for as long as it runs — with the socket as its stdio
-    # there is no separate signal to notice, which is deliberate: the old pump
-    # guessed the exchange was over when stdout closed, and guessing wrong is what
-    # truncated responses. So `close()` is what ends it, via terminate-then-kill.
+    # not owns its connection for as long as it runs, since with the socket as its
+    # stdio there is no separate signal to notice, so `close()` is what ends it.
     verdicts = []
     base = splice_subprocess(['sh', '-c', 'exec sleep 60'])
 

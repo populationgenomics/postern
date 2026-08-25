@@ -3,18 +3,14 @@
 A `Process` verdict makes the accepted connection the command's stdin and stdout,
 and the child's fds 0 and 1 are ``dup2``s of *one* open file description. Its file
 status flags and its socket options are therefore shared with the handler's
-``stream.conn``, not copied from it — so anything a handler configures is what the
-command runs with.
+``stream.conn``, not copied from it, so anything a handler configures is what the
+command runs with — and the failure is silent: the command takes ``EAGAIN``, exits,
+and the guest reads the truncation as a clean end-of-stream.
 
-That is a hazard the host-side pump did not have: with a pump, a non-blocking
-socket was the pump's problem. Now it is the command's, and the failure is silent
-— the command takes ``EAGAIN``, exits, and the guest reads the truncation as a
-clean end-of-stream.
-
-So the invariant these tests pin is not "``O_NONBLOCK`` is cleared", it is **the
-child gets ordinary stdio**: one case per shared setting, asserted from inside the
-child. :func:`test_the_tests_would_notice_if_normalisation_stopped_happening`
-checks they are not vacuous.
+The invariant pinned here is not "``O_NONBLOCK`` is cleared" but **the child gets
+ordinary stdio**: one case per shared setting, asserted from inside the child.
+:func:`test_the_tests_would_notice_if_normalisation_stopped_happening` checks they
+are not vacuous.
 """
 
 from __future__ import annotations
@@ -134,9 +130,8 @@ def test_baseline_is_ordinary_stdio() -> None:
 def test_a_handlers_settimeout_does_not_reach_the_command() -> None:
     """``settimeout`` is the reachable one: CPython implements it as ``O_NONBLOCK``.
 
-    Before normalisation the child saw ``O_NONBLOCK`` on both fd 0 and fd 1 — see
-    :func:`test_a_nonblocking_connection_no_longer_truncates_the_response` for what
-    that cost.
+    Unnormalised it reaches both fd 0 and fd 1 — see
+    :func:`test_a_nonblocking_connection_no_longer_truncates_the_response`.
     """
     seen = _report(lambda conn: conn.settimeout(2.0))
     assert not seen['fl'] & os.O_NONBLOCK, 'the command inherited O_NONBLOCK on stdin'
@@ -152,9 +147,8 @@ def test_a_handlers_setblocking_false_does_not_reach_the_command() -> None:
 def test_o_async_does_not_reach_the_command() -> None:
     """Signal-driven I/O: ordinary stdio has none, and a child with it can get SIGIO.
 
-    Measured inert on ``AF_UNIX`` (no ``SIGIO`` was delivered even with an owner
-    set), which is why this asserts the flag rather than a death: the inertness is
-    a detail of one kernel's ``AF_UNIX`` path, not a property to depend on.
+    Asserts the flag rather than a death: ``AF_UNIX`` happens to deliver no
+    ``SIGIO`` even with an owner set, but that is one kernel's detail.
     """
     seen = _report(lambda conn: _set_fl(conn, _O_ASYNC))
     assert not seen['fl'] & _O_ASYNC
@@ -169,8 +163,7 @@ def test_o_append_does_not_reach_the_command() -> None:
 def test_a_stale_signal_owner_does_not_reach_the_command() -> None:
     """``F_SETOWN``/``F_SETSIG`` are on the same description, so they are shared too.
 
-    Inert once ``O_ASYNC`` is clear, but zeroed rather than reasoned about: a stale
-    owner is the sort of thing that becomes reachable when something else changes.
+    Inert once ``O_ASYNC`` is clear, but zeroed rather than reasoned about.
     """
 
     def tweak(conn: socket.socket) -> None:
@@ -213,11 +206,9 @@ def test_so_passcred_does_not_reach_the_command() -> None:
 def test_so_linger_is_deliberately_left_alone() -> None:
     """The one exception, and it has to be an exception.
 
-    Close semantics carry the disposition signal — an unread receive queue at
-    last-close is what resets the guest, and that reset is the only failure signal
-    a stream with no framing of its own has. Normalising ``SO_LINGER`` would change
-    what the guest is told about the command, so it is left exactly as found. Pinned
-    so that "not normalised" stays a decision rather than becoming an oversight.
+    Close semantics carry the disposition signal: an unread receive queue at
+    last-close is what resets the guest, and that reset is the only failure signal a
+    stream with no framing of its own has.
     """
     seen = _report(lambda conn: conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)))
     assert seen['linger'][:4] != b'\x00\x00\x00\x00', 'SO_LINGER was normalised away; see the docstring'
@@ -227,12 +218,11 @@ def test_so_linger_is_deliberately_left_alone() -> None:
 # The behaviour behind the two flags that actually bite                         #
 # --------------------------------------------------------------------------- #
 def test_a_nonblocking_connection_no_longer_truncates_the_response(tmp_path: Path) -> None:
-    """The symptom that found all of this: 219264 of 4194304 bytes, reported as EOF.
+    """A truncated response must not be reported to the guest as a clean EOF.
 
-    A slow reader forces the command to block in ``write``; on a non-blocking
-    socket it takes ``EAGAIN`` instead, exits, and the guest sees a clean
-    end-of-stream on a truncated response — silent corruption with no diagnostic
-    anywhere. Both ``cat`` and CPython lost the tail at exactly the same offset.
+    A slow reader forces the command to block in ``write``; on a non-blocking socket
+    it takes ``EAGAIN`` instead, exits, and the guest sees end-of-stream on a
+    truncated response — silent corruption with no diagnostic anywhere.
     """
     big = tmp_path / 'big'
     big.write_bytes(b'B' * (4 * _MIB))
@@ -266,11 +256,11 @@ def test_a_nonblocking_connection_no_longer_truncates_the_response(tmp_path: Pat
 
 
 def test_a_receive_timeout_no_longer_breaks_a_slow_request() -> None:
-    """``SO_RCVTIMEO`` is the same failure by another route: 8 of 16 bytes echoed.
+    """``SO_RCVTIMEO`` is the same failure by another route.
 
-    A guest that pauses mid-request is ordinary (git does it between phases). With
-    an inherited receive timeout the command's ``read`` fails ``EAGAIN`` and it
-    exits half way through.
+    A guest that pauses mid-request is ordinary (git does it between phases). With an
+    inherited receive timeout the command's ``read`` fails ``EAGAIN`` and it exits
+    half way through.
     """
     base = splice_subprocess(['cat'])
 
@@ -346,9 +336,8 @@ def test_read_preamble_reads_without_disturbing_the_handover() -> None:
 def test_read_preamble_is_bounded_and_leaves_the_socket_blocking() -> None:
     """A silent guest costs ``timeout``, not the hatch's life — and no flags change.
 
-    This is the safe form of the pattern that otherwise pins a slot for ever: the
-    hatch cannot shut a connection down until its handler returns, so an unbounded
-    read here is a slot a guest takes with nothing but ``connect()``.
+    The hatch cannot shut a connection down until its handler returns, so an
+    unbounded read here is a slot a guest takes with nothing but ``connect()``.
     """
     elapsed: list[float] = []
     flags: list[int] = []
@@ -382,11 +371,9 @@ def test_read_preamble_is_bounded_and_leaves_the_socket_blocking() -> None:
 def test_an_adopted_popen_on_an_abnormal_connection_is_refused_and_reaped() -> None:
     """``from_popen`` cannot be normalised after the fact, so it is checked instead.
 
-    Normalising post-spawn is not a fix but a race: measured, half a millisecond of
-    delay in the parent between ``Popen`` and the clear took a 4 MiB response down
-    to 219 KiB on 10 of 10 attempts. So the hatch refuses the verdict and names the
-    cause, which is late but loud — and it must still reap what it refuses, or a
-    guest reconnecting in a loop grows the host's process table.
+    Normalising post-spawn is a race, not a fix, so the hatch refuses the verdict and
+    names the cause — late but loud. It must still reap what it refuses, or a guest
+    reconnecting in a loop grows the host's process table.
     """
     verdicts: list[Process] = []
 
@@ -459,10 +446,8 @@ def test_an_adopted_popen_on_a_clean_connection_still_works() -> None:
 def test_stderr_stdout_is_refused_at_both_entry_points() -> None:
     """stdout *is* the guest socket, so merging fd 2 into it is a disclosure.
 
-    Measured before the guard: the guest received ``fatal:
-    '/srv/secrets/customer-a/repo.git' does not appear to be a git repository`` —
-    verbatim the host-path leak the ``stderr`` argument exists to prevent. ``PIPE``
-    (a deadlock) was guarded; ``STDOUT`` (a disclosure) was not.
+    A command's diagnostics quote host paths (``fatal:
+    '/srv/secrets/customer-a/repo.git' does not appear to be a git repository``).
     """
     for build in (
         lambda: splice_subprocess(['cat'], stderr=subprocess.STDOUT),
@@ -484,11 +469,9 @@ def test_stderr_stdout_is_refused_at_both_entry_points() -> None:
 def test_the_tests_would_notice_if_normalisation_stopped_happening(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neuter the normalisation and the child must see the handler's settings.
 
-    This branch has a track record of tests that passed vacuously, so each case
-    above is only worth its line count if it fails without the fix. Rather than
-    trusting that, this reintroduces the bug and checks the observation notices —
-    for the flag that bites and for one socket option, which between them cover
-    both halves of :func:`postern.stream._normalise_stdio`.
+    Guards the cases above against passing vacuously: one flag and one socket
+    option, which between them cover both halves of
+    :func:`postern.stream._normalise_stdio`.
     """
     monkeypatch.setattr(stream_module, '_normalise_stdio', lambda _conn: None)
     seen = _report(lambda conn: conn.settimeout(2.0))

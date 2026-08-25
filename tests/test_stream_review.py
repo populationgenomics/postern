@@ -1,8 +1,4 @@
-"""Regressions from the review of the stream hatch.
-
-Each test here failed on the reviewed revision and passes now; they are grouped by
-the cause rather than by the symptom that found them.
-"""
+"""Stream-hatch regressions, grouped by cause rather than by symptom."""
 
 from __future__ import annotations
 
@@ -55,9 +51,8 @@ def _serving(hatch: StreamHatch):
 def _is_zombie(pid: int) -> bool:
     """Whether ``pid`` is an unreaped zombie — without reaping it.
 
-    Deliberately avoids ``Popen.poll()``/``wait()``: those *are* the reap, so a
-    test that calls them cannot observe the leak it is looking for. (That is why
-    the reviewed revision's own ``test_process_requires_both_pipes`` missed this.)
+    Avoids ``Popen.poll()``/``wait()``: those *are* the reap, so a test that calls
+    them cannot observe the leak it is looking for.
     """
     if pathlib.Path('/proc/self/stat').exists():  # Linux: absent pid == fully gone
         try:
@@ -83,13 +78,8 @@ def _dial(hatch: StreamHatch, timeout: float = 20.0) -> socket.socket:
 def test_response_survives_a_command_that_closes_stdin_first(tmp_path: Path) -> None:
     """A command that closes stdin and then writes must still deliver everything.
 
-    This shape — a request/response filter, ``head``, an ``upload-pack`` exiting
-    while the client still writes — used to deliver *nothing*, 0 of 4 MiB: the
-    reverse pump's drain began with ``shutdown(SHUT_WR)``, the forward pump's next
-    ``sendall`` took EPIPE, and the guest saw a clean EOF. With the socket as the
-    command's stdio there is no pump to get this wrong, so the test guards a
-    property rather than demonstrating a fix — it cannot fail on the current design
-    without the pump coming back.
+    The shape: a request/response filter, ``head``, an ``upload-pack`` exiting while
+    the client still writes.
     """
     big = tmp_path / 'big'
     big.write_bytes(b'A' * (4 * _MIB))
@@ -121,16 +111,11 @@ def test_response_survives_a_command_that_closes_stdin_first(tmp_path: Path) -> 
 def test_no_signal_is_ever_sent_to_an_already_reaped_group() -> None:
     """A group may only be signalled while we still hold the leader's pid.
 
-    ``poll()``/``wait()`` reap, reaping releases the leader's pid, and a process
-    group id is valid only while that pid is allocated — so a signal sent afterwards
-    can land on a recycled pid, and `splice_subprocess` mints a session leader per
-    connection, which makes the recycled pid plausibly another connection's command.
-
-    The group *is* signalled on the normal path, deliberately: a command that exits
-    having left a child behind leaves that child holding the guest's socket, so
-    collecting the group is what lets the guest reach end-of-stream. What must never
-    happen is signalling after the reap, and the observation here is exactly that —
-    the leader's ``returncode`` at the moment of each ``killpg``.
+    A group id is valid only while that pid is allocated, so a signal sent after the
+    reap can land on a recycled pid — plausibly another connection's command, since
+    every verdict mints a session leader. The group *is* signalled on the normal
+    path; what must never happen is signalling after the reap, so the observation
+    here is the leader's ``returncode`` at the moment of each ``killpg``.
     """
     seen: list[tuple[int, int, int | None]] = []
     verdicts: list[Process] = []
@@ -208,24 +193,15 @@ def test_a_caller_supplied_socket_path_is_never_unlinked_unbound() -> None:
 
 
 def test_grace_zero_still_reaps() -> None:
-    """``grace=0.0`` must still reap: an invariant, not a regression.
+    """``grace=0.0`` must still reap.
 
     ``wait(timeout=0.0)`` is a single ``WNOHANG`` poll that necessarily loses the
     race against the signal it just sent, which is why the final ``wait()`` is
     untimed.
 
-    This test used to be vacuous, and the inverted `Process` contract is what made
-    it so: its handler built a ``Popen`` holding pipes, which ``__post_init__``
-    rejected *before* the verdict was ever accepted, so every reap in it ran at
-    ``_REJECT_GRACE`` and never at the hatch's ``grace``. Instrumenting ``_reap``
-    showed six calls, all at 0.5 — it was
-    :func:`test_process_contract_rejection_reaps_the_group` six times over, and
-    the ``grace=0.0`` path had no coverage at all. A declarative verdict is
-    accepted, so the hatch's ``grace`` is the one that reaches ``_reap``.
-
     Driven through ``close()`` rather than by disconnecting: a command that writes
-    nothing and ignores stdin EOF holds its slot by design (there is deliberately
-    no per-connection lifetime cap), so ``close()`` is what makes the reap run.
+    nothing and ignores stdin EOF holds its slot by design (there is no
+    per-connection lifetime cap), so ``close()`` is what makes the reap run.
     """
     verdicts: list[Process] = []
 
@@ -256,8 +232,8 @@ def test_grace_zero_still_reaps() -> None:
         stream_module._reap = real_reap
         for conn in conns:
             conn.close()
-    # The point of the test: the reap really ran at the hatch's grace, not at the
-    # contract-rejection budget. Without this the whole test can pass vacuously.
+    # The reap must have run at the hatch's grace, not at the contract-rejection
+    # budget; without this the test can pass vacuously.
     assert graces, 'no reap ran at all'
     assert all(g == 0.0 for g in graces), f'grace=0.0 never reached _reap: {graces}'
     pids = [v.proc.pid for v in verdicts if v.proc is not None]
@@ -284,9 +260,9 @@ def test_process_contract_rejection_reaps_the_group() -> None:
 def test_transient_accept_errors_do_not_retire_the_hatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """EMFILE from the embedding worker must not leave the hatch permanently deaf.
 
-    Before, any ``OSError`` from ``accept()`` returned from the loop while
-    ``_started`` stayed ``True`` and ``_srv`` stayed live, so ``start()``
-    short-circuited for ever and dials piled up in the backlog with no diagnostic.
+    Returning from the accept loop leaves ``_started`` true and ``_srv`` live, so
+    ``start()`` short-circuits for ever and dials pile up in the backlog with no
+    diagnostic.
     """
     hatch = StreamHatch(splice_subprocess(['cat']), name='a', max_conns=2, grace=0.5)
     hatch.start()
@@ -391,10 +367,10 @@ _CONNECTOR = str(Path(__file__).resolve().parent.parent / 'src' / 'postern' / '_
 
 
 def test_connector_moves_bulk_bytes_both_ways() -> None:
-    """Full duplex through the real connector: the suite had no such coverage.
+    """Full duplex through the connector the sandbox actually binds in.
 
-    ``test_large_payload_streams_without_a_ceiling`` passes only because its client
-    is two-threaded, so nothing exercised the connector the sandbox actually binds.
+    ``test_large_payload_streams_without_a_ceiling`` passes with a two-threaded
+    client of its own, so it says nothing about the connector.
     """
     # 64 MiB, not 8: the deadlock needs enough in flight to fill the socket
     # buffers, both pipe buffers and the command's own queue. 8 MiB clears on a
@@ -441,7 +417,7 @@ def test_connector_works_when_stdin_is_not_a_pipe() -> None:
     """``epoll_ctl`` rejects regular files and ``/dev/null`` with EPERM.
 
     The sandbox gives entrypoints ``stdin=DEVNULL``, so an in-guest invocation
-    inheriting it silently reported success having moved nothing.
+    inherits it.
     """
     hatch = StreamHatch(splice_subprocess(['sh', '-c', 'echo HELLO']), name='n', grace=2.0)
     with _serving(hatch), open(os.devnull) as devnull:
@@ -473,9 +449,8 @@ def test_connector_reports_a_failure_rather_than_exiting_zero(tmp_path: Path) ->
 def test_the_kernel_propagates_the_commands_disposition() -> None:
     """EOF when the command finished, a reset when it died mid-request.
 
-    This is the distinction a host-side pump destroyed by draining unconditionally,
-    and the reason the `Process` path deliberately does not drain: for a stream with
-    no framing of its own it is the only failure signal there is.
+    The reason the `Process` path does not drain: for a stream with no framing of its
+    own this is the only failure signal there is.
     """
 
     def outcome(argv: list[str], payload: bytes, *, half_close: bool) -> str:
