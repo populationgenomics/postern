@@ -146,9 +146,16 @@ from postern import Sandbox, SandboxProfile
 from postern.stream import StreamHatch, git_url, splice_subprocess
 
 hatch = StreamHatch(splice_subprocess(['git', 'upload-pack', '/srv/repo.git']), name='repo')
-sandbox = Sandbox(SandboxProfile(), hatch=hatch)
-sandbox.run(['git', '-c', 'protocol.ext.allow=always', 'clone', git_url('repo'), 'work'])
+profile = SandboxProfile()
+sandbox = Sandbox(profile, hatch=hatch)
+sandbox.run(['git', '-c', 'protocol.ext.allow=always', 'clone',
+             git_url('repo', profile=profile), 'work'])
 ```
+
+Pass `profile=` to `git_url`: the in-guest interpreter comes from
+`profile.python`, the same place `run_python` gets it, so the URL cannot disagree
+with the sandbox it runs in. Without it the default is a bare `python3` off the
+guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`.
 
 This is the sharpest form of the postern thesis: **the socket is the
 capability.** The same access could be brokered through an HTTP forward proxy
@@ -218,7 +225,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 - `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch. `hatch` is opt-in and takes one hatch or a sequence — a `GrpcHatch` (typed methods), any number of named `StreamHatch`es (raw streams), both, or none (no channel opened); at most one *unnamed* hatch, since it owns a fixed guest env var.
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` opts bwrap into running at a non-root real uid (defense in depth for the sysctl surface; the deploy must make bind sources reachable by it). `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
-- `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>` (so `run()` works, not just `run_python()`). `handler(stream) -> Process | Upstream | None`: splice a subprocess's stdio, splice a connected socket, or refuse. Batteries: `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)`, `splice_tcp(host, port)`; `git_url(name)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`. Named, so several coexist — one socket per resource. Stdlib-only. `with hatch.accepting(): ...`.
+- `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>` (so `run()` works, not just `run_python()`). `handler(stream) -> Process | Upstream | None`: splice a subprocess's stdio, splice a connected socket, or refuse. Batteries: `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)`, `splice_tcp(host, port)`; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`. `close()` is terminal, as `GrpcHatch`'s is. `splice_subprocess` refuses `stderr=PIPE` (nothing drains it, so the command deadlocks). Named, so several coexist — one socket per resource. Stdlib-only. `with hatch.accepting(): ...`.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).
 - `available()` — bubblewrap present?
 
