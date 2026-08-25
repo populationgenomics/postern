@@ -151,7 +151,7 @@ status was 7, and ``poll()`` likewise returned ``0`` for one that exited 9. So
 and the whole signalling block is skipped. (On the `close`-first path
 `_dispose` runs before anything has set ``returncode``, so `_exited` is reached
 instead: ``waitid`` gives ``ECHILD``, its ``poll()`` fallback synthesises 0 again,
-and the ``elif proc.returncode is None`` guard fails just the same. Two routes,
+and the second ``if proc.returncode is None`` guard fails just the same. Two routes,
 one outcome.)
 
 Measured consequence, using ``SIGCHLD=SIG_IGN`` as a race-free stand-in for a
@@ -261,6 +261,10 @@ _FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 _ACCEPT_RETRY_DELAY = 0.05
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
+# Poll interval while waiting for a signalled command to exit. Small, because it
+# is pure teardown latency; a poll rather than `Popen.wait(timeout=...)` because
+# that reaps, and the reap is what invalidates the group id (see `_wait_exited`).
+_EXIT_POLL = 0.02
 # Observing the command's exit *without reaping it* is what keeps its pid — and so
 # the process group id captured at spawn — provably ours until teardown has
 # signalled the group. Three tiers, because no single interface is portable:
@@ -1177,6 +1181,15 @@ def _await_command(verdict: Process) -> None:
     proc = verdict.proc
     if proc is None:  # never attached; nothing to wait for
         return
+    if proc.returncode is not None:
+        # Already waited — by `close()` racing this connection, or by a handler that
+        # adopted a finished `Popen`. Without this the kqueue tier below registers
+        # EVFILT_PROC on a *released* pid: harmless while the pid is merely gone
+        # (NOTE_EXIT fires immediately, measured), but once it has been recycled the
+        # registration succeeds against a stranger and this waits for that process
+        # to exit instead — a slot held for a lifetime that is not ours to observe.
+        # `_exited` has this guard for the same reason.
+        return
     if _WAITID is not None:
         try:
             _WAITID(_P_PID, proc.pid, _WEXITED | _WNOWAIT)
@@ -1268,6 +1281,26 @@ def _exited(proc: subprocess.Popen[bytes]) -> bool:
     return proc.poll() is not None  # weaker: this reaps, so no group signal follows
 
 
+def _wait_exited(proc: subprocess.Popen[bytes], grace: float) -> None:
+    """Wait up to ``grace`` for the command to exit, **without reaping it**.
+
+    ``Popen.wait(timeout=...)`` cannot be used here: it reaps, and reaping releases
+    the leader's pid, which is the only thing that keeps the captured ``pgid``
+    provably ours (see :func:`_exited`). So this polls the non-reaping exit test
+    instead. On the tier-3 platform where ``_exited`` falls back to ``poll()`` this
+    reaps exactly as before, and the group signal is skipped exactly as before.
+
+    ``grace=0.0`` is a single check, which is the point of the untimed ``wait()``
+    that follows the kill in :func:`_reap`.
+    """
+    deadline = time.monotonic() + grace
+    while not _exited(proc):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(_EXIT_POLL, remaining))
+
+
 def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) -> None:
     """Terminate, then kill, then wait — never leave a child of the host running.
 
@@ -1283,6 +1316,15 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
     correct answer to the ambiguity), and it does not reach a grandchild that has
     left the group with ``setsid()``.
 
+    ``SIGKILL`` goes to the group whenever the leader is confirmed gone and still
+    unreaped, and **not** only when the leader outlived ``grace``. Keying the
+    escalation on the leader's exit was a hole with nothing exotic in it: a group
+    member that ignores ``SIGTERM`` (a sidecar with a handler, an installer script)
+    survives while the leader dies inside ``grace``, so the old code reaped the
+    leader and stopped — and that member kept a dup of the guest's socket, in its
+    own session, outliving the connection, the hatch and this process. Measured on
+    Linux and macOS with ``sh -c '(trap "" TERM; …) & exec cat'``.
+
     The final ``wait()`` is deliberately untimed. With ``grace=0.0`` every
     ``wait(timeout=grace)`` is a single ``WNOHANG`` poll that necessarily loses the
     race against the signal it just sent, so the killed child stayed an unreaped
@@ -1295,15 +1337,13 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
     if proc.returncode is None:
         if not _exited(proc):
             _signal_group(proc, pgid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                _signal_group(proc, pgid, signal.SIGKILL)
-        elif proc.returncode is None:
-            # Exited but not yet reaped: the zombie pins the pid, so the group id is
-            # still valid and anything the command started is still in it. The
-            # re-check matters because the fallback above reaps, and after a reap
-            # the group is no longer provably ours.
+            _wait_exited(proc, grace)
+        if proc.returncode is None:
+            # Either exited and not yet reaped, or still running past `grace`. Both
+            # ways the pid is still ours — an unreaped zombie pins it — so the group
+            # id is still valid and anything the command started is still in it. The
+            # re-check matters because `_exited`'s last-resort tier reaps, and after
+            # a reap the group is no longer provably ours.
             _signal_group(proc, pgid, signal.SIGKILL)
     with contextlib.suppress(Exception):
         proc.wait()
