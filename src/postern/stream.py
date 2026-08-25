@@ -265,6 +265,10 @@ _STALE_PROBE_TIMEOUT = 1.0
 # is pure teardown latency; a poll rather than `Popen.wait(timeout=...)` because
 # that reaps, and the reap is what invalidates the group id (see `_wait_exited`).
 _EXIT_POLL = 0.02
+# How long `_drain` waits for the *next* byte before calling the receive queue
+# empty. An empty queue is what makes the last close orderly, so this is a
+# quiet-period test and not a share of `grace`, which still caps the whole drain.
+_DRAIN_QUIET = 0.1
 # Observing the command's exit *without reaping it* is what keeps its pid — and so
 # the process group id captured at spawn — provably ours until teardown has
 # signalled the group. Three tiers, because no single interface is portable:
@@ -413,28 +417,55 @@ class Process:
     env: dict[str, str] | None = None
     stderr: int | None = subprocess.DEVNULL
 
-    # Populated when the hatch attaches this verdict to a connection, or up front
-    # by from_popen. Public because teardown tests and handlers that want the pid
-    # need it; None until then.
-    proc: subprocess.Popen[bytes] | None = dataclasses.field(default=None, init=False)
+    # Set when the hatch attaches this verdict to a connection, or up front by
+    # from_popen. **Read-only**, and that is the point: assigning it was a way to
+    # reach the adopted path with none of :meth:`from_popen`'s validation — a
+    # `Popen` holding pipes was accepted, nothing pumped them, and the command
+    # deadlocked filling one while the guest waited for bytes that never came
+    # (measured). A checked-at-the-door field would still have been a door; this
+    # makes the bypass unrepresentable, which is the same argument as one socket
+    # per resource. Readable because teardown tests and handlers that want the pid
+    # need it; ``None`` until the hatch attaches the verdict.
+    _proc: subprocess.Popen[bytes] | None = dataclasses.field(default=None, init=False, repr=False)
     # The command's process group, captured at spawn and not at teardown: by then
     # the leader may have been reaped, so ``getpgid`` on its pid is ESRCH (and on
     # darwin it is ESRCH for a zombie regardless) — while the *group* is still
     # alive, and here still holding a descriptor for the guest's socket. ``None``
     # when the command is not its own group leader, i.e. an adopted `Popen` built
     # without ``start_new_session=True``, whose group is the worker's own:
-    # signalling that would signal the worker.
-    pgid: int | None = dataclasses.field(default=None, init=False)
+    # signalling that would signal the worker. Read-only for the same reason
+    # ``proc`` is: a writable pgid is a ``killpg`` at an arbitrary group.
+    _pgid: int | None = dataclasses.field(default=None, init=False, repr=False)
+    # Whether this verdict's Popen came through from_popen — i.e. whether the
+    # adopted path was *asked for*. "``proc`` is set" is not the same question, and
+    # conflating them is what made a reused verdict silently take the adopted
+    # branch on its second connection.
+    _adopted: bool = dataclasses.field(default=False, init=False, repr=False)
+    # A verdict describes *one* connection's command; see _claim.
+    _claimed: bool = dataclasses.field(default=False, init=False, repr=False)
     _disposed: bool = dataclasses.field(default=False, init=False, repr=False)
     _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, init=False, repr=False)
 
+    @property
+    def proc(self) -> subprocess.Popen[bytes] | None:
+        """The command, once the hatch has spawned or adopted it. Read-only."""
+        return self._proc
+
+    @property
+    def pgid(self) -> int | None:
+        """The command's process group, captured at spawn. Read-only."""
+        return self._pgid
+
     def __post_init__(self) -> None:
+        # Before the argv check and before from_popen's early return, so it cannot
+        # be skipped: `Process(stderr=subprocess.STDOUT)` with no argv used to
+        # construct happily, because the only call was past this branch.
+        _check_stderr(self.stderr)
         if self.argv is None:
             return  # from_popen, or a Process() the hatch will refuse at attach
         self.argv = list(self.argv)
         if not self.argv:
             raise ValueError('Process(argv) requires a command')
-        _check_stderr(self.stderr)
 
     @classmethod
     def from_popen(cls, proc: subprocess.Popen[bytes]) -> Process:
@@ -455,9 +486,33 @@ class Process:
         ``start_new_session=True``; without the latter ``pgid`` is ``None`` and
         teardown can only signal the command itself, so a background child it
         leaves behind keeps the guest's connection open.
+
+        **What you are also taking on, beyond the descriptors.** ``Process(argv)``
+        does not merely spawn for you, it spawns with three defaults that are
+        security properties, and a `Popen` you built has none of them unless you
+        passed them yourself:
+
+        * ``stderr``. The declarative path defaults to ``DEVNULL`` and *refuses*
+          ``STDOUT``, because stdout is the guest's socket and a command's
+          diagnostics quote host paths. ``Popen``'s own default is to inherit fd 2,
+          and ``stderr=subprocess.STDOUT`` merges it into the guest's stream. The
+          hatch detects that last case where the platform allows (Linux, by
+          comparing the child's fd 2 with the connection) and refuses the verdict,
+          but detection is not the same as a default: pass ``DEVNULL`` or a file.
+        * ``env``. The declarative path passes a fixed minimal ``PATH``; ``Popen``
+          inherits the worker's entire environment, secrets included, into a
+          process whose stdin is attacker-controlled. Pass ``env=`` explicitly.
+        * ``cwd``. The declarative path uses ``/``; ``Popen`` inherits the worker's
+          working directory, so the capability starts depending on where the host
+          process was started. Pass ``cwd=`` explicitly.
+
+        Those two are not policed here — owning the hygiene is this method's whole
+        premise, and a check that guessed at intent would be worse than a note. The
+        one that is checked is the one that leaks host state *to the guest*.
         """
         verdict = cls()
-        verdict.proc = proc
+        verdict._proc = proc
+        verdict._adopted = True
         verdict._capture_pgid()
         held = [name for name in ('stdin', 'stdout', 'stderr') if getattr(proc, name) is not None]
         if held:
@@ -473,11 +528,38 @@ class Process:
 
     def _capture_pgid(self) -> None:
         """Record the group id while the leader is certainly still alive."""
-        if self.proc is None:
+        if self._proc is None:
             return
         with contextlib.suppress(OSError, AttributeError):
-            if os.getpgid(self.proc.pid) == self.proc.pid:
-                self.pgid = self.proc.pid
+            if os.getpgid(self._proc.pid) == self._proc.pid:
+                self._pgid = self._proc.pid
+
+    def _claim(self) -> bool:
+        """Take ownership of this verdict for one connection. False if taken.
+
+        A verdict describes *one* connection's command, and nothing about
+        ``Process(argv)`` says so: it looks like an immutable description, so
+        caching one — a module-level constant, a dict of verdicts by resource — is
+        the obvious idiom. It was also silently wrong. The second connection to
+        return the same object found ``proc`` already set, took the adopted branch
+        of :meth:`_attach`, and was spliced to *nothing*: its socket went to no
+        command, it never reached end-of-stream, and its pool worker parked in
+        `_await_command` on the first connection's command until that exited
+        (measured). Worse if the second handler had touched the socket, because
+        then the adopted branch's refusal disposed the verdict — killing the first
+        connection's live command.
+
+        So the hatch claims a verdict before attaching it, and refuses one it
+        cannot claim. `StreamHatch._serve_conn` must forget the verdict it could
+        not claim before it raises: it is another connection's, and the
+        per-connection ``finally`` would otherwise tear down that connection's
+        command.
+        """
+        with self._lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
 
     def _attach(self, conn: socket.socket, grace: float) -> None:
         """Make ``conn`` this verdict's command's stdio. Called only by the hatch.
@@ -485,7 +567,16 @@ class Process:
         Normalise, then spawn. In that order and with nothing in between, which is
         the property `Process`'s docstring exists to explain.
         """
-        if self.proc is not None:
+        if self._adopted:
+            merged = _stderr_is_the_connection(self._proc, conn)
+            if merged:
+                self.dispose(grace)
+                raise ValueError(
+                    "this verdict's command has the connection as its stderr as well as its stdout "
+                    '(stderr=subprocess.STDOUT, or the connection passed for fd 2), so its diagnostics — '
+                    'which quote host paths — go straight to the guest. Pass stderr=DEVNULL or a file. '
+                    '(Process(argv=...) refuses this at construction; here it can only be detected.)'
+                )
             abnormal = _abnormal_stdio(conn)
             if abnormal:
                 self.dispose(grace)
@@ -496,11 +587,21 @@ class Process:
                     'let the hatch spawn it.'
                 )
             return
+        if self._proc is not None:
+            # Not adopted, yet already holding a process: either a verdict reused
+            # across connections (which _claim catches first, so this is the
+            # narrower case) or `_proc` assigned behind the property's back, which
+            # skips every check in from_popen.
+            raise ValueError(
+                'this Process already holds a command but did not come from Process.from_popen(popen). '
+                'A verdict describes one connection: build a fresh Process per connection, and adopt an '
+                'existing Popen only through from_popen, which validates it.'
+            )
         if self.argv is None:
             raise ValueError('Process() requires argv, or use Process.from_popen(popen)')
         _normalise_stdio(conn)
         fd = conn.fileno()
-        self.proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell; guest bytes only ever reach stdin
+        self._proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell; guest bytes only ever reach stdin
             list(self.argv),
             # The descriptor, not the socket object: `subprocess` accepts anything
             # with a fileno(), but typeshed's _FILE does not admit a socket. Passing
@@ -536,10 +637,10 @@ class Process:
             if self._disposed:
                 return
             self._disposed = True
-        if self.proc is None:
+        if self._proc is None:
             return
         with contextlib.suppress(Exception):
-            _reap(self.proc, grace, self.pgid)
+            _reap(self._proc, grace, self._pgid)
 
 
 Handler = Callable[[Stream], 'Process | None']
@@ -883,6 +984,14 @@ class StreamHatch:
             # workers are non-daemon the host process can no longer exit either.
             self._track(conn, None)
             verdict = self._handler(Stream(conn, self._name))
+            if verdict is not None and not verdict._claim():  # noqa: SLF001 — the hatch owns the verdict's lifecycle
+                # Another connection's verdict (a handler that caches or shares
+                # one). Forget it *before* raising: it is not ours to tear down,
+                # and the `finally` below would otherwise dispose of the other
+                # connection's live command. This connection gets the refusal
+                # path instead — a clean end-of-stream, like any other failure.
+                verdict = None
+                raise ValueError('a Process verdict is single-use; this one is already attached to a connection')
             if verdict is not None:
                 # Normalise-then-spawn, the one place a connection becomes a
                 # command's stdio. Inside the try, so a refused verdict is
@@ -1063,6 +1172,35 @@ def _normalise_stdio(conn: socket.socket) -> None:
             conn.setsockopt(socket.SOL_SOCKET, opt, value)
 
 
+def _stderr_is_the_connection(proc: subprocess.Popen[bytes] | None, conn: socket.socket) -> bool:
+    """Whether an adopted command's fd 2 is the guest's connection. Never raises.
+
+    The disclosure `_check_stderr` refuses on the declarative path, arriving by the
+    one route that check cannot see: ``subprocess`` keeps no record of the
+    ``stderr`` argument it was given, so an adopted `Popen` built with
+    ``stderr=subprocess.STDOUT`` is indistinguishable from one built with
+    ``DEVNULL`` by inspecting the object — ``proc.stderr`` is ``None`` either way.
+    The child itself is not indistinguishable, though: on Linux its fd 2 can be
+    stat'd through ``/proc``, and if it names the same inode as the connection then
+    fd 2 goes to the guest. Measured: the guest received ``HOST
+    /srv/secrets/repo.git`` before this check, and the inode comparison identifies
+    it.
+
+    Best-effort by construction — ``False`` where there is no ``/proc``, or where
+    the child has already exited, or on any error. Linux is the platform postern
+    sandboxes on, which is where it matters; elsewhere `from_popen`'s docstring is
+    the only guard, and says so.
+    """
+    if proc is None:
+        return False
+    try:
+        target = os.fstat(conn.fileno())
+        actual = os.stat(f'/proc/{proc.pid}/fd/2')
+    except (OSError, ValueError):
+        return False
+    return (actual.st_dev, actual.st_ino) == (target.st_dev, target.st_ino)
+
+
 def _abnormal_stdio(conn: socket.socket) -> list[str]:
     """Which of the normalised properties ``conn`` is not in. Never raises.
 
@@ -1128,12 +1266,21 @@ def _drain(guest: socket.socket, grace: float) -> None:
 
     Waits on readability rather than a socket timeout: ``settimeout`` is
     per-socket, and on the refusal path a handler may have already written to it.
+
+    ``grace`` caps the whole drain, but each wait is only ``_DRAIN_QUIET`` long,
+    because what makes the close orderly is an **empty receive queue** — so a
+    queue that is already empty is the answer, not a reason to keep waiting. The
+    old shape spent the full ``grace`` on the *first* byte, which a guest that
+    connects and says nothing never sends: a refusal therefore cost a slot for
+    ``grace`` seconds (measured 9.5 s for two of them at ``grace=5.0``), renewably,
+    for nothing but ``connect()``. Draining continues as long as bytes keep
+    arriving, which is the case the reset actually depends on.
     """
     deadline = time.monotonic() + grace
     with contextlib.suppress(OSError, ValueError):
         while (remaining := deadline - time.monotonic()) > 0:
-            if not _readable(guest, remaining):
-                return  # the guest has gone quiet; stop waiting on it
+            if not _readable(guest, min(_DRAIN_QUIET, remaining)):
+                return  # nothing queued: closing now is already orderly
             if not guest.recv(_CHUNK):
                 return
 
