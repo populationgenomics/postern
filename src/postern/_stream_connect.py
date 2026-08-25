@@ -16,196 +16,99 @@ no repository, no handshake. That is deliberate: the socket already *is* the
 capability (the host bound one socket per resource), so there is nothing for the
 guest to name and nothing for the host to parse.
 
-Single-threaded on purpose. A two-thread pump aborts under git (``python3 died of
-signal 6`` at interpreter shutdown, when one thread is blocked in ``read`` on a
-fd git has already torn down); one selector loop over both directions has no such
-window. Half-closes propagate: stdin EOF becomes ``shutdown(SHUT_WR)`` on the
-socket so the host's subprocess sees a real EOF, and socket EOF retires both
-directions so the pump exits rather than blocking on a stdin that will never
-close.
+**One blocking thread per direction.** This is the only place in postern that
+still copies bytes — the host side hands the socket straight to a command as its
+stdio — and a thread each way is the simplest shape that can do it. The selector
+loop it replaces had to be non-blocking on the socket and keep an unsent tail per
+direction, and still could not poll stdout for write-readiness, because stdout is
+not portably pollable: git gives us a pipe, a shell redirect gives us a regular
+file, and ``epoll`` refuses the latter outright. So it wrote stdout from inside the
+loop and blocked there, coupling the two directions.
+
+Threads decouple them, though honesty requires saying by how much: a guest that
+stops reading its own stdout stalls the *command* too, through the socket, so
+end-to-end backpressure arrives either way and the coupling was not reachable as a
+deadlock. What the rewrite actually buys is half the code, no non-blocking
+bookkeeping, and one class of bug that stops existing rather than being fixed —
+with no selector there is no ``epoll_ctl`` to reject a regular file or
+``/dev/null``, so the silent zero-byte exit that came from registering such a stdin
+is now unrepresentable rather than worked around.
+
+Threads were tried before and abandoned because they aborted under git (``python3
+died of signal 6``) when a daemon thread sat blocked in ``read`` on a descriptor
+git had already torn down and the interpreter then tried to finalise. That is a
+shutdown bug rather than an argument about architecture, and the fix is to not
+finalise: when the socket direction is done the exchange is over by definition, so
+``os._exit`` leaves immediately, with no interpreter teardown for a parked reader
+to trip over.
+
 """
 
 import contextlib
 import os
-import selectors
-import signal
 import socket
 import sys
+import threading
 
 _CHUNK = 65536
 
 
-def _selector():
-    """A selector that accepts regular files and character devices.
-
-    Not ``DefaultSelector``: on Linux that is ``EpollSelector``, and ``epoll_ctl``
-    rejects regular files and ``/dev/null`` with ``EPERM``. Registering stdin then
-    raised ``PermissionError`` — an ``OSError`` — which ``main`` swallowed before
-    returning 0, so any invocation whose stdin was not a pipe reported success
-    having moved nothing. The sandbox hands entrypoints ``stdin=DEVNULL``, so
-    ``python3 $POSTERN_CONNECT $SOCK > out.bin`` hit exactly that. Two descriptors
-    make ``select``'s ceiling irrelevant.
-    """
-    for name in ('PollSelector', 'SelectSelector'):
-        impl = getattr(selectors, name, None)
-        if impl is not None:
-            return impl()
-    return selectors.DefaultSelector()
+def _write_all(fd, data) -> None:
+    """Write every byte of ``data`` to ``fd`` (``os.write`` may write short)."""
+    while data:
+        data = data[os.write(fd, data) :]
 
 
-class _Half:
-    """One direction of the relay: read from ``src``, write to ``dst``.
-
-    Holds its own unsent ``tail``. That is the whole point: a blocking
-    ``sendall``/``write`` inside the selector loop stops the *other* direction
-    being serviced, and on a full-duplex bulk exchange that deadlocks the entire
-    cycle -- the connector parks in send, so the host's forward pump fills the
-    socket buffer and blocks, the command's stdout pipe fills, the command stops
-    reading stdin, the host's reverse pump stops reading the socket, and the
-    connector's send can never complete. 64 MiB through `cat` moved 10 MiB and
-    wedged. Only git's mostly half-duplex phases hid it.
-    """
-
-    def __init__(self, src, dst, on_eof=None):
-        self.src = src
-        self.dst = dst
-        self.tail = b''
-        self.reading = True
-        self.on_eof = on_eof
-
-    @property
-    def done(self):
-        return not self.reading and not self.tail
-
-    def read(self):
-        """Take what is available; returns False at end of input."""
-        chunk = _read(self.src)
-        if chunk:
-            self.tail += chunk
-            return True
-        self.reading = False
-        if self.on_eof is not None and not self.tail:
-            self.on_eof()
-        return False
-
-    def flush(self):
-        """Write what we can without blocking; fires ``on_eof`` once drained."""
-        if self.tail:
-            self.tail = self.tail[_write(self.dst, self.tail) :]
-        if not self.tail and not self.reading and self.on_eof is not None:
-            self.on_eof()
-
-
-def _read(src):
-    if isinstance(src, int):
-        return os.read(src, _CHUNK)
-    return src.recv(_CHUNK)
-
-
-def _write(dst, data):
-    if isinstance(dst, int):
-        return os.write(dst, data)
-    return dst.send(data)
-
-
-def _pump(sock) -> None:
-    """Relay stdin<->``sock`` in one selector loop until both directions retire."""
-    sock.setblocking(False)
-
-    def half_close():
+def _stdin_to_socket(sock) -> None:
+    """Copy stdin -> socket, then half-close so the host's command reads EOF."""
+    try:
+        while True:
+            chunk = os.read(0, _CHUNK)
+            if not chunk:
+                break
+            sock.sendall(chunk)
+    except OSError:
+        pass  # git tore our stdin down, or the host went away
+    finally:
         # Our input is done, but the host may still have a pack to send: half-close
-        # so its subprocess reads EOF, and keep reading.
+        # rather than close, and let the other direction run to its own end.
         with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_WR)
 
-    out = _Half(0, sock, on_eof=half_close)  # stdin -> socket
-    back = _Half(sock, 1)  # socket -> stdout
-    sel = _selector()
+
+def _socket_to_stdout(sock) -> int:
+    """Copy socket -> stdout until the host is finished. Returns an exit status."""
     try:
-        while not (out.done and back.done):
-            sel_map = _interest(out, back, sock)
-            _reregister(sel, sel_map)
-            if not sel_map:
-                break
-            for key, mask in sel.select():
-                if key.fileobj is sock and mask & selectors.EVENT_WRITE:
-                    out.flush()
-                if not mask & selectors.EVENT_READ:
-                    continue
-                half = out if key.fd == 0 else back
-                if half.read() and half is back:
-                    # stdout is not portably pollable (git gives us a pipe, a
-                    # redirect gives us a file), so drain it here and now.
-                    while back.tail:
-                        back.flush()
-            if not back.reading and back.done and out.reading:
-                # The host is finished; nothing more can arrive, so stop waiting on
-                # a stdin the client may never close.
-                out.reading = False
-                out.tail = b''
-    finally:
-        sel.close()
-
-
-def _interest(out, back, sock):
-    """What we want to hear about next, which is also the backpressure rule.
-
-    stdin is worth reading only while we are not already holding a backlog for the
-    socket, and vice versa: whoever has an unsent tail waits for writability
-    instead of taking on more.
-    """
-    wanted = {}
-    if out.reading and not out.tail:
-        wanted[0] = selectors.EVENT_READ
-    if back.reading:
-        wanted[sock] = selectors.EVENT_READ
-    if out.tail:
-        wanted[sock] = wanted.get(sock, 0) | selectors.EVENT_WRITE
-    return wanted
-
-
-def _reregister(sel, wanted) -> None:
-    """Make the selector's registrations exactly ``wanted``."""
-    for key in list(sel.get_map().values()):
-        if key.fileobj not in wanted:
-            with contextlib.suppress(KeyError, OSError):
-                sel.unregister(key.fileobj)
-    for fileobj, events in wanted.items():
-        try:
-            sel.modify(fileobj, events)
-        except KeyError:
-            sel.register(fileobj, events)
+        while True:
+            chunk = sock.recv(_CHUNK)
+            if not chunk:
+                return 0
+            _write_all(1, chunk)
+    except BrokenPipeError:
+        return 0  # git closed our stdout; a normal end, not a failure
+    except OSError as exc:
+        print(f'connect.py: stream failed: {exc}', file=sys.stderr)
+        return 1
 
 
 def main() -> int:
     if len(sys.argv) != 2:
         print('usage: connect.py <socket-path>', file=sys.stderr)
         return 2
-    # Die on SIGPIPE like any pipe filter instead of raising: when git tears down
-    # the helper it closes our stdout, and a Python traceback on the way out would
-    # be mistaken for a protocol error.
-    with contextlib.suppress(AttributeError, ValueError):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.connect(sys.argv[1])
     except OSError as exc:
         print(f'connect.py: cannot reach the hatch: {exc}', file=sys.stderr)
         return 1
-    try:
-        _pump(sock)
-    except BrokenPipeError:
-        pass  # git tore our stdout down; that is a normal end, not a failure
-    except OSError as exc:
-        # Not `pass`: swallowing this and returning 0 reported success for a pump
-        # that moved nothing, which is how the epoll registration failure above
-        # stayed invisible.
-        print(f'connect.py: stream failed: {exc}', file=sys.stderr)
-        return 1
-    finally:
-        with contextlib.suppress(OSError):
-            sock.close()
-    return 0
+    threading.Thread(target=_stdin_to_socket, args=(sock,), daemon=True).start()
+    status = _socket_to_stdout(sock)
+    # The host has closed its end, so nothing more can arrive and the exchange is
+    # over whatever stdin is doing. Leave without finalising the interpreter: the
+    # stdin reader may be parked in read() on a descriptor git has already closed,
+    # and joining or finalising around that is what used to abort under git.
+    sys.stderr.flush()
+    os._exit(status)
 
 
 if __name__ == '__main__':
