@@ -135,6 +135,13 @@ _POLL_INTERVAL = 0.25
 _REVERSE_THREAD = 'postern-stream-reverse'
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
+# waitid lets us observe an exit without reaping it. Reached through getattr because
+# typeshed marks it unavailable on darwin, where CPython in fact provides it; None
+# would mean falling back to poll(), which reaps and so forfeits the group signal.
+_WAITID = getattr(os, 'waitid', None)
+_P_PID = getattr(os, 'P_PID', 0)
+_WEXITED = getattr(os, 'WEXITED', 0)
+_WNOWAIT = getattr(os, 'WNOWAIT', 0)
 # Everything a host-side subprocess gets of the host's environment. The subprocess
 # is the thing chewing on guest bytes, so it must not inherit the trusted worker's
 # secrets (the same reasoning as _sandbox.bwrap_env).
@@ -907,7 +914,7 @@ def _splice_process(guest: socket.socket, verdict: Process, grace: float) -> Non
             # died. Once the command itself has exited, whatever still holds the
             # pipe is not part of this stream, and the group kill collects it.
             if not _readable(out_fd, _POLL_INTERVAL):
-                if proc.poll() is not None:
+                if _exited(proc):
                     break
                 continue
             chunk = os.read(out_fd, _CHUNK)
@@ -950,6 +957,26 @@ def _signal_group(proc: subprocess.Popen[bytes], pgid: int | None, sig: int) -> 
         proc.send_signal(sig)
 
 
+def _exited(proc: subprocess.Popen[bytes]) -> bool:
+    """Whether the command has exited — **without reaping it**.
+
+    ``poll()`` reaps, and reaping releases the leader's pid. A process group's id
+    stays valid only while that pid is still allocated, which an unreaped zombie
+    guarantees and a reaped child does not, so a group kill issued after a ``poll()``
+    can land on a recycled pid — and `splice_subprocess` mints a new session leader
+    per connection, so the recycled pid is plausibly another connection's command.
+    ``waitid(..., WNOWAIT)`` reports the exit and leaves the child waitable.
+    """
+    if proc.returncode is not None:
+        return True
+    if _WAITID is None:  # pragma: no cover - waitid is POSIX-wide in practice
+        return proc.poll() is not None  # weaker: this reaps, so no group signal follows
+    try:
+        return _WAITID(_P_PID, proc.pid, _WEXITED | os.WNOHANG | _WNOWAIT) is not None
+    except OSError:
+        return proc.poll() is not None
+
+
 def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) -> None:
     """Terminate, then kill, then wait — never leave a child of the host running.
 
@@ -964,15 +991,22 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
     zombie — one per connection, which is the leak this function exists to close.
     It cannot hang: it runs only after ``SIGKILL``, which is not maskable.
     """
-    if proc.poll() is None:
-        _signal_group(proc, pgid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
+    # Signalling the group is only safe while we still hold the leader's pid. If
+    # something already waited this Popen, the pid may have been recycled, so the
+    # group is no longer provably ours and we signal nothing.
+    if proc.returncode is None:
+        if not _exited(proc):
+            _signal_group(proc, pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                _signal_group(proc, pgid, signal.SIGKILL)
+        elif proc.returncode is None:
+            # Exited but not yet reaped: the zombie pins the pid, so the group id is
+            # still valid and anything the command started is still in it. The
+            # re-check matters because the fallback above reaps, and after a reap
+            # the group is no longer provably ours.
             _signal_group(proc, pgid, signal.SIGKILL)
-    else:
-        # Already exited, but anything it started is still in its group.
-        _signal_group(proc, pgid, signal.SIGKILL)
     with contextlib.suppress(Exception):
         proc.wait()
     # stderr as well as the two the splice owns: `splice_subprocess` refuses PIPE,
