@@ -283,9 +283,18 @@ _WAITID = getattr(os, 'waitid', None)
 _P_PID = getattr(os, 'P_PID', 0)
 _WEXITED = getattr(os, 'WEXITED', 0)
 _WNOWAIT = getattr(os, 'WNOWAIT', 0)
+# Every name the kqueue tier touches is reached through getattr, the whole family
+# and not just some of it: `select.kevent` and the KQ_* constants exist only on the
+# BSDs, so naming them directly is an attribute error on Linux at *type-check* time
+# even though the call site can never run there — which is exactly what CI found
+# the first time this tier reached it (pyright runs on ubuntu, where the stubs have
+# no kevent).
 _KQUEUE = getattr(select, 'kqueue', None)
+_KEVENT = getattr(select, 'kevent', None)
 _KQ_FILTER_PROC = getattr(select, 'KQ_FILTER_PROC', None)
 _KQ_NOTE_EXIT = getattr(select, 'KQ_NOTE_EXIT', None)
+_KQ_EV_ADD = getattr(select, 'KQ_EV_ADD', 0)
+_KQ_EV_ONESHOT = getattr(select, 'KQ_EV_ONESHOT', 0)
 # File status flags to clear before handing the connection over as a command's
 # stdio. They live on the *open file description*, which the child's fds 0 and 1
 # are dup2's of, so whatever is set here is what the command runs with.
@@ -1361,17 +1370,17 @@ def _kq_exited(pid: int, timeout: float | None) -> bool | None:
     would be meaningless. `Popen` holds the pid until something waits it, so
     within this module "registration says exited" and "our child exited" coincide.
     """
-    if _KQUEUE is None or _KQ_FILTER_PROC is None or _KQ_NOTE_EXIT is None:
+    if _KQUEUE is None or _KEVENT is None or _KQ_FILTER_PROC is None or _KQ_NOTE_EXIT is None:
         return None
     try:
         kq = _KQUEUE()
     except OSError:  # pragma: no cover - only if the platform lies about kqueue
         return None
     try:
-        event = select.kevent(
+        event = _KEVENT(
             pid,
             filter=_KQ_FILTER_PROC,
-            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            flags=_KQ_EV_ADD | _KQ_EV_ONESHOT,
             fflags=_KQ_NOTE_EXIT,
         )
         try:
