@@ -93,25 +93,127 @@ connections live, so size the cap for the workload and rely on the outer
 ``Sandbox.run(timeout=...)`` as the backstop that EOFs every connection at once.
 
 That backstop is only a backstop if a dead guest actually frees the slot, which
-takes two things beyond the EOF: teardown that signals the command's whole
-*process group* (a background child it left behind would otherwise keep the
-stdout pipe open, so the splice would wait for an EOF that can never come), and a
-forward pump that stops waiting on that pipe once the command itself has exited.
-Both are here; without them one connection could cost a slot, a subprocess and a
+takes teardown that signals the command's whole *process group*: a child the
+command left behind inherits the guest's socket, so it holds the connection open
+after the command is gone and the guest waits for an end-of-stream that can never
+come. Without it one connection could cost a slot, a subprocess and a
 non-exitable worker thread permanently, and ``max_conns`` of them killed the hatch
 for the worker's whole life rather than the run's.
 
-**Platform.** Linux is the only platform postern sandboxes *on* (bubblewrap), but
-a `StreamHatch` is host-side and runs anywhere, so the host half is exercised on
-macOS too — and process-group teardown needs a way to observe the command's exit
-without reaping it. There are two, ``waitid(..., WNOWAIT)`` and
-``kqueue``/``NOTE_EXIT``, and between them they cover Linux, macOS and the BSDs
-(see ``_WAITID``). On a platform with neither, teardown can still signal the
-command but not its group, so a command that leaves a background child behind
-leaves that child holding the guest's socket: the guest never reaches
-end-of-stream. That is a real functional gap rather than a theoretical one — it
-is what macOS did before the kqueue tier, and two of the teardown tests failed
-there while the Linux container stayed green.
+Teardown and its caveats
+------------------------
+Linux is the only platform postern sandboxes *on* (bubblewrap), but a
+`StreamHatch` is host-side and runs anywhere, so the host half is exercised on
+macOS too. Everything in this section follows from one requirement: teardown
+signals the command's process *group*, and doing that safely means observing the
+command's exit **without reaping it** — an unreaped zombie is what proves the
+leader's pid, and so the group id captured at spawn, is still ours rather than a
+number the kernel has since handed to somebody else.
+
+**Observing the exit: three tiers.** In ``_WAITID``'s order, and the reason there
+is more than one is that no single interface is portable.
+
+1. ``os.waitid(..., WNOWAIT)``. Always present on Linux. On macOS its presence is
+   a property of the *build* rather than of the platform, which is why it is
+   reached through ``getattr`` and why typeshed's "unavailable on darwin" is not
+   simply wrong: measured absent on CPython 3.9.6 (Apple's system interpreter),
+   3.10.20, 3.11.12, 3.11.13 and 3.12.13, and present on 3.13.12 — where it is
+   also correct end to end (the leader stays a zombie, the captured pgid stays
+   addressable, and ``killpg`` reaches a child the command left behind).
+2. ``kqueue``/``EVFILT_PROC``/``NOTE_EXIT`` on macOS and the BSDs, measured
+   equivalent to tier 1. One sharp edge: ``EVFILT_PROC`` reports an immediate
+   ``NOTE_EXIT`` for a pid that does not exist *at all*, so a registration only
+   answers the question for a pid we own and have not reaped. `Popen` guarantees
+   that here, and `_kq_exited` says so — but it makes the tier unusable for a pid
+   whose fate is what you are trying to establish.
+3. ``Popen.poll()``/``wait()``. These reap, which frees the leader's pid, so
+   `_reap` then declines to signal a group it can no longer prove is ours and a
+   background child survives holding the guest's socket. This tier exists only as
+   a floor; without tier 2 every macOS interpreter lacking ``os.waitid`` landed on
+   it, and ``test_teardown_reaches_the_whole_process_group`` and
+   ``test_a_child_left_behind_does_not_hold_the_connection_open`` did not pass
+   vacuously there — they *failed*, the second with the guest timing out. The
+   suite had only ever been run on Linux.
+
+**Caveat 1 — another reaper in the host process voids the group signal.** If
+anything else in the embedding process reaps arbitrary children, teardown
+silently skips the process-group kill. The triggers are ordinary: a supervisor
+loop calling ``waitpid(-1)``, ``multiprocessing``, an asyncio child watcher, or
+``SIGCHLD`` set to ``SIG_IGN``.
+
+The mechanism is an information loss in ``Popen``, not a branch in this module.
+Once a third party has collected the status, ``waitid`` raises
+``ChildProcessError`` (``ECHILD``); `_await_command` falls back to ``proc.wait()``,
+and ``Popen._try_wait`` catches that same ``ECHILD`` and *synthesises a status of
+0* — measured: ``wait()`` returned ``0`` in 2.3 ms for a command whose real exit
+status was 7, and ``poll()`` likewise returned ``0`` for one that exited 9. So
+``returncode`` is ``0``, `_reap`'s outer ``if proc.returncode is None`` is false,
+and the whole signalling block is skipped. (On the `close`-first path
+`_dispose` runs before anything has set ``returncode``, so `_exited` is reached
+instead: ``waitid`` gives ``ECHILD``, its ``poll()`` fallback synthesises 0 again,
+and the ``elif proc.returncode is None`` guard fails just the same. Two routes,
+one outcome.)
+
+Measured consequence, using ``SIGCHLD=SIG_IGN`` as a race-free stand-in for a
+supervisor: without a foreign reaper, ``killpg`` is called once with ``SIGKILL``,
+the guest reads end-of-stream immediately, and every group member is a zombie.
+With one, ``killpg`` is **never called**, the guest times out after 6 s having
+never reached end-of-stream, and two group members are still alive. In both cases
+the host's thread count returns to its baseline and no ``postern-stream`` thread
+is left behind — this leaks the command's *children*, and it does not hang the
+worker or leak a thread, which is the plausible wrong guess about it.
+
+**Declining to signal is the correct response to that ambiguity, not a bug.**
+``ECHILD`` is indistinguishable from a clean exit, and signalling anyway would
+reintroduce exactly the pid-reuse hazard ``8d8e00f`` closed — *because* the third
+party's reap freed the pid, and a freed pid really is reissued (measured: with
+``pid_max`` lowered, the reaped pid came back within two wraps of the allocator).
+Every verdict mints a session leader, so a stale group kill is plausibly aimed at
+another connection's command. This is an information limit, and closing it needs a
+different primitive, not a different branch — see *The fix* below.
+
+**Caveat 2 — a grandchild that leaves the process group escapes teardown.** The
+guarantee is over the command's process group, which is where a shell's ``&``
+child stays. A *correctly daemonising* sidecar calls ``setsid()`` and leaves it,
+and nothing here reaches it. Measured on this revision: with a plain ``&`` child
+the guest reads end-of-stream, and with a ``setsid()`` child the guest times out
+while the escapee keeps a dup of the guest's socket indefinitely. ``max_conns``
+still holds — the slot is released — so the cost is one leaked process and one
+leaked descriptor per connection, unbounded across reconnections. Read "a
+background child it left behind", wherever this module says it, as "one that stays
+in the group".
+
+**The fix, deliberately deferred.** Both caveats above are open in this revision
+and are to be closed in a follow-up. The shape of it, with the parts that were
+measured rather than assumed:
+
+* *Reaper-independent exit observation.* Acquire the handle **at spawn** —
+  ``os.pidfd_open(pid)`` on Linux, a ``kqueue`` ``EVFILT_PROC``/``NOTE_EXIT``
+  registration on macOS and the BSDs — and wait on that instead of on
+  ``waitid``/``wait``. Verified: both still report the exit after a third party
+  has reaped the leader (the pidfd becomes readable; the kqueue still delivers
+  ``NOTE_EXIT``). At spawn and not at wait time, because once the pid is gone
+  ``pidfd_open`` fails ``ESRCH`` and ``EVFILT_PROC`` gives the spurious immediate
+  event described in tier 2. That makes "the command exited" and "somebody else
+  reaped it" distinguishable, which is what caveat 1 currently cannot tell apart.
+* *A group signal that does not go through a pid number.* This is the half a
+  pidfd does **not** give for free, and the easy assumption to get wrong: holding
+  a pidfd does *not* pin the pid number against reuse — measured, the reaped pid
+  was reissued within two wraps of the allocator whether or not a pidfd on it was
+  open — so ``killpg(pgid)`` after a foreign reap stays unprovable. What does work
+  is ``pidfd_send_signal(fd, sig, NULL, PIDFD_SIGNAL_PROCESS_GROUP)``, which names
+  the group through the pidfd rather than through a number: measured, it killed a
+  live group member whose leader a third party had already reaped. That flag is
+  **Linux 6.9+**, so ``killpg`` plus today's decline has to remain the fallback
+  below it — and on macOS and the BSDs there is no equivalent, so caveat 1 stays
+  open there even with the kqueue handle in place.
+* Caveat 2 is not addressed by either primitive: the escapee is in another group
+  by its own choice. The durable answer is to bound the command with a container
+  rather than a group — cgroup v2 ``cgroup.kill`` on Linux — which needs
+  delegation an unprivileged embedder may not have.
+* Secondary, and not a reason on its own: a pidfd or kqueue handle is *pollable*,
+  so the per-connection wait would stop needing a thread parked in ``waitid``. At
+  ``max_conns=8`` that is eight threads.
 """
 
 from __future__ import annotations
@@ -159,27 +261,16 @@ _FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 _ACCEPT_RETRY_DELAY = 0.05
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
-# Observing the command's exit *without reaping it* is what keeps its pid — and
-# so the process group id captured at spawn — provably ours until teardown has
-# signalled the group. No single interface is portable, so there are three tiers.
-#
-# 1. ``os.waitid(..., WNOWAIT)``. typeshed marks it unavailable on darwin, hence
-#    the getattr — and typeshed is not simply wrong: its presence on macOS is
-#    *build-dependent*. Measured absent on Apple's system 3.9.6 and on pyenv's
-#    3.10/3.11; present on a uv-managed 3.13.12, where it is also fully correct
-#    end to end (leader stays a zombie, the captured pgid stays addressable,
-#    ``killpg`` still reaches a child the command left behind).
-# 2. ``kqueue``/``EVFILT_PROC``/``NOTE_EXIT`` on darwin and the BSDs, measured
-#    equivalent to tier 1. This tier exists because without it every macOS
-#    interpreter lacking ``os.waitid`` fell straight to tier 3, where
-#    ``test_teardown_reaches_the_whole_process_group`` and
-#    ``test_a_child_left_behind_does_not_hold_the_connection_open`` do not pass
-#    vacuously — they *fail*, the second with the guest timing out because it
-#    never reaches end-of-stream. The whole suite was only ever run on Linux.
-# 3. ``Popen.poll()``/``wait()``. These reap, which releases the leader's pid, so
-#    `_reap` then declines to signal a group it can no longer prove is ours: a
-#    background child survives holding the guest's socket. A platform that gets
-#    here has no process-group teardown; see the module docstring.
+# Observing the command's exit *without reaping it* is what keeps its pid — and so
+# the process group id captured at spawn — provably ours until teardown has
+# signalled the group. Three tiers, because no single interface is portable:
+# waitid(WNOWAIT), then kqueue/EVFILT_PROC/NOTE_EXIT, then a reaping poll()/wait()
+# as the floor. Which platform gets which, what each guarantees, and the two
+# caveats that remain open (a third-party reaper in the host process, and a
+# grandchild that leaves the group) are in this module's docstring under "Teardown
+# and its caveats" — deliberately there and not repeated here, because the reader
+# who needs them is not reading a fallback branch. waitid is reached through
+# getattr because its presence on macOS is a property of the build.
 _WAITID = getattr(os, 'waitid', None)
 _P_PID = getattr(os, 'P_PID', 0)
 _WEXITED = getattr(os, 'WEXITED', 0)
@@ -1158,6 +1249,11 @@ def _exited(proc: subprocess.Popen[bytes]) -> bool:
     connection, so the recycled pid is plausibly another connection's command.
     ``waitid(..., WNOWAIT)`` and ``kqueue``/``NOTE_EXIT`` both report the exit and
     leave the child waitable; ``poll()`` is the last resort and reaps.
+
+    Note what this cannot answer: if another reaper in the host process has already
+    collected the status, every tier here reports "exited" indistinguishably from a
+    clean exit, because ``Popen`` synthesises a status of 0 on ``ECHILD``. See the
+    module docstring, "Teardown and its caveats".
     """
     if proc.returncode is not None:
         return True
@@ -1177,8 +1273,15 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
 
     Signals the process *group*, not the process: a command that leaves a
     background child behind otherwise strands it, and — because that child
-    inherited the stdout pipe — strands the splice waiting for EOF on it too, so
-    the connection's slot never came back even after the guest died.
+    inherited the guest's *socket* — strands the guest too, waiting for an
+    end-of-stream that can never come.
+
+    Two things bound that guarantee, both open in this revision and both written
+    up under "Teardown and its caveats" in the module docstring: it is skipped
+    entirely if something else in the host process reaps arbitrary children (the
+    ``if proc.returncode is None`` below is where that lands, and declining is the
+    correct answer to the ambiguity), and it does not reach a grandchild that has
+    left the group with ``setsid()``.
 
     The final ``wait()`` is deliberately untimed. With ``grace=0.0`` every
     ``wait(timeout=grace)`` is a single ``WNOHANG`` poll that necessarily loses the

@@ -207,6 +207,31 @@ long-lived by definition, so a queue of accepted-but-unserved connections would
 be a queue of host file descriptors — past the cap, dials wait in the kernel
 backlog costing the host nothing.
 
+**Teardown has two known holes.** Per connection the hatch waits for the command
+and then signals its whole process *group*, because a child the command left
+behind inherits the guest's socket and would otherwise hold the connection open
+for ever. Two things bound that, both open in this release and both to be closed
+in a follow-up:
+
+- *Another reaper in your process voids it.* If the embedding process reaps
+  arbitrary children — a supervisor loop calling `waitpid(-1)`, `multiprocessing`,
+  an asyncio child watcher, `SIGCHLD` set to `SIG_IGN` — then `Popen` synthesises
+  an exit status of `0` on `ECHILD`, which is indistinguishable from a clean exit,
+  and the group signal is skipped. Declining is the correct answer to that
+  ambiguity rather than a bug: the foreign reap freed the pid, so signalling
+  anyway could land on a recycled one. It leaks the command's *children*, not a
+  thread, and it does not hang the worker. If your host process has its own
+  reaper, keep the outer `Sandbox.run(timeout=...)` short.
+- *A grandchild that calls `setsid()` escapes it*, because it is no longer in the
+  group. A shell's `&` child stays and is collected; a correctly daemonising
+  sidecar does not. Prefer a command that does not daemonise.
+
+Mechanism, measurements and the fix plan are in `postern.stream`'s module
+docstring under "Teardown and its caveats"; the same docstring records which
+platforms can observe a command's exit without reaping it (`waitid` on Linux and
+some macOS builds, `kqueue` on macOS and the BSDs) and what a platform with
+neither loses.
+
 **Know this before you pick a command.** A fixed argv means guest bytes never
 become *that* process's argv. It does not mean they cannot become a *downstream*
 process's argv or a shell command, because the command's own **stdin grammar** is
