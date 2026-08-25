@@ -3,7 +3,7 @@
 Where `GrpcHatch` grants the guest a set of typed methods, `StreamHatch` gives it
 **one socket** and nothing else. Per accepted connection a handler you supply
 decides what the guest's bytes are spliced to — a host-side subprocess's stdio,
-an upstream socket, or nothing.
+or nothing.
 
     handler(stream) -> Process | None
 
@@ -316,10 +316,26 @@ def splice_subprocess(
             'stderr=subprocess.PIPE is not supported: nothing drains it, so the command deadlocks. '
             'Use DEVNULL (the default), or pass a file/fd to keep the diagnostics.'
         )
+    if stderr == subprocess.STDOUT:
+        # stdout *is* the guest's socket, so this is the one setting that relays the
+        # command's diagnostics — host paths included — straight to the guest, which
+        # is precisely what this argument exists to prevent.
+        raise ValueError(
+            'stderr=subprocess.STDOUT is not supported: stdout is the guest socket, so merging fd 2 '
+            'into it hands the guest the command diagnostics (host paths included). '
+            'Use DEVNULL (the default), or pass a file/fd to keep them host-side.'
+        )
     argv = list(argv)
     process_env = dict(env) if env is not None else {'PATH': _MINIMAL_PATH}
 
     def handler(stream: Stream) -> Process:
+        # The command's fds 0 and 1 are dup2's of *this* open file description, so
+        # its file status flags are shared: a wrapping handler that bounded its own
+        # preamble read with conn.settimeout() left the socket O_NONBLOCK, and the
+        # command then took EAGAIN on a large write and exited — a silently
+        # truncated response the guest reads as a clean end-of-stream. Restore
+        # blocking mode so that trap is unrepresentable.
+        os.set_blocking(stream.conn.fileno(), True)
         proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell; guest bytes only ever reach stdin
             argv,
             # The descriptor, not the socket object: `subprocess` accepts anything
@@ -597,6 +613,13 @@ class StreamHatch:
         # always give its slot back — otherwise the hatch bleeds capacity.
         verdict: Process | None = None
         try:
+            # Tracked *before* the verdict, not after: a handler is entitled to read
+            # a preamble (see `Stream`), and until this connection is in _live,
+            # close() cannot shut it down. A hostile guest that connects and sends
+            # nothing then parks a pool worker in recv() for ever — max_conns of
+            # those deafen the hatch permanently, and because ThreadPoolExecutor
+            # workers are non-daemon the host process can no longer exit either.
+            self._track(conn, None)
             verdict = self._handler(Stream(conn, self._name))
             self._track(conn, verdict)
             if verdict is None:

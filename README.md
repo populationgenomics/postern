@@ -136,8 +136,8 @@ stream hatch (below) is stdlib-only.
 
 Some protocols are neither typed RPC nor request/response. `StreamHatch` gives
 the guest **one socket** and nothing else; per accepted connection a handler
-decides what its bytes are spliced to — a host-side subprocess's stdio, an
-upstream socket, or nothing. The motivating case is git: git's native wire
+decides what its bytes are spliced to — a host-side subprocess's stdio, or
+nothing. The motivating case is git: git's native wire
 protocol is pkt-line over a raw bidirectional stream, and `ext::` carries it over
 a command's stdin/stdout, so a byte pump reaches the socket.
 
@@ -189,7 +189,9 @@ each binds at `/run/postern/<name>.sock` and is exported as
 `$POSTERN_HATCH_<NAME>` (the unnamed `GrpcHatch` keeps `$POSTERN_HATCH`, and
 `hatch=` now takes one hatch or a sequence). The in-guest connector that bridges
 a command's stdio to the socket is bound in at `$POSTERN_CONNECT` (stdlib-only,
-single-threaded — a two-thread pump aborts under git). git gates `ext::` behind
+one blocking thread per direction; it leaves with `os._exit` rather than
+finalising, because a daemon reader parked on a descriptor git has torn down is
+what used to abort under git). git gates `ext::` behind
 `protocol.ext.allow` because an `ext::` URL is command execution; inside the
 sandbox that gate protects nothing, since the guest is already running untrusted
 code, so enable it per invocation with `-c` and leave the host's git config alone.
