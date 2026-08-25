@@ -90,10 +90,12 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import os
-import select
+import selectors
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -101,7 +103,13 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from concurrent import futures
 
-from postern._sandbox import guest_env_var, guest_socket_path, validate_guest_name
+from postern._sandbox import (
+    GUEST_CONNECT,
+    SandboxProfile,
+    guest_env_var,
+    guest_socket_path,
+    validate_guest_name,
+)
 
 _CHUNK = 65536
 # Concurrent connections a hatch serves at once (see StreamHatch.__init__ for why
@@ -110,9 +118,23 @@ _DEFAULT_MAX_CONNS = 8
 # How long to wait for a subprocess to die after terminate(), and for the guest to
 # close after we half-close, before forcing the issue.
 _DEFAULT_GRACE = 5.0
-# The guest path Sandbox binds postern._stream_connect at. Defined here so git_url
-# and the sandbox agree on one string; Sandbox owns the bind itself.
-_GUEST_CONNECT = '/run/postern/connect.py'
+# Teardown budget for a verdict rejected at construction: enough for SIGTERM to
+# land before SIGKILL, since the caller has no handle to reap it later.
+_REJECT_GRACE = 0.5
+# accept() errnos that mean the listening socket itself is finished, as opposed to
+# a transient shortage the loop should ride out.
+_FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
+# Pause before retrying a transient accept() failure, so an fd shortage in the
+# embedding worker cannot turn into a hot spin.
+_ACCEPT_RETRY_DELAY = 0.05
+# How often the forward pump re-checks whether the command is still alive. Kept
+# separate from `grace`: grace is a teardown budget, and reusing it here meant
+# grace=0.0 turned the liveness check into a hot spin.
+_POLL_INTERVAL = 0.25
+# Named so a leaked pump is identifiable in a thread dump, and countable in tests.
+_REVERSE_THREAD = 'postern-stream-reverse'
+# How long to wait when probing whether a socket in the way is still live.
+_STALE_PROBE_TIMEOUT = 1.0
 # Everything a host-side subprocess gets of the host's environment. The subprocess
 # is the thing chewing on guest bytes, so it must not inherit the trusted worker's
 # secrets (the same reasoning as _sandbox.bwrap_env).
@@ -167,15 +189,38 @@ class Process:
     # when a handler built the `Popen` without ``start_new_session=True`` and the
     # group is the worker's own: signalling that would signal the worker.
     pgid: int | None = dataclasses.field(default=None, init=False)
+    _disposed: bool = dataclasses.field(default=False, init=False, repr=False)
+    _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.proc.stdin is None or self.proc.stdout is None:
-            with contextlib.suppress(Exception):
-                _reap(self.proc, 0.0)
-            raise ValueError('Process(proc) requires a Popen created with stdin=PIPE and stdout=PIPE')
+        # Before the contract check, not after: the check's own reject path has to
+        # be able to signal the group it is about to abandon.
         with contextlib.suppress(OSError, AttributeError):
             if os.getpgid(self.proc.pid) == self.proc.pid:
                 self.pgid = self.proc.pid
+        if self.proc.stdin is None or self.proc.stdout is None:
+            self.dispose(_REJECT_GRACE)
+            raise ValueError('Process(proc) requires a Popen created with stdin=PIPE and stdout=PIPE')
+
+    def dispose(self, grace: float) -> None:
+        """Terminate, kill and reap the command's process group. Idempotent.
+
+        Idempotence is load-bearing rather than tidy. Two call sites need to reap:
+        the splice, because closing the command's stdin is what unblocks a reverse
+        pump parked in ``write``, and `StreamHatch`'s per-connection ``finally``,
+        because an exception anywhere would otherwise abandon the command. Letting
+        both actually reap meant every connection was reaped twice, and the second
+        pass signalled a process group whose leader had already been waited — a pid
+        the kernel is then free to reuse, and `splice_subprocess` mints a new
+        session leader per connection, so one connection's stale ``SIGKILL`` could
+        land on another's command.
+        """
+        with self._lock:
+            if self._disposed:
+                return
+            self._disposed = True
+        with contextlib.suppress(Exception):
+            _reap(self.proc, grace, self.pgid)
 
 
 @dataclasses.dataclass
@@ -183,6 +228,24 @@ class Upstream:
     """Handler verdict: splice this connected socket to the guest, both ways."""
 
     sock: socket.socket
+    _disposed: bool = dataclasses.field(default=False, init=False, repr=False)
+    _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, init=False, repr=False)
+
+    def dispose(self, grace: float) -> None:
+        """Shut the upstream down, then close it. Idempotent.
+
+        ``shutdown`` before ``close`` because on Linux closing a socket another
+        thread is parked in ``recv`` on does not wake that thread.
+        """
+        del grace
+        with self._lock:
+            if self._disposed:
+                return
+            self._disposed = True
+        with contextlib.suppress(OSError):
+            self.sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            self.sock.close()
 
 
 Handler = Callable[[Stream], 'Process | Upstream | None']
@@ -243,6 +306,17 @@ def splice_subprocess(
         read-only the flags look. Choose a command whose stdin grants nothing
         beyond the capability you meant to grant.
     """
+    if stderr == subprocess.PIPE:
+        # Nothing in the package reads proc.stderr, so a command that fills the
+        # 64 KiB pipe blocks in write(2) for ever: it never reaches stdout EOF, the
+        # forward pump polls a process that never exits, and the slot is pinned
+        # until close() — while the splice cannot even notice the guest leaving,
+        # because it only learns that from a sendall the stalled command never
+        # feeds. Refuse it here rather than deadlock later.
+        raise ValueError(
+            'stderr=subprocess.PIPE is not supported: nothing drains it, so the command deadlocks. '
+            'Use DEVNULL (the default), or pass a file/fd to keep the diagnostics.'
+        )
     argv = list(argv)
     process_env = dict(env) if env is not None else {'PATH': _MINIMAL_PATH}
 
@@ -291,7 +365,12 @@ def splice_tcp(host: str, port: int, *, timeout: float = 10.0) -> Handler:
     return handler
 
 
-def git_url(name: str = 'stream', *, python: str = 'python3') -> str:
+def git_url(
+    name: str = 'stream',
+    *,
+    profile: SandboxProfile | None = None,
+    python: str | None = None,
+) -> str:
     """The ``ext::`` URL a guest uses to reach the stream hatch called ``name``.
 
     git has no unix-socket transport, but `ext::` carries its native protocol over
@@ -302,13 +381,28 @@ def git_url(name: str = 'stream', *, python: str = 'python3') -> str:
     already running untrusted code with the connector bound in — so enable it per
     invocation and leave the host's git config alone:
 
-        git -c protocol.ext.allow=always clone <git_url('repo')> work
+        git -c protocol.ext.allow=always clone <git_url('repo', profile=profile)> work
 
     The URL passes no ``%s``/``%S``/``%G``, so git sends no service or repository
     line: the host fixed both when it bound the hatch.
+
+    Args:
+        name: The hatch to reach.
+        profile: The profile the guest will run under. **Pass this.** The
+            interpreter is taken from ``profile.python``, which is the same place
+            :meth:`Sandbox.run_python` gets it, so the URL cannot disagree with the
+            sandbox it runs in. Without it the default is a bare ``python3``
+            resolved from the guest ``PATH`` — which is wrong for exactly the
+            posture the README recommends, since ``SandboxProfile.with_venv`` sets
+            an absolute venv interpreter and does not touch ``PATH``, and a curated
+            ``rootfs`` need not carry ``python3`` at all. The failure surfaces
+            inside git's helper as ``cannot run python3: No such file or
+            directory``, traceable to this default only if you know it exists.
+        python: An explicit interpreter, overriding ``profile``.
     """
     validate_guest_name(name)
-    return f'ext::{python} {_GUEST_CONNECT} {guest_socket_path(name)}'
+    interpreter = python or (profile.python if profile is not None else 'python3')
+    return f'ext::{interpreter} {GUEST_CONNECT} {guest_socket_path(name)}'
 
 
 # --------------------------------------------------------------------------- #
@@ -393,6 +487,9 @@ class StreamHatch:
         self._srv: socket.socket | None = None
         self._started = False
         self._closing = False
+        self._closed = False
+        self._accepting = False
+        self._bound = False
         # Live connections and the verdict behind each, so close() can tear them
         # down rather than merely stop accepting new ones.
         self._lock = threading.Lock()
@@ -414,13 +511,24 @@ class StreamHatch:
 
     # -- serving lifecycle (mirrors GrpcHatch) ------------------------------- #
     def start(self) -> None:
-        """Start serving (idempotent). Serves until :meth:`close`."""
+        """Start serving. Idempotent while open; raises once :meth:`close` has run.
+
+        ``close()`` is **terminal**, matching `GrpcHatch`, and that is now
+        structural rather than a convention. It used to reset ``_started`` and
+        ``_closing`` while leaving the thread pool permanently shut down, so a
+        restarted hatch looked alive from every angle — socket bound, listening,
+        accept thread running — and served nothing: the first dial's ``submit``
+        raised and every later one parked in the backlog until the guest's run
+        timed out, with no host-side error anywhere.
+        """
+        if self._closed:
+            raise RuntimeError('this StreamHatch is closed; close() is terminal — construct a new one')
         if self._started:
             return
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(self._path)  # a stale socket from a crashed run would EADDRINUSE
+        self._clear_stale_socket()
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(self._path)
+        self._bound = True
         srv.listen(self._backlog)
         # Deterministic perms, not umask-dependent (F9): the guest runs as a
         # non-root uid so must connect; host-side isolation rests on the 0700 dir.
@@ -428,8 +536,47 @@ class StreamHatch:
             os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
         self._srv = srv
         self._started = True
-        self._closing = False
+        self._accepting = True
         threading.Thread(target=self._accept_loop, args=(srv,), daemon=True, name='postern-stream-accept').start()
+
+    def _clear_stale_socket(self) -> None:
+        """Remove a dead socket left where we are about to bind. Nothing else.
+
+        A crashed run leaves its socket file behind and ``bind`` would fail with
+        ``EADDRINUSE``, so this has to happen — but the old version unlinked the
+        path unconditionally, and a caller-supplied ``socket_path`` is somebody
+        else's file until we have bound it. Pointed at a reused or mistyped path
+        (the docstring's own ``/tmp/myservice.sock``), constructing a hatch quietly
+        deleted a live unrelated service's socket, which then kept accepting on an
+        unlinked inode while every new client got ENOENT.
+
+        So: a path under the temp dir this hatch created is ours to clear. Any
+        other path is cleared only if it is an ``AF_UNIX`` socket with nobody
+        listening — the standard liveness probe, and the only case where removing
+        it is unambiguously safe. Anything else is left alone for ``bind`` to
+        refuse loudly.
+        """
+        if self._dir is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self._path)
+            return
+        try:
+            mode = os.stat(self._path).st_mode
+        except OSError:
+            return  # nothing there, or not ours to look at
+        if not stat.S_ISSOCK(mode):
+            return  # a regular file or a directory: let bind() say so
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(_STALE_PROBE_TIMEOUT)
+            probe.connect(self._path)
+        except ConnectionRefusedError:
+            with contextlib.suppress(OSError):
+                os.unlink(self._path)  # nobody home: a crashed run's leftover
+        except OSError:
+            pass  # in doubt (EAGAIN on a full backlog, a timeout): leave it be
+        finally:
+            probe.close()
 
     @contextlib.contextmanager
     def accepting(self) -> Generator[StreamHatch, None, None]:
@@ -447,8 +594,17 @@ class StreamHatch:
                 return
             try:
                 conn, _ = srv.accept()
-            except OSError:
-                return  # socket closed by close(); the slot dies with the loop
+            except OSError as exc:
+                if self._closing or exc.errno in _FATAL_ACCEPT_ERRNOS:
+                    return  # our own close(), or the socket is genuinely unusable
+                # Transient: EMFILE/ENFILE when the *embedding* worker momentarily
+                # runs out of descriptors, ECONNABORTED when a dial dies during the
+                # handshake, EINTR. Retiring the hatch on one of these left it
+                # bound, listening and permanently deaf, with no log line and no
+                # recovery short of close().
+                self._slots.release()
+                time.sleep(_ACCEPT_RETRY_DELAY)
+                continue
             try:
                 self._pool.submit(self._serve_conn, conn)
             except RuntimeError:  # pool shut down mid-accept
@@ -468,7 +624,7 @@ class StreamHatch:
             if isinstance(verdict, Process):
                 _splice_process(conn, verdict, self._grace)
             elif isinstance(verdict, Upstream):
-                _splice_sockets(conn, verdict.sock, self._grace)
+                _splice_sockets(conn, verdict, self._grace)
             else:
                 # A refusal. A raw stream has no way to say "no", so the guest gets
                 # end-of-stream and nothing else — in particular no diagnostic,
@@ -505,6 +661,11 @@ class StreamHatch:
     def close(self) -> None:
         """Stop serving, tear down everything in flight, and drop the socket.
 
+        **Terminal and idempotent**: a closed hatch cannot be restarted (see
+        :meth:`start`), and closing twice is a no-op rather than a second pass that
+        inflates the slot semaphore — two ``close()``es on a ``max_conns=1`` hatch
+        used to leave three slots available.
+
         Every live connection is shut down and every verdict behind it disposed of
         (a subprocess group reaped, an upstream socket closed), because nothing else
         will: ``ThreadPoolExecutor`` workers have been non-daemon since 3.9 and
@@ -513,31 +674,38 @@ class StreamHatch:
         host worker process from exiting at all.
         """
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._closing = True
             live = list(self._live.items())
             self._live.clear()
+            accepting, self._accepting = self._accepting, False
+            bound, self._bound = self._bound, False
         if self._srv is not None:
-            # shutdown() *before* close(): on Linux, closing a listening socket
+            # shutdown() before close(): on Linux, closing a listening socket
             # another thread is blocked in accept() on does not wake that thread,
             # so the accept loop parked there for the life of the process — one
-            # leaked thread and stack per closed hatch, which a worker that builds
-            # a hatch per job leaks its way to a thread limit with.
+            # leaked thread and stack per closed hatch.
             with contextlib.suppress(OSError):
                 self._srv.shutdown(socket.SHUT_RDWR)
             with contextlib.suppress(OSError):
                 self._srv.close()
             self._srv = None
         self._started = False
-        self._slots.release()  # unblock an accept loop parked on the cap
+        if accepting:
+            self._slots.release()  # unblock an accept loop parked on the cap
         for conn, verdict in live:
             # Shut the socket down first: that is what unblocks a pump parked in
             # recv or sendall on it, so its thread can finish and be joined.
-            with contextlib.suppress(OSError):
-                conn.shutdown(socket.SHUT_RDWR)
+            _unblock(conn)
             _dispose(verdict, self._grace)
         self._pool.shutdown(wait=False)
-        with contextlib.suppress(OSError):
-            os.unlink(self._path)
+        if bound:
+            # Only what this hatch actually bound. A caller-supplied socket_path
+            # that we never bound belongs to whoever did.
+            with contextlib.suppress(OSError):
+                os.unlink(self._path)
         if self._dir is not None:
             with contextlib.suppress(OSError):
                 os.rmdir(self._dir)
@@ -548,40 +716,75 @@ class StreamHatch:
 # --------------------------------------------------------------------------- #
 def _dispose(verdict: Process | Upstream | None, grace: float) -> None:
     """Release whatever a verdict was holding. Idempotent, never raises."""
-    if isinstance(verdict, Process):
+    if verdict is not None:
         with contextlib.suppress(Exception):
-            _reap(verdict.proc, grace, verdict.pgid)
-    elif isinstance(verdict, Upstream):
-        with contextlib.suppress(OSError):
-            verdict.sock.shutdown(socket.SHUT_RDWR)
-        with contextlib.suppress(OSError):
-            verdict.sock.close()
+            verdict.dispose(grace)
 
 
-def _finish(guest: socket.socket, grace: float) -> None:
-    """End the guest's stream cleanly: half-close, then drain what it still sends.
+def _readable(sock_or_fd: socket.socket | int, timeout: float) -> bool:
+    """Wait for readability. ``selectors``, never ``select.select``.
+
+    CPython's ``select()`` rejects any descriptor >= ``FD_SETSIZE`` (1024) with
+    ``ValueError`` before it reaches the syscall, and the precondition is the
+    *embedding* worker's descriptor budget, which a library cannot control. A
+    gRPC server with pools above the default soft limit would have silently
+    skipped the forward pump and the drain — no bytes, no diagnostic, no
+    exception. ``poll``/``kqueue`` have no such ceiling.
+    """
+    with contextlib.suppress(OSError, ValueError), selectors.DefaultSelector() as sel:
+        sel.register(sock_or_fd, selectors.EVENT_READ)
+        return bool(sel.select(timeout))
+    return False
+
+
+def _drain(guest: socket.socket, grace: float) -> None:
+    """Discard what the guest is still sending, bounded by ``grace``.
 
     Closing an ``AF_UNIX`` socket while bytes remain unread in its receive queue
     makes the kernel set ``ECONNRESET`` on the *peer* (``unix_release_sock``), so
     the guest's next read fails with a reset instead of reporting end-of-stream —
     and a client such as git reads that as a protocol error, not as "the exchange
     is over". Draining first turns the close into an orderly one. ``grace`` bounds
-    the drain, so a guest that keeps writing forever gives up its slot anyway (at
-    the price of the reset it brought on itself).
+    it, so a guest that keeps writing forever gives up its slot anyway (at the
+    price of the reset it brought on itself).
 
-    Waits with ``select`` rather than a socket timeout: the other direction may
-    still be sending on this same socket from another thread, and ``settimeout``
-    is per-socket, so it would put a deadline on a legitimately slow ``sendall``.
+    Deliberately does **not** touch the write side. This is called from the
+    reverse pump, which shares the socket with a forward pump that may still be
+    delivering the command's response; half-closing here used to break that
+    direction, and a command that closed its stdin before writing (a
+    request/response filter, ``head``, an ``upload-pack`` exiting while the client
+    still writes) delivered *nothing* — 0 of 4 MiB, with the EPIPE swallowed and
+    the guest seeing a clean EOF. Half-closing belongs to the forward pump, which
+    knows the response is over.
+
+    Waits on readability rather than a socket timeout, because ``settimeout`` is
+    per-socket and would put a deadline on the other direction's ``sendall``.
     """
-    with contextlib.suppress(OSError):
-        guest.shutdown(socket.SHUT_WR)
     deadline = time.monotonic() + grace
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, ValueError):
         while (remaining := deadline - time.monotonic()) > 0:
-            if not select.select([guest], [], [], remaining)[0]:
+            if not _readable(guest, remaining):
                 return  # the guest has gone quiet; stop waiting on it
             if not guest.recv(_CHUNK):
                 return
+
+
+def _finish(guest: socket.socket, grace: float) -> None:
+    """Half-close towards the guest, then drain: the end of an exchange we own."""
+    with contextlib.suppress(OSError):
+        guest.shutdown(socket.SHUT_WR)
+    _drain(guest, grace)
+
+
+def _unblock(sock: socket.socket) -> None:
+    """Wake any thread parked in ``recv``/``sendall`` on ``sock``.
+
+    ``close()`` does not do this on Linux — the descriptor goes away but a thread
+    already inside the syscall stays there — which is how reverse-pump threads
+    accumulated without bound while ``max_conns`` reported everything was fine.
+    """
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
 
 
 def _pump_to_socket(src: socket.socket, dst: socket.socket) -> None:
@@ -599,19 +802,33 @@ def _pump_to_socket(src: socket.socket, dst: socket.socket) -> None:
             dst.shutdown(socket.SHUT_WR)
 
 
-def _splice_sockets(guest: socket.socket, upstream: socket.socket, grace: float) -> None:
-    """Relay bytes both ways between two connected sockets until both close."""
-    reverse = threading.Thread(target=_pump_to_socket, args=(guest, upstream), daemon=True)
+def _splice_sockets(guest: socket.socket, verdict: Upstream, grace: float) -> None:
+    """Relay bytes both ways between the guest and an upstream until both are done.
+
+    The upstream's FIN ends the upstream-to-guest direction and nothing else. It
+    means the upstream has nothing more to *say*, not that it has stopped
+    listening, so the guest-to-upstream direction runs to its own EOF rather than
+    being cut off after ``grace``: an ordinary request/response upstream that
+    half-closes after its banner and keeps reading the body used to lose every
+    upload longer than ``grace`` (measured: 640 KiB of a 2.5 MiB upload delivered,
+    then a reset), which also contradicted ``grace``'s documented job of bounding
+    teardown rather than the stream.
+
+    What bounds it is therefore the guest's own EOF plus
+    :meth:`StreamHatch.close`, which shuts every live connection down — the same
+    bound the `Process` path's forward pump has, and the reason the connection
+    stays registered until this function returns.
+    """
+    upstream = verdict.sock
+    reverse = threading.Thread(target=_pump_to_socket, args=(guest, upstream), daemon=True, name=_REVERSE_THREAD)
     reverse.start()
-    _pump_to_socket(upstream, guest)
-    reverse.join(grace)
-    if not reverse.is_alive():
-        # The reverse pump owns the read side, so only drain once it is done — and
-        # only then, or the upstream's early death would leave the guest a reset.
-        _finish(guest, grace)
-    for sock in (guest, upstream):
-        with contextlib.suppress(OSError):
-            sock.close()
+    _pump_to_socket(upstream, guest)  # ends with SHUT_WR towards the guest
+    reverse.join()
+    _drain(guest, grace)
+    _unblock(guest)
+    verdict.dispose(grace)
+    with contextlib.suppress(OSError):
+        guest.close()
 
 
 def _pump_to_stdin(guest: socket.socket, proc: subprocess.Popen[bytes], grace: float) -> None:
@@ -623,8 +840,16 @@ def _pump_to_stdin(guest: socket.socket, proc: subprocess.Popen[bytes], grace: f
     instead of waiting on a peer that is gone.
 
     If the *command* stops reading first, the guest may still be mid-sentence, so
-    this thread — the only reader of the socket — drains it before returning, and
-    the exchange ends in an orderly close rather than a reset (see :func:`_finish`).
+    this thread — the only reader of the socket — drains it before returning, so
+    the eventual close is orderly rather than a reset (see :func:`_drain`). It
+    drains only; half-closing towards the guest belongs to the forward pump, which
+    is the half that knows whether the response is finished.
+
+    ``ValueError`` as well as ``OSError``: if teardown wins the race and closes the
+    ``BufferedWriter`` under this thread, ``write`` raises ``ValueError: write to
+    closed file``, which used to kill the thread with a traceback and skip the
+    drain — handing the guest exactly the ECONNRESET the drain exists to avoid.
+    The ordering below (join before dispose) is the actual fix; this is the belt.
     """
     stdin = proc.stdin
     assert stdin is not None  # noqa: S101 — Process's contract is stdin=PIPE
@@ -637,24 +862,32 @@ def _pump_to_stdin(guest: socket.socket, proc: subprocess.Popen[bytes], grace: f
                 break
             stdin.write(chunk)
             stdin.flush()
-    except OSError:
+    except (OSError, ValueError):
         pass  # the process closed stdin first, or the guest vanished
     finally:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, ValueError):
             stdin.close()
     if drain:
-        _finish(guest, grace)
+        _drain(guest, grace)
 
 
 def _splice_process(guest: socket.socket, verdict: Process, grace: float) -> None:
-    """Splice ``proc``'s stdio to ``guest``, then terminate and reap it.
+    """Splice the command's stdio to ``guest``, then tear the whole thing down.
 
-    The process's stdout drives the exchange: when it closes, the command has said
+    The command's stdout drives the exchange: when it closes, the command has said
     everything it will say, so we half-close towards the guest and tear down. The
     handler's contract is that the command exits on stdin EOF (``git
     upload-pack``/``receive-pack`` do); terminate-then-kill is the backstop for one
     that does not, so a hostile or abandoned connection can never leave a host
     process running once the exchange is over.
+
+    Teardown order is the delicate part, and every step of it is a bug that was
+    here: half-close towards the guest (ending the guest's read side, which is what
+    lets the reverse pump reach EOF), **join the reverse pump before disposing** so
+    it closes the command's stdin itself rather than having it closed under a live
+    ``write``, then — only if that join timed out — unblock the socket and dispose
+    to break a pump parked in ``recv`` or in ``write`` respectively, and close last.
+    ``shutdown`` is what wakes a parked thread; ``close`` does not, on Linux.
     """
     proc = verdict.proc
     stdout = proc.stdout
@@ -663,7 +896,7 @@ def _splice_process(guest: socket.socket, verdict: Process, grace: float) -> Non
     # stream must forward each write as it lands (git's sideband progress, an
     # interactive protocol), and a buffered read would wait to fill a block.
     out_fd = stdout.fileno()
-    reverse = threading.Thread(target=_pump_to_stdin, args=(guest, proc, grace), daemon=True)
+    reverse = threading.Thread(target=_pump_to_stdin, args=(guest, proc, grace), daemon=True, name=_REVERSE_THREAD)
     reverse.start()
     try:
         while True:
@@ -672,8 +905,8 @@ def _splice_process(guest: socket.socket, verdict: Process, grace: float) -> Non
             # that left a background child behind would otherwise park this thread
             # (and its slot, and its subprocess) permanently — even after the guest
             # died. Once the command itself has exited, whatever still holds the
-            # pipe is not part of this stream, and _reap's group kill collects it.
-            if not select.select([out_fd], [], [], grace)[0]:
+            # pipe is not part of this stream, and the group kill collects it.
+            if not _readable(out_fd, _POLL_INTERVAL):
                 if proc.poll() is not None:
                     break
                 continue
@@ -686,11 +919,16 @@ def _splice_process(guest: socket.socket, verdict: Process, grace: float) -> Non
     finally:
         with contextlib.suppress(OSError):
             guest.shutdown(socket.SHUT_WR)
-        _reap(proc, grace, verdict.pgid)
-        # The half-close above is what ends the guest's side, so the reverse pump
-        # reaches EOF on its own and drains the socket cleanly; give it that chance
-        # before closing, since closing under it is what causes a reset.
         reverse.join(grace)
+        if reverse.is_alive():
+            # Parked in recv on the guest, or in write to a command that stopped
+            # reading. shutdown wakes the first; disposing closes stdin and so
+            # wakes the second. Neither is safe to do before the join above.
+            _unblock(guest)
+            verdict.dispose(grace)
+            reverse.join(grace)
+        else:
+            verdict.dispose(grace)
         with contextlib.suppress(OSError):
             guest.close()
 
@@ -718,8 +956,13 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
     Signals the process *group*, not the process: a command that leaves a
     background child behind otherwise strands it, and — because that child
     inherited the stdout pipe — strands the splice waiting for EOF on it too, so
-    the connection's slot never came back even after the guest died. Both leaked
-    for the worker's lifetime and survived :meth:`StreamHatch.close`.
+    the connection's slot never came back even after the guest died.
+
+    The final ``wait()`` is deliberately untimed. With ``grace=0.0`` every
+    ``wait(timeout=grace)`` is a single ``WNOHANG`` poll that necessarily loses the
+    race against the signal it just sent, so the killed child stayed an unreaped
+    zombie — one per connection, which is the leak this function exists to close.
+    It cannot hang: it runs only after ``SIGKILL``, which is not maskable.
     """
     if proc.poll() is None:
         _signal_group(proc, pgid, signal.SIGTERM)
@@ -730,11 +973,14 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
     else:
         # Already exited, but anything it started is still in its group.
         _signal_group(proc, pgid, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=grace)
-    for pipe in (proc.stdin, proc.stdout):
+    with contextlib.suppress(Exception):
+        proc.wait()
+    # stderr as well as the two the splice owns: `splice_subprocess` refuses PIPE,
+    # but a handler may build its own Popen, and an unclosed read end leaks until
+    # the Popen is garbage collected.
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
         if pipe is not None:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, ValueError):
                 pipe.close()
 
 

@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import tempfile
 import typing
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from postern import _seccomp
 from postern._workspace import Workspace
@@ -442,33 +442,46 @@ class Sandbox:
             self._own_workspace = True
 
     def _check_hatches(self) -> None:
-        """Reject a hatch set whose guest sockets or env vars would collide.
+        """Reject a hatch set whose guest sockets, env vars or host paths collide.
 
-        The unnamed hatch is capped at one because it owns a fixed guest path and
-        env var (``POSTERN_HATCH``); a second would silently shadow the first's
-        bind. Named hatches are unlimited but must be distinct, for the same
-        reason.
+        Checked on the *derived* artefacts rather than on names, because every
+        collision that matters is a collision of something a name is turned into,
+        and each one is a silent capability swap in exactly the dimension one
+        socket per resource exists to make unrepresentable:
 
-        Distinct *names* are not enough: the env var is the name upper-cased, so
-        ``repo`` and ``REPO`` bind two different sockets and then collide on
-        ``POSTERN_HATCH_REPO``, where the last one silently wins. A guest reading
-        the documented variable would land on a capability the host meant to
-        expose under the other name — a resource swap in exactly the dimension the
-        one-socket-per-resource design exists to make unrepresentable. So check
-        the derived env var, not the name.
+        * **Guest socket path.** ``GrpcHatch()`` plus ``StreamHatch(name='hatch')``
+          have distinct names and distinct env vars, and both land on
+          ``/run/postern/hatch.sock``: two ``--bind``s onto one target, where the
+          later silently shadows the earlier. A guest dialling ``$POSTERN_HATCH``
+          for the allowlisted gRPC surface would reach the raw stream splice.
+        * **Env var.** ``.upper()`` means ``repo`` and ``REPO`` are two sockets that
+          collide on ``POSTERN_HATCH_REPO``, last one winning.
+        * **Host socket path.** Two hatches given the same ``socket_path`` have
+          distinct names, and then the second ``start()`` rebinds the first's
+          socket, so both guest names alias whichever handler bound last.
+
+        The unnamed hatch is capped at one for the same reason: it owns a fixed
+        guest path and env var, so a second would shadow the first's bind.
         """
         if sum(_guest_name(h) is None for h in self._hatches) > 1:
             raise ValueError('a sandbox takes at most one unnamed hatch (e.g. GrpcHatch); name the rest')
-        names = [name for h in self._hatches if (name := _guest_name(h)) is not None]
-        duplicates = {name for name in names if names.count(name) > 1}
-        if duplicates:
-            raise ValueError(f'hatch names must be unique; repeated: {sorted(duplicates)}')
-        env_vars = [guest_env_var(name) for name in names]
-        clashes = {
-            var: sorted(n for n in names if guest_env_var(n) == var) for var in env_vars if env_vars.count(var) > 1
-        }
+        for label, derive in (
+            ('guest socket paths', lambda h: _hatch_paths(h)[0]),
+            ('guest environment variables', lambda h: _hatch_paths(h)[1]),
+            ('host socket paths', lambda h: os.fspath(h.socket_path)),
+        ):
+            self._reject_duplicates(label, derive)
+
+    def _reject_duplicates(self, label: str, derive: Callable[[Hatch], str]) -> None:
+        """Raise if two configured hatches derive the same value."""
+        seen: dict[str, list[str]] = {}
+        for hatch in self._hatches:
+            name = _guest_name(hatch)
+            seen.setdefault(derive(hatch), []).append('<unnamed>' if name is None else name)
+        clashes = {value: names for value, names in seen.items() if len(names) > 1}
         if clashes:
-            raise ValueError(f'hatch names must differ by more than case; they collide on {clashes}')
+            detail = '; '.join(f'{value!r} <- {sorted(names)}' for value, names in sorted(clashes.items()))
+            raise ValueError(f'hatches must not share {label}: {detail}')
 
     def _hatch_wiring(self) -> tuple[list[str], dict[str, str]]:
         """The bwrap binds and guest env for every configured hatch (no serving yet).

@@ -99,7 +99,10 @@ def test_a_named_hatch_does_not_consume_the_unnamed_slot():
 
 
 def test_duplicate_hatch_names_are_rejected():
-    with pytest.raises(ValueError, match='unique'):
+    # Two hatches of the same name collide on every derived artefact at once; the
+    # guest socket path is the one reported first because it is the one that would
+    # have silently shadowed a bind.
+    with pytest.raises(ValueError, match='must not share guest socket paths'):
         Sandbox(hatch=[_FakeNamedHatch('repo'), _FakeNamedHatch('repo')])
 
 

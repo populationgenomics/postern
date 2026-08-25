@@ -127,3 +127,71 @@ def test_a_bare_entrypoint_without_the_hatch_reaches_nothing():
     )
     sandbox.close()
     assert not result.ok
+
+
+# Guest code: drive the bound-in connector as a *subprocess*, full duplex, with
+# bulk bytes in both directions at once. This is the shape the host-side suite
+# cannot cover — `test_large_payload_streams_without_a_ceiling` passes 8 MiB only
+# because its client is two-threaded, so nothing there exercises
+# `postern._stream_connect` itself, which is what the sandbox actually binds in
+# and what every real guest (git included) goes through. A blocking send inside
+# the connector's selector loop deadlocks the whole cycle here: the connector
+# stops draining its receive side, the host's forward pump fills the socket
+# buffer, the command's stdout pipe fills, the command stops reading stdin, and
+# the host's reverse pump stops reading the socket, so the send never completes.
+_DUPLEX_GUEST = """
+import os, subprocess, sys, threading
+
+payload = %(size)d
+connector = os.environ['POSTERN_CONNECT']
+sock = os.environ['POSTERN_HATCH_DUPLEX']
+
+proc = subprocess.Popen(
+    [sys.executable, connector, sock],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+)
+got = bytearray()
+
+def read():
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        got.extend(chunk)
+
+def write():
+    block = b'Q' * 65536
+    try:
+        for _ in range(payload // 65536):
+            proc.stdin.write(block)
+        proc.stdin.flush()
+        proc.stdin.close()
+    except OSError:
+        pass
+
+reader = threading.Thread(target=read); reader.start()
+writer = threading.Thread(target=write); writer.start()
+writer.join(180); reader.join(180)
+proc.wait(60)
+print('ECHOED', len(got), 'OF', payload)
+"""
+
+
+def test_bulk_bytes_move_both_ways_through_the_bound_in_connector() -> None:
+    """Full-duplex bulk through the real connector, inside the jail.
+
+    ``cat`` rather than git: git's phases are mostly half-duplex, which is exactly
+    why a clone passing says nothing about the full-duplex case.
+    """
+    size = 64 * 1024 * 1024
+    hatch = StreamHatch(splice_subprocess(['cat']), name='duplex', grace=5.0)
+    try:
+        sandbox = Sandbox(SandboxProfile(), hatch=hatch)
+        try:
+            result = sandbox.run_python(_DUPLEX_GUEST % {'size': size}, timeout=300)
+        finally:
+            sandbox.close()
+    finally:
+        hatch.close()
+    assert result.ok, f'guest failed: rc={result.returncode} {result.stderr[-800:]}'
+    assert f'ECHOED {size} OF {size}' in result.stdout, result.stdout[-400:]

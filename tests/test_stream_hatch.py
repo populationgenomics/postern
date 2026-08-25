@@ -311,7 +311,13 @@ def test_stale_socket_from_a_crashed_run_is_replaced():
     # tempfile, not pytest's tmp_path: AF_UNIX paths are capped at ~104 bytes and
     # a per-test tmp_path blows through that on macOS.
     path = pathlib.Path(tempfile.mkdtemp()) / 'hatch.sock'
-    path.write_bytes(b'')  # a leftover file where the socket must go
+    # What a crashed run actually leaves: a bound socket file with nobody
+    # listening. (A *live* socket at a caller-supplied path is deliberately not
+    # replaced — see test_a_caller_supplied_socket_path_is_never_unlinked_unbound.)
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(path))
+    stale.close()
+    assert path.exists()
     hatch = StreamHatch(splice_subprocess(['cat']), socket_path=path)
     with _serving(hatch):
         assert _exchange(hatch, b'ok') == b'ok'
