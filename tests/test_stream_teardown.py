@@ -89,89 +89,95 @@ def test_teardown_reaches_the_whole_process_group(heartbeat: pathlib.Path) -> No
         hatch.close()
 
 
-def test_a_stranded_pipe_does_not_pin_the_slot(heartbeat: pathlib.Path) -> None:
-    """The slot must come back even while something else still holds stdout.
+def test_a_child_left_behind_does_not_hold_the_connection_open(heartbeat: pathlib.Path) -> None:
+    """A child that inherited the guest's socket must not outlive the command.
 
-    Before the group kill and the bounded forward pump, ``max_conns`` connections
-    of this shape killed the hatch permanently: the slots were not returned even
-    once the guest died, because the pump was waiting for an EOF on a pipe a
-    surviving child held open.
+    The hazard moved rather than went away when the host-side pump did. It used to
+    be a *pipe*: a surviving child held the stdout pipe open, so the pump waited for
+    an EOF that could never come and the slot never returned. Now the socket itself
+    is the command's stdio, so a surviving child holds the *guest's connection*
+    open — the guest never reads end-of-stream, and the run hangs until its timeout.
+    Either way the fix is the same: teardown signals the process group.
     """
     hatch = StreamHatch(splice_subprocess(_command(heartbeat)), name='p', max_conns=1, grace=1.0)
     hatch.start()
     try:
-        held = socket.socket(socket.AF_UNIX)
-        held.connect(hatch.socket_path)
-        held.sendall(b'req\n')
+        conn = socket.socket(socket.AF_UNIX)
+        conn.settimeout(25.0)
+        conn.connect(hatch.socket_path)
+        conn.sendall(b'req\n')
         assert _wait_until(lambda: _beating(heartbeat)), 'the command never started its background child'
-        held.shutdown(socket.SHUT_WR)  # deliberately never read, never closed
+        conn.shutdown(socket.SHUT_WR)  # `cat` exits; the background child does not
+        # The guest must reach end-of-stream, which needs every inherited copy of
+        # this socket closed — the child's included.
+        data = b''
+        while chunk := conn.recv(65536):
+            data += chunk
+        assert data == b'req\n'
+        conn.close()
 
+        # And the slot must come back, so the next dial is served.
         probe = socket.socket(socket.AF_UNIX)
         probe.settimeout(25.0)
         probe.connect(hatch.socket_path)
         probe.sendall(b'ping\n')
+        probe.shutdown(socket.SHUT_WR)
         assert probe.recv(64) == b'ping\n', 'the only slot was never returned'
         probe.close()
-        held.close()
     finally:
         hatch.close()
 
 
-def test_a_verdict_is_reaped_even_when_the_splice_raises() -> None:
-    """An exception *after* the handler returned must not abandon its subprocess.
+def test_a_verdict_handed_to_a_closing_hatch_is_still_reaped() -> None:
+    """A verdict the hatch cannot use must still be disposed of, not abandoned.
 
-    ``max_conns`` bounds concurrent splices, not abandoned children, so a guest
-    reconnecting in a loop grew the host's process table without bound. Closing
-    stdout stands in for anything that can raise once the verdict is in hand.
-
-    Observed through ``Popen.poll()`` rather than the heartbeat file the other
-    tests use, because that is exact here and a heartbeat is not: these children
-    are the worker's own, so ``poll()`` reaps them and cannot report a zombie as
-    alive, and an *abandoned* child is precisely one whose ``poll()`` stays
-    ``None`` for ever because nobody ever waits it. Asserting how many were
-    created is what keeps the test from passing vacuously.
-
-    (A handler that raises *before* returning still owns what it started: the
-    hatch never saw the verdict and cannot dispose of it. That is the handler's
-    obligation, and why the batteries do nothing between `Popen` and ``return``.)
+    With no splice function there is far less between the handler returning and the
+    command being waited, but the window is not empty: a handler that returns while
+    `close` is running has its verdict refused by the bookkeeping, and that path has
+    to reap what it declines. ``max_conns`` bounds concurrent commands, not
+    abandoned ones, so a guest reconnecting in a loop would otherwise grow the
+    host's process table without bound.
     """
-    created: list[subprocess.Popen[bytes]] = []
+    started: list[int] = []
+    hatch = StreamHatch(splice_subprocess(['sh', '-c', 'exec sleep 30']), name='r', max_conns=4, grace=0.5)
 
-    def handler(_stream: Stream) -> Process:
-        proc = subprocess.Popen(
-            [sys.executable, '-c', 'import time; time.sleep(300)'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        created.append(proc)
-        verdict = Process(proc)
-        assert proc.stdout is not None
-        proc.stdout.close()  # the splice will raise on fileno()
+    def handler(stream: Stream) -> Process:
+        verdict = splice_subprocess(['sh', '-c', 'exec sleep 30'])(stream)
+        assert isinstance(verdict, Process)
+        started.append(verdict.proc.pid)
+        hatch._closing = True
         return verdict
 
-    hatch = StreamHatch(handler, name='raise', max_conns=2, grace=1.0)
+    hatch._handler = handler
     hatch.start()
     try:
-        for _ in range(4):
-            conn = socket.socket(socket.AF_UNIX)
-            conn.connect(hatch.socket_path)
-            conn.close()
-        assert _wait_until(lambda: len(created) == 4), f'only {len(created)} subprocesses were started'
-        assert _wait_until(lambda: all(p.poll() is not None for p in created)), (
-            'a failing splice abandoned its subprocess'
-        )
+        # One connection: setting _closing also retires the accept loop, which is
+        # exactly the race being simulated, so a second dial would never land.
+        conn = socket.socket(socket.AF_UNIX)
+        conn.connect(hatch.socket_path)
+        conn.close()
+        assert _wait_until(lambda: len(started) == 1), 'the command never started'
+        assert _wait_until(lambda: not _alive(started[0])), f'the closing path abandoned pid {started[0]}'
     finally:
         hatch.close()
-        for proc in created:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                proc.kill()
-                proc.wait(timeout=30)
 
 
-def test_process_requires_both_pipes() -> None:
-    """The `Popen` contract is enforced, not asserted downstream."""
+def _alive(pid: int) -> bool:
+    """Whether ``pid`` is a live (non-zombie) process."""
+    stat = pathlib.Path(f'/proc/{pid}/stat')
+    if pathlib.Path('/proc/self/stat').exists():
+        try:
+            return stat.read_text().rpartition(')')[2].split()[0] != 'Z'
+        except OSError:
+            return False
+    out = subprocess.run(
+        ['ps', '-o', 'state=', '-p', str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return bool(out) and not out.startswith('Z')
+
+
+def test_process_refuses_pipes() -> None:
+    """The connection must be the command's stdio; a pipe would go unread."""
     proc = subprocess.Popen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
         stdin=subprocess.PIPE,
@@ -179,7 +185,7 @@ def test_process_requires_both_pipes() -> None:
         start_new_session=True,
     )
     try:
-        with pytest.raises(ValueError, match='stdin=PIPE and stdout=PIPE'):
+        with pytest.raises(ValueError, match=r'requires the connection as the command'):
             Process(proc)
     finally:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):

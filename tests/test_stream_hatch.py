@@ -26,10 +26,8 @@ from postern.stream import (
     Process,
     Stream,
     StreamHatch,
-    Upstream,
     git_url,
     splice_subprocess,
-    splice_tcp,
 )
 
 _DEADLINE = 10.0
@@ -143,35 +141,6 @@ def test_cwd_is_honoured(tmp_path):
         assert _exchange(hatch, b'') == b'here\n'
 
 
-# -- batteries: an upstream socket ------------------------------------------ #
-def test_upstream_socket_is_spliced_both_ways():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('127.0.0.1', 0))
-    server.listen(1)
-
-    def echo_once():
-        conn, _ = server.accept()
-        while chunk := conn.recv(65536):
-            conn.sendall(chunk.upper())
-        conn.close()
-
-    threading.Thread(target=echo_once, daemon=True).start()
-    host, port = server.getsockname()
-    with _serving(StreamHatch(splice_tcp(host, port))) as hatch:
-        assert _exchange(hatch, b'shout') == b'SHOUT'
-    server.close()
-
-
-def test_splice_tcp_refusal_is_just_a_closed_connection():
-    # A raw stream has no way to say "no"; a failed dial is EOF and nothing else.
-    dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    dead.bind(('127.0.0.1', 0))
-    port = dead.getsockname()[1]
-    dead.close()  # nothing listens there now
-    with _serving(StreamHatch(splice_tcp('127.0.0.1', port, timeout=1))) as hatch:
-        assert _exchange(hatch, b'anyone home') == b''
-
-
 # -- core: the handler is the policy ---------------------------------------- #
 def test_handler_refusal_closes_with_no_bytes():
     with _serving(StreamHatch(lambda _stream: None)) as hatch:
@@ -258,10 +227,13 @@ def test_guest_reset_mid_splice_reaps_the_subprocess_and_frees_the_slot():
 
 
 def test_subprocess_that_ignores_stdin_eof_is_terminated_at_teardown():
-    # The handler's contract is that the command exits on stdin EOF; this one
-    # closes stdout and then sleeps, so terminate-then-kill is what ends it.
+    # The handler's contract is that the command exits on stdin EOF. One that does
+    # not owns its connection for as long as it runs — with the socket as its stdio
+    # there is no separate signal to notice, which is deliberate: the old pump
+    # guessed the exchange was over when stdout closed, and guessing wrong is what
+    # truncated responses. So `close()` is what ends it, via terminate-then-kill.
     procs = []
-    base = splice_subprocess(['sh', '-c', 'exec >/dev/null; exec sleep 60'])
+    base = splice_subprocess(['sh', '-c', 'exec sleep 60'])
 
     def handler(stream):
         verdict = base(stream)
@@ -269,12 +241,20 @@ def test_subprocess_that_ignores_stdin_eof_is_terminated_at_teardown():
         procs.append(verdict.proc)
         return verdict
 
-    with _serving(StreamHatch(handler, grace=1.0)) as hatch:
-        # The guest is EOF'd as soon as the command's stdout closes; the reap
-        # follows, so poll for it rather than racing the teardown.
-        assert _exchange(hatch, b'') == b''
+    hatch = StreamHatch(handler, grace=1.0)
+    hatch.start()
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(_DEADLINE)
+    conn.connect(hatch.socket_path)
+    try:
+        assert _until(lambda: bool(procs))
+        assert procs[0].poll() is None  # still running: nothing has ended it
+        hatch.close()
         assert _until(lambda: procs[0].poll() is not None)
-    assert procs[0].returncode != 0  # signalled, not a clean exit
+        assert procs[0].returncode != 0  # signalled, not a clean exit
+    finally:
+        conn.close()
+        hatch.close()
 
 
 # -- lifecycle -------------------------------------------------------------- #
@@ -471,13 +451,14 @@ def test_connector_pumps_stdio_to_the_hatch():
 
 # -- verdict types ----------------------------------------------------------- #
 def test_verdicts_are_plain_data():
-    proc = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    # The connection is the command's stdio, so a verdict holds no pipes at all.
+    left, right = socket.socketpair()
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'pass'], stdin=right.fileno(), stdout=right.fileno(), start_new_session=True
+    )
     try:
         assert Process(proc).proc is proc
     finally:
-        proc.communicate(timeout=30)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        assert Upstream(sock).sock is sock
-    finally:
-        sock.close()
+        proc.wait(timeout=30)
+        left.close()
+        right.close()

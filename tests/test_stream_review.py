@@ -10,7 +10,6 @@ import contextlib
 import errno
 import os
 import pathlib
-import signal
 import socket
 import subprocess
 import sys
@@ -24,13 +23,11 @@ import pytest
 from postern import Sandbox, SandboxProfile
 from postern._sandbox import GUEST_CONNECT
 from postern.stream import (
-    _REVERSE_THREAD,
     Process,
     Stream,
     StreamHatch,
     git_url,
     splice_subprocess,
-    splice_tcp,
 )
 
 _MIB = 1 << 20
@@ -83,12 +80,15 @@ def _dial(hatch: StreamHatch, timeout: float = 20.0) -> socket.socket:
 # Teardown ownership                                                           #
 # --------------------------------------------------------------------------- #
 def test_response_survives_a_command_that_closes_stdin_first(tmp_path: Path) -> None:
-    """The reverse pump must not half-close the direction the response uses.
+    """A command that closes stdin and then writes must still deliver everything.
 
-    A command that closes stdin and then writes (a request/response filter,
-    ``head``, an ``upload-pack`` exiting while the client still writes) used to
-    deliver *nothing*: the reverse pump's drain began with ``shutdown(SHUT_WR)``,
-    the forward pump's next ``sendall`` took EPIPE, and the guest saw a clean EOF.
+    This shape — a request/response filter, ``head``, an ``upload-pack`` exiting
+    while the client still writes — used to deliver *nothing*, 0 of 4 MiB: the
+    reverse pump's drain began with ``shutdown(SHUT_WR)``, the forward pump's next
+    ``sendall`` took EPIPE, and the guest saw a clean EOF. With the socket as the
+    command's stdio there is no pump to get this wrong, so the test guards a
+    property rather than demonstrating a fix — it cannot fail on the current design
+    without the pump coming back.
     """
     big = tmp_path / 'big'
     big.write_bytes(b'A' * (4 * _MIB))
@@ -117,143 +117,39 @@ def test_response_survives_a_command_that_closes_stdin_first(tmp_path: Path) -> 
     assert got == 4 * _MIB, f'guest received {got} of {4 * _MIB} bytes'
 
 
-def test_reverse_pump_threads_do_not_leak() -> None:
-    """A guest that holds its write side open in silence must not park a thread.
+def test_no_signal_is_ever_sent_to_an_already_reaped_group() -> None:
+    """A group may only be signalled while we still hold the leader's pid.
 
-    ``close()`` does not wake a thread already inside ``recv`` on Linux; only
-    ``shutdown`` does. Without it every such connection left a reverse pump parked
-    for ever, and ``max_conns`` bounded none of it because the slot was released —
-    the same unbounded growth the process reaping exists to prevent.
+    ``poll()``/``wait()`` reap, reaping releases the leader's pid, and a process
+    group id is valid only while that pid is allocated — so a signal sent afterwards
+    can land on a recycled pid, and `splice_subprocess` mints a session leader per
+    connection, which makes the recycled pid plausibly another connection's command.
+
+    The group *is* signalled on the normal path, deliberately: a command that exits
+    having left a child behind leaves that child holding the guest's socket, so
+    collecting the group is what lets the guest reach end-of-stream. What must never
+    happen is signalling after the reap, and the observation here is exactly that —
+    the leader's ``returncode`` at the moment of each ``killpg``.
     """
-
-    def parked() -> int:
-        # Both spellings: the pumps are named now, and were bare ``Thread-N``
-        # before, so this counts the leak either way rather than passing vacuously
-        # against a revision that never set the name.
-        return len(
-            [
-                t
-                for t in threading.enumerate()
-                if t.is_alive() and (t.name == _REVERSE_THREAD or t.name.startswith('Thread-'))
-            ]
-        )
-
-    argv = ['sh', '-c', 'echo hi']  # says its piece, exits, never reads stdin
-    with _serving(StreamHatch(splice_subprocess(argv), name='l', max_conns=4, grace=0.5)) as hatch:
-        held = []
-        for _ in range(12):
-            conn = _dial(hatch)
-            # Read to EOF so the forward direction is over, then hold the socket
-            # open and silent: the reverse pump has nothing to end it.
-            with contextlib.suppress(OSError):
-                while conn.recv(65536):
-                    pass
-            held.append(conn)
-        assert _wait_until(lambda: parked() == 0), f'{parked()} reverse pumps still parked after 12 connections'
-        for conn in held:
-            conn.close()
-
-
-def test_upstream_half_close_does_not_cap_the_guest_upload() -> None:
-    """An upstream FIN must not turn ``grace`` into a deadline on the upload."""
-    payload = 2560 * 1024
-    received: list[int] = []
-    ready = threading.Event()
-
-    srv = socket.socket()
-    srv.bind(('127.0.0.1', 0))
-    srv.listen(4)
-    port = srv.getsockname()[1]
-
-    def upstream() -> None:
-        sock, _ = srv.accept()
-        sock.sendall(b'BANNER\n')
-        sock.shutdown(socket.SHUT_WR)  # nothing more to say; still listening
-        total = 0
-        ready.set()
-        try:
-            while chunk := sock.recv(65536):
-                total += len(chunk)
-        except OSError:
-            pass
-        received.append(total)
-        sock.close()
-
-    threading.Thread(target=upstream, daemon=True).start()
-    try:
-        with _serving(StreamHatch(splice_tcp('127.0.0.1', port), name='u', grace=2.0)) as hatch:
-            conn = _dial(hatch, timeout=60)
-            assert conn.recv(64) == b'BANNER\n'
-            ready.wait(10)
-            sent = 0
-            buf = b'z' * 65536
-            while sent < payload:
-                # Slower than `grace`, which is the point: the old code closed the
-                # socket under the still-running pump after grace expired.
-                conn.sendall(buf)
-                sent += len(buf)
-                time.sleep(0.08)
-            conn.shutdown(socket.SHUT_WR)
-            assert _wait_until(lambda: bool(received), timeout=30)
-            conn.close()
-    finally:
-        srv.close()
-    assert received, 'the upstream never finished reading'
-    assert received[0] == sent, f'upstream got {received[0]} of {sent} bytes'
-
-
-def test_teardown_does_not_raise_valueerror_in_the_reverse_pump() -> None:
-    """Join before dispose: stdin must not be closed under a live reverse pump.
-
-    The window, per Leo's recipe: connect, outlast the grace, send one byte. The
-    command closes *stdout* so the forward pump ends and teardown begins; teardown
-    closed the command's ``BufferedWriter`` while the reverse pump was still parked
-    in ``recv``; the next byte from the guest then hit ``write`` on a closed file.
-    ``ValueError`` is not an ``OSError``, so the thread died with a traceback and
-    skipped its drain — handing the guest the very ECONNRESET the drain prevents.
-
-    (Sending *continuously* instead would park the pump in ``write`` and take the
-    EPIPE path, which was always handled. The bug needs an idle pump.)
-    """
-    seen: list[BaseException] = []
-    hook = threading.excepthook
-
-    def record(args) -> None:
-        if args.exc_value is not None:
-            seen.append(args.exc_value)
-
-    threading.excepthook = record
-    try:
-        argv = ['sh', '-c', 'echo ack; exec 1>&-; exec sleep 30']
-        with _serving(StreamHatch(splice_subprocess(argv), name='v', max_conns=4, grace=2.0)) as hatch:
-            for _ in range(10):
-                conn = _dial(hatch, timeout=10)
-                with contextlib.suppress(OSError):
-                    conn.recv(64)  # the ack; stdout is now closed, teardown starts
-                time.sleep(0.6)  # let the reap close the command's stdin
-                with contextlib.suppress(OSError):
-                    conn.sendall(b'x')  # wakes a pump parked in recv
-                time.sleep(0.2)
-                conn.close()
-            time.sleep(2.0)
-    finally:
-        threading.excepthook = hook
-    value_errors = [e for e in seen if isinstance(e, ValueError)]
-    assert not value_errors, f'{len(value_errors)} uncaught ValueError(s) in teardown: {value_errors[:3]}'
-
-
-def test_a_process_verdict_is_reaped_exactly_once() -> None:
-    """Two reap passes SIGKILLed a pgid whose leader had already been waited."""
-    signalled: list[tuple[int, int]] = []
+    seen: list[tuple[int, int, int | None]] = []
+    procs: list[subprocess.Popen[bytes]] = []
     real_killpg = os.killpg
 
     def spy(pgid: int, sig: int) -> None:
-        signalled.append((pgid, sig))
+        seen.append((pgid, sig, procs[0].returncode if procs else None))
         real_killpg(pgid, sig)
+
+    base = splice_subprocess(['cat'])
+
+    def handler(stream: Stream) -> Process:
+        verdict = base(stream)
+        assert isinstance(verdict, Process)
+        procs.append(verdict.proc)
+        return verdict
 
     os.killpg = spy
     try:
-        with _serving(StreamHatch(splice_subprocess(['cat']), name='k', grace=1.0)) as hatch:
+        with _serving(StreamHatch(handler, name='k', grace=1.0)) as hatch:
             conn = _dial(hatch)
             conn.sendall(b'ping\n')
             assert conn.recv(64) == b'ping\n'
@@ -262,11 +158,11 @@ def test_a_process_verdict_is_reaped_exactly_once() -> None:
                 while conn.recv(65536):
                     pass
             conn.close()
-            time.sleep(1.0)
+            assert _wait_until(lambda: bool(seen), timeout=15), 'the group was never collected'
     finally:
         os.killpg = real_killpg
-    kills = [s for s in signalled if s[1] == signal.SIGKILL]
-    assert not kills, f'SIGKILL issued after the group was reaped: {signalled}'
+    after_reap = [entry for entry in seen if entry[2] is not None]
+    assert not after_reap, f'signal sent after the leader was reaped: {after_reap}'
 
 
 # --------------------------------------------------------------------------- #
@@ -362,7 +258,7 @@ def test_process_contract_rejection_reaps_the_group() -> None:
         stdout=subprocess.DEVNULL,
         start_new_session=True,
     )
-    with pytest.raises(ValueError, match='stdin=PIPE and stdout=PIPE'):
+    with pytest.raises(ValueError, match=r'requires the connection as the command'):
         Process(proc)
     pid = proc.pid
     assert _wait_until(lambda: not _is_zombie(pid), timeout=15), f'rejected Popen left a zombie: {pid}'
@@ -552,3 +448,41 @@ def test_connector_reports_a_failure_rather_than_exiting_zero(tmp_path: Path) ->
     )
     assert done.returncode != 0
     assert b'cannot reach the hatch' in done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Disposition: what the kernel says, now that nothing copies                   #
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(sys.platform != 'linux', reason='AF_UNIX close only resets the peer on Linux')
+def test_the_kernel_propagates_the_commands_disposition() -> None:
+    """EOF when the command finished, a reset when it died mid-request.
+
+    This is the distinction a host-side pump destroyed by draining unconditionally,
+    and the reason the `Process` path deliberately does not drain: for a stream with
+    no framing of its own it is the only failure signal there is.
+    """
+
+    def outcome(argv: list[str], payload: bytes, *, half_close: bool) -> str:
+        with _serving(StreamHatch(splice_subprocess(argv), name='d', grace=1.0)) as hatch:
+            conn = _dial(hatch)
+            with contextlib.suppress(OSError):
+                conn.sendall(payload)
+                if half_close:
+                    conn.shutdown(socket.SHUT_WR)
+            try:
+                while conn.recv(65536):
+                    pass
+            except ConnectionResetError:
+                return 'reset'
+            except OSError:
+                return 'error'
+            finally:
+                conn.close()
+            return 'eof'
+
+    assert outcome(['sh', '-c', 'cat >/dev/null; echo done'], b'x' * 4096, half_close=True) == 'eof'
+    # A megabyte the command never reads: the remainder is still queued when its
+    # last descriptor closes, which is precisely what the guest needs to be told.
+    assert outcome(['sh', '-c', 'echo partial; exit 0'], b'x' * (1 << 20), half_close=False) == 'reset'
+    died = ['sh', '-c', 'head -c 100 >/dev/null; echo hi; exit 1']
+    assert outcome(died, b'x' * (1 << 20), half_close=False) == 'reset'

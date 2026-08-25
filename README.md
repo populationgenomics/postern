@@ -169,9 +169,14 @@ ways, and the first is the reason the hatch exists.
   nothing parses anything. The service is fixed too — a hatch bound to `git
   upload-pack` cannot be talked into `receive-pack`, so read-only is read-only by
   construction rather than by a rule about verbs.
-- *No body buffering.* A proxy that lets a handler inspect request bodies has to
-  buffer them, and so has to cap them. A raw stream streams: no ceiling, no cap
-  to tune.
+- *No body buffering, and no copying at all.* A proxy that lets a handler inspect
+  request bodies has to buffer them, and so has to cap them. Here the socket **is**
+  the command's stdin and stdout, so the kernel moves every byte and postern is not
+  on the data path: no ceiling, no cap, no pump. It also means the kernel
+  propagates the command's disposition for free — a command that consumed its
+  input and exited gives the guest end-of-stream, one that died mid-request gives
+  it a reset, which for a stream with no framing of its own is the only failure
+  signal there is.
 - *No protocol translation.* The host side is "run a subprocess, splice its
   stdio", not a bridge that decodes framing and re-emits headers to reach the
   same subprocess.
@@ -225,7 +230,7 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 - `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch. `hatch` is opt-in and takes one hatch or a sequence — a `GrpcHatch` (typed methods), any number of named `StreamHatch`es (raw streams), both, or none (no channel opened); at most one *unnamed* hatch, since it owns a fixed guest env var.
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` opts bwrap into running at a non-root real uid (defense in depth for the sysctl surface; the deploy must make bind sources reachable by it). `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
-- `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>` (so `run()` works, not just `run_python()`). `handler(stream) -> Process | Upstream | None`: splice a subprocess's stdio, splice a connected socket, or refuse. Batteries: `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)`, `splice_tcp(host, port)`; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`. `close()` is terminal, as `GrpcHatch`'s is. `splice_subprocess` refuses `stderr=PIPE` (nothing drains it, so the command deadlocks). Named, so several coexist — one socket per resource. Stdlib-only. `with hatch.accepting(): ...`.
+- `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>` (so `run()` works, not just `run_python()`). `handler(stream) -> Process | None`: hand the connection to a subprocess as its stdio, or refuse. Battery: `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)`; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`. `close()` is terminal, as `GrpcHatch`'s is. `splice_subprocess` refuses `stderr=PIPE` (nothing drains it, so the command deadlocks). Named, so several coexist — one socket per resource. Stdlib-only. `with hatch.accepting(): ...`.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).
 - `available()` — bubblewrap present?
 
