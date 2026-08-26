@@ -10,17 +10,18 @@ guest-planted reference in the host's own namespace and privileges and becomes a
 confused deputy (exfiltrating host data, or writing through the link to a host
 path outside the workspace).
 
-`Workspace` is the postern-owned host-side accessor that makes that impossible
-*by construction*. It is a confined root: a capability to one directory subtree
-where every path operation resolves one component at a time with ``O_NOFOLLOW``
-relative to a directory fd, so no symlink, ``..`` or absolute path a guest
-planted is ever followed out of the tree, and no path string is re-resolved
-(TOCTOU-resistant). It never hands back a dereferenceable host path — that is
-what keeps it safe. The model is Go 1.24's ``os.Root`` and Rust's
-``cap-std::Dir``; the kernel primitive underneath is ``openat2(RESOLVE_BENEATH)``.
+`Workspace` is the host-side accessor that makes that impossible by construction.
+It is a confined root: a capability to one directory subtree where every path
+operation resolves one component at a time with ``O_NOFOLLOW`` relative to a
+directory fd, so no symlink, ``..`` or absolute path a guest planted is ever
+followed out of the tree, and no path string is re-resolved (TOCTOU-resistant).
+It never hands back a dereferenceable host path. The model is Go 1.24's
+``os.Root`` and Rust's ``cap-std::Dir``, built here on ``os.open`` with a
+``dir_fd`` rather than on ``openat2(RESOLVE_BENEATH)``, which keeps it portable to
+macOS and to kernels without ``openat2``.
 
 `WorkspacePath` is a `pathlib`-like facade over the confined root (``ws / 'a/b'``,
-``.iterdir()``, ``.open()``, ``.read_bytes()``, ``.walk()``) for ergonomic use.
+``.iterdir()``, ``.open()``, ``.read_bytes()``, ``.walk()``).
 
 Consumers get "read / pack / restore this workspace safely" as an API:
 
@@ -53,9 +54,8 @@ if typing.TYPE_CHECKING:
 
     from typing_extensions import Self
 
-# The anchor is host-trusted, so following a symlinked *prefix* to reach it is
-# fine; every component *below* the anchor is opened O_NOFOLLOW so a guest-planted
-# link is never traversed.
+# The anchor is host-trusted, so a symlinked prefix reaching it is fine; every
+# component below it is opened O_NOFOLLOW.
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
 _ANCHOR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC
 _DIR_FLAGS = _ANCHOR_FLAGS | os.O_NOFOLLOW
@@ -75,10 +75,9 @@ class WorkspaceReport:
     """What a pack/restore neutralized rather than following.
 
     ``skipped`` is a list of ``(workspace-relative path, reason)`` — symlinks,
-    hardlinks, FIFOs, sockets, device nodes, or escaping member names that were
-    dropped instead of dereferenced. An empty report means the whole tree was
-    regular files and directories (``ok`` is ``True``); a non-empty one is the
-    audit trail of what the guest planted (never silently truncated).
+    hardlinks, FIFOs, sockets, device nodes, unreadable entries, or escaping member
+    names that were dropped instead of dereferenced. It is never truncated, so
+    ``ok`` (an empty list) means the whole tree was regular files and directories.
     """
 
     skipped: list[tuple[str, str]] = dataclasses.field(default_factory=list)
@@ -94,9 +93,14 @@ class WorkspaceReport:
 def _split(rel: object) -> tuple[str, ...]:
     """Normalize a caller path into safe workspace-relative components.
 
-    Accepts a `WorkspacePath`, a string, or an ``os.PathLike``. Rejects absolute
-    paths and any ``..`` component, so a virtual path can never escape the anchor;
-    ``.`` and empty components are dropped.
+    Args:
+        rel: A `WorkspacePath`, a string, or an ``os.PathLike``.
+
+    Returns:
+        The path's components, with ``.`` and empty ones dropped.
+
+    Raises:
+        WorkspaceError: On an absolute path or any ``..`` component.
     """
     if isinstance(rel, WorkspacePath):
         return rel._parts
@@ -138,17 +142,15 @@ class Workspace:
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
         self._root = Path(root)
-        # The anchor is trusted; a symlinked prefix to it is fine, so no
-        # O_NOFOLLOW here. Every descent below uses _DIR_FLAGS (O_NOFOLLOW).
         self._fd: int | None = os.open(self._root, _ANCHOR_FLAGS)
 
     @property
     def host_root(self) -> Path:
-        """The anchor directory on the host (for logging only — not any child).
+        """The anchor directory on the host: the trusted path the caller handed in.
 
-        This is the trusted path the caller handed in. Child paths are never
-        exposed as host paths (`WorkspacePath` has no ``__fspath__``): that is the
-        whole point — a dereferenceable child path would re-open the escape.
+        Child paths are never exposed this way — `WorkspacePath` raises from
+        ``__fspath__`` — because a dereferenceable child path would re-open the
+        escape this class exists to close.
         """
         return self._root
 
@@ -164,8 +166,8 @@ class Workspace:
         self.close()
 
     def __del__(self) -> None:
-        # Best-effort release if the caller never used the context manager /
-        # close(); at interpreter teardown os may already be gone.
+        # Best-effort if the caller never closed: at interpreter teardown `os` may
+        # already be gone.
         with contextlib.suppress(Exception):
             self.close()
 
@@ -180,8 +182,10 @@ class Workspace:
         """Open the directory at ``parts`` confined beneath the anchor.
 
         Each component is opened ``O_DIRECTORY | O_NOFOLLOW`` relative to its
-        parent's fd, so a symlinked component (e.g. ``a -> /etc``) fails rather
-        than being traversed. Caller owns the returned fd.
+        parent's fd, so a symlinked component fails rather than being traversed.
+
+        Returns:
+            A directory fd the caller owns and must close.
         """
         fd = os.dup(self._anchor())
         try:
@@ -215,8 +219,7 @@ class Workspace:
 
         ``O_NOFOLLOW`` makes a final symlink component fail (``ELOOP``);
         ``O_NONBLOCK`` keeps a FIFO from blocking the open, and the ``S_ISREG``
-        check then rejects any non-regular target (which the guest, holding no
-        ``CAP_MKNOD``, cannot create as a device anyway).
+        check then rejects any non-regular target.
         """
         if not parts:
             raise IsADirectoryError('workspace root is a directory')
@@ -232,15 +235,14 @@ class Workspace:
         except BaseException:
             os.close(fd)
             raise
-        # Clear O_NONBLOCK for ordinary blocking reads (harmless on a regular file).
-        os.set_blocking(fd, True)
+        os.set_blocking(fd, True)  # undo the O_NONBLOCK used to survive opening a FIFO
         return fd
 
     def _open_write_fd(self, parts: tuple[str, ...]) -> int:
         """Create/truncate a regular file for writing, never through a symlink.
 
         ``O_NOFOLLOW`` makes writing through an existing symlink at the final
-        component fail (``ELOOP``) — the restore-direction guarantee.
+        component fail (``ELOOP``).
         """
         if not parts:
             raise IsADirectoryError('workspace root is a directory')
@@ -306,27 +308,33 @@ class Workspace:
         """Write the workspace tree to ``fileobj`` as a tar of regular files+dirs.
 
         Only regular files and directories are archived, so the result is
-        reference-closed — any consumer can extract it anywhere without following
-        a reference out of the tree. Entries that are not are never dereferenced:
-        symlinks, FIFOs, sockets, device nodes, and any *hardlink whose link count
-        is not fully accounted for within the workspace* (its inode is also named
-        outside the tree, so its content is shared out of bounds — the one case a
-        confined open cannot tell from an ordinary file) are neutralized. With
-        ``on_unsafe='skip'`` (default) they are omitted and recorded in the
-        returned :class:`WorkspaceReport`; with ``'error'`` the first raises
-        :class:`WorkspaceError`. Nothing is dropped silently — the report is the
-        audit trail.
+        reference-closed: any consumer can extract it anywhere without following a
+        reference out of the tree. Symlinks, FIFOs, sockets and device nodes are
+        neutralized rather than dereferenced, and so is a hardlink whose link count
+        is not fully accounted for inside the workspace — its inode is named
+        outside the tree too, the one case a confined open cannot distinguish from
+        an ordinary file.
 
-        ``exclude`` is called with each entry's workspace-relative POSIX path; if
-        it returns true the entry is skipped and, for a directory, not descended
-        (e.g. to checkpoint everything but a separately-persisted ``document.md``
-        and a re-downloaded ``skills/``). ``compression`` is a ``tarfile`` stream
-        suffix (``'gz'``, ``'bz2'``, ``'xz'``) or ``''``.
+        Args:
+            fileobj: Binary stream the archive is written to.
+            on_unsafe: ``'skip'`` records a neutralized entry in the report;
+                ``'error'`` raises on the first.
+            compression: A ``tarfile`` stream suffix (``'gz'``, ``'bz2'``,
+                ``'xz'``) or ``''``.
+            exclude: Called with each entry's workspace-relative POSIX path; a
+                true result skips the entry and, for a directory, its subtree.
+
+        Returns:
+            The :class:`WorkspaceReport` audit trail. Nothing is dropped silently.
+
+        Raises:
+            WorkspaceError: On the first neutralized entry when
+                ``on_unsafe='error'``.
         """
         report = WorkspaceReport()
         entries = [(parts, self._lstat(parts)) for parts in self._descendants(())]
-        # Count how many names *inside* the workspace point at each multiply-
-        # linked inode; if fewer than st_nlink, some links lie outside the tree.
+        # Names inside the workspace per multiply-linked inode; fewer than
+        # st_nlink means some links lie outside the tree.
         inside: dict[tuple[int, int], int] = {}
         for _parts, st in entries:
             if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
@@ -366,14 +374,13 @@ class Workspace:
         try:
             fd = self._open_read_fd(parts)
         except (OSError, WorkspaceError):
-            # Raced: the entry changed type or vanished since the walk. O_NOFOLLOW
-            # means nothing was followed out — this is a robustness skip, never an
-            # escape — so record it rather than aborting the whole pack.
+            # The entry changed type or vanished since the walk. O_NOFOLLOW means
+            # nothing was followed out, so record it and keep going.
             self._flag(report, name, 'unreadable', on_unsafe)
             return
         with os.fdopen(fd, 'rb') as src:
-            # Size from the *open* fd, not the earlier lstat, so a concurrent
-            # truncation can't desync the tar header from the bytes written.
+            # Size from the open fd, not the earlier lstat: a concurrent truncation
+            # would otherwise desync the tar header from the bytes written.
             tar.addfile(self._tarinfo(name, os.fstat(fd), tarfile.REGTYPE), src)
 
     @staticmethod
@@ -383,8 +390,7 @@ class Workspace:
         info.mode = stat.S_IMODE(st.st_mode) & ~(stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
         info.mtime = int(st.st_mtime)
         info.size = st.st_size if kind == tarfile.REGTYPE else 0
-        # The guest owns these files as uid 65534; normalize identity out of the
-        # artifact so it restores cleanly under any host uid.
+        # Normalize the guest's uid out so the archive restores under any host uid.
         info.uid = info.gid = 0
         info.uname = info.gname = ''
         return info
@@ -400,18 +406,24 @@ class Workspace:
         """Extract a tar into the workspace through the confined root.
 
         Only regular-file and directory members are created, each via an
-        ``O_NOFOLLOW`` confined open so extraction never writes *through* a
-        symlink (in-tree or planted). Members with absolute/``..`` names, or that
-        are symlinks/hardlinks/specials, are neutralized: skipped and reported
-        (``on_unsafe='skip'``) or raised (``'error'``). This is stronger than a
-        stock ``extractall`` even with :func:`reference_closed_filter`: the filter
-        vets members but stock extraction still writes through a pre-existing
-        symlink in the destination, whereas this writes through the confined root.
+        ``O_NOFOLLOW`` confined open, so extraction never writes *through* a
+        symlink — pre-existing or planted. That is stronger than a stock
+        ``extractall`` even with :func:`reference_closed_filter`, which vets members
+        but leaves the writes to ``tarfile``.
 
-        ``max_entries`` / ``max_bytes`` bound a decompression bomb from an
-        untrusted archive — extraction raises :class:`WorkspaceError` once either
-        is exceeded. Both default to ``None`` (no limit); a consumer restoring
-        from a store it does not fully trust should set them.
+        Args:
+            fileobj: Binary stream the archive is read from.
+            on_unsafe: ``'skip'`` records a neutralized member in the report;
+                ``'error'`` raises on the first.
+            max_entries: Member-count ceiling, or ``None`` for no limit.
+            max_bytes: Extracted-byte ceiling, or ``None`` for no limit.
+
+        Returns:
+            The :class:`WorkspaceReport` audit trail.
+
+        Raises:
+            WorkspaceError: Once ``max_entries`` or ``max_bytes`` is exceeded, and
+                on the first neutralized member when ``on_unsafe='error'``.
         """
         report = WorkspaceReport()
         written = [0]
@@ -472,9 +484,9 @@ class Workspace:
 class WorkspacePath:
     """A `pathlib`-like handle to one path within a `Workspace`, confined.
 
-    Join with ``/`` (``ws / 'sub' / 'file'``); read/write and traverse with the
-    familiar methods. It deliberately has **no** ``__fspath__``: it is a confined
-    handle, not a host path, so it cannot be handed to ``open()`` to escape.
+    Join with ``/`` (``ws / 'sub' / 'file'``); read, write and traverse with the
+    familiar methods. ``__fspath__`` raises rather than returning a path, so the
+    handle cannot be passed to ``open()`` to escape the confined root.
     """
 
     workspace: Workspace
@@ -500,12 +512,10 @@ class WorkspacePath:
         return self.workspace._lstat(self._parts)
 
     def exists(self) -> bool:
-        """Whether the path exists (a dangling/valid symlink counts — lexists).
+        """Whether the path exists, counting a dangling symlink (``lexists``).
 
-        Returns ``False`` — not raises — when an intermediate component is a
-        symlink or non-directory (``OSError``: ELOOP/ENOTDIR), so the predicate is
-        total: a path *behind* a guest-planted symlinked directory reads as absent
-        rather than throwing.
+        Total rather than raising: a path behind a guest-planted symlinked
+        directory (``ELOOP``/``ENOTDIR``) reads as absent.
         """
         try:
             self.workspace._lstat(self._parts)
@@ -577,21 +587,28 @@ class WorkspacePath:
 def reference_closed_filter(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo:
     """A ``TarFile.extractall(filter=...)`` hook that vets members for closure.
 
-    Refuses (raises :class:`WorkspaceError`, aborting extraction) any member with
-    an absolute or ``..`` name, and any symlink, hardlink, FIFO, socket or device
-    member, so the *archive* cannot introduce an out-of-tree reference or create
-    one on disk. Setuid/setgid/sticky bits are stripped.
+    Setuid/setgid/sticky bits are stripped, so the *archive* cannot introduce an
+    out-of-tree reference or create one on disk.
 
-    Important scope: a filter only vets members — stock ``extractall`` still does
-    the writes and will follow a symlink that *already exists in the destination*.
-    So this is safe only when extracting into a fresh, host-controlled directory;
-    it does **not** make extraction into a workspace a guest may have touched
-    safe. For that — and for the strongest guarantee generally — use
-    :meth:`Workspace.restore_tar`, which writes through the confined root (never
-    through an in-tree symlink, pre-existing or planted) and reports what it
-    neutralized rather than aborting.
+    Scope: a filter only vets members, and stock ``extractall`` still does the
+    writes — following a symlink that already exists in the destination. Safe only
+    into a fresh host-controlled directory; for a workspace a guest may have
+    touched, use :meth:`Workspace.restore_tar`, which writes through the confined
+    root and reports rather than aborting.
+
+    Args:
+        member: The member ``tarfile`` is about to extract.
+        path: The destination directory, unused — confinement here is by member
+            vetting, not by the destination.
+
+    Returns:
+        The member with its setuid/setgid/sticky bits cleared.
+
+    Raises:
+        WorkspaceError: On an absolute or ``..`` name, or a symlink, hardlink,
+            FIFO, socket or device member. Extraction aborts.
     """
-    del path  # confinement is by member vetting, not by the destination path
+    del path
     _split(member.name)  # raises WorkspaceError on an absolute or ".." name
     if not (member.isreg() or member.isdir()):
         kind = 'symlink' if member.issym() else 'hardlink' if member.islnk() else 'special'

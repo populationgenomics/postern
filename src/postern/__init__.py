@@ -2,9 +2,10 @@
 
 Run untrusted Python in an OS-isolated `Sandbox` (bubblewrap: empty network
 namespace, surgical filesystem, dropped capabilities, seccomp) whose *only*
-interface to the outside is a hatch — host-provided gRPC methods, gated by an
-allowlist, that the guest calls with the generated stub. The security boundary
-is that method set, not a coarse permission flag.
+interface to the outside is a hatch. `postern.grpc.GrpcHatch` exposes host gRPC
+methods gated by an allowlist; `postern.stream.StreamHatch` exposes one raw byte
+stream per resource. The security boundary is what the hatch exposes, not a
+coarse permission flag.
 
     from postern import Sandbox, SandboxProfile
     from postern.grpc import GrpcHatch
@@ -18,7 +19,7 @@ is that method set, not a coarse permission flag.
 
 The bare `Sandbox` has no third-party dependencies and no cloud dependency — it
 is a Linux + bubblewrap primitive. The gRPC hatch lives behind the ``grpc``
-extra; provider/runtime adapters behind their own.
+extra; the stream hatch is stdlib-only.
 """
 
 from __future__ import annotations
