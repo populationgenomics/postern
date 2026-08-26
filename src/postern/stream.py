@@ -121,6 +121,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Callable, Generator, Sequence
 from concurrent import futures
 
@@ -145,6 +146,8 @@ _REJECT_GRACE = 0.5
 _FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 # Pause before retrying a transient accept() failure: no hot spin on an fd shortage.
 _ACCEPT_RETRY_DELAY = 0.05
+# Escaped-traceback cap: enough for a real stack, still a bounded record.
+_TRACEBACK_CAP = 4000
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
 # A poll rather than `Popen.wait(timeout=...)` because that reaps, and the reap is
@@ -708,6 +711,7 @@ class StreamHatch:
         self._started = True
         self._accepting = True
         threading.Thread(target=self._accept_loop, args=(srv,), daemon=True, name='postern-stream-accept').start()
+        log.info('stream hatch %s serving at %s', _log.safe(self._name), self._path)
 
     def _clear_stale_socket(self) -> None:
         """Remove a dead socket left where we are about to bind. Nothing else.
@@ -762,8 +766,8 @@ class StreamHatch:
                 # Transient: EMFILE/ENFILE when the *embedding* worker momentarily
                 # runs out of descriptors, ECONNABORTED when a dial dies during the
                 # handshake, EINTR. Riding these out rather than retiring the hatch.
-                # Host-side condition, and the sleep below bounds how often this
-                # can be logged, so it is not a guest-driven rate.
+                # Host-side condition: the guest cannot reach it. The retry sleep
+                # bounds this at 1/_ACCEPT_RETRY_DELAY lines per second (20).
                 log.warning('accept() failed transiently on hatch %s: %s; retrying', _log.safe(self._name), exc)
                 self._slots.release()
                 time.sleep(_ACCEPT_RETRY_DELAY)
@@ -806,11 +810,13 @@ class StreamHatch:
                 _drain(conn, self._grace)
             else:
                 _await_command(verdict)
-        except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
-            # The handler is host code, so this is usually a host bug rather than
-            # hostile input — and without the traceback the two are indistinguishable
-            # from the guest's clean end-of-stream.
-            log.warning('handler raised for hatch %s; connection dropped', _log.safe(self._name), exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — hostile input; contain it to this connection
+            if isinstance(exc, ConnectionAbortedError) and self._closing:
+                # _track's teardown refusal, not a handler failure: close() ran while
+                # this connection was in flight. The guest picks how many fire.
+                log.debug('hatch %s closed with a connection in flight', _log.safe(self._name))
+            else:
+                _report_handler_failure(self._name, exc)
             _drain(conn, self._grace)
         finally:
             # The verdict must not outlive the connection: an abandoned subprocess
@@ -881,6 +887,7 @@ class StreamHatch:
         if self._dir is not None:
             with contextlib.suppress(OSError):
                 os.rmdir(self._dir)
+        log.info('stream hatch %s at %s stopped', _log.safe(self._name), self._path)
 
 
 # --------------------------------------------------------------------------- #
@@ -987,6 +994,32 @@ def _abnormal_stdio(conn: socket.socket) -> list[str]:
             if any(conn.getsockopt(socket.SOL_SOCKET, opt, _TIMEVAL_MAX)):
                 bad.append(name)
     return bad
+
+
+def _report_handler_failure(name: str, exc: BaseException) -> None:
+    """Report a handler failure without letting guest bytes into the record raw.
+
+    A handler runs on guest input, so both the exception's text and its traceback
+    are guest-derived. Neither is handed to ``exc_info``: a raw traceback in an
+    aggregated stream lets a guest-chosen message start what reads like a fresh
+    host-attributed line, which is the whole reason :func:`_log.safe` exists. The
+    type and message identify the bug at ``WARNING``; the escaped traceback is at
+    ``DEBUG`` for whoever is actually debugging it.
+
+    Args:
+        name: The hatch the failing handler belongs to.
+        exc: The exception the handler raised.
+    """
+    log.warning(
+        'handler raised for hatch %s: %s; connection dropped',
+        _log.safe(name),
+        _log.safe(f'{type(exc).__name__}: {exc}'),
+    )
+    log.debug(
+        'handler traceback for hatch %s: %s',
+        _log.safe(name),
+        _log.safe(traceback.format_exc(), _TRACEBACK_CAP),
+    )
 
 
 def _dispose(verdict: Process | None, grace: float) -> None:
