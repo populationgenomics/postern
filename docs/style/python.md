@@ -40,7 +40,7 @@ class Record:
     name: str
 ```
 
-The cost is a little extra typing at call sites. It's worth it.
+The cost is a little extra typing at call sites.
 
 ### Carved-out exceptions
 
@@ -51,8 +51,11 @@ The cost is a little extra typing at call sites. It's worth it.
   package's public API surface, and `postern.stream` re-exports `guest_env_var` and `guest_socket_path` as the surface a
   caller building a guest command line by hand reaches them through. Naming each exported symbol is that line's job.
   Everything a module imports for its *own* use goes through the module, even from a sibling in the same package.
-- Tests and examples importing postern's own public API (`from postern import Sandbox`), which reads as the consumer
-  code it stands in for.
+- Tests and examples importing postern itself, at either level: the public API (`from postern import Sandbox`), which
+  reads as the consumer code it stands in for, and internals a test names as its subject
+  (`from postern._sandbox import GUEST_CONNECT`), because a test is entitled to reach a private symbol and naming it in
+  the import block is how the reader sees what is under test. The carve-out is postern's own package only — a stdlib or
+  third-party symbol in a test goes through its module like anywhere else.
 
 Anything else — `pathlib.Path`, `dataclasses.dataclass`, `contextlib.contextmanager`, a class from another module in
 this package — goes through its module.
