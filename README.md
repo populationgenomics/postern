@@ -185,8 +185,8 @@ each binds at `/run/postern/<name>.sock` and is exported as
 `hatch=` takes one hatch or a sequence. The in-guest connector that bridges a
 command's stdio to the socket is bound in at `$POSTERN_CONNECT` — stdlib-only,
 one blocking thread per direction, leaving with `os._exit` rather than finalising,
-because a daemon reader parked on a descriptor git has torn down aborts the git
-process. git gates `ext::` behind `protocol.ext.allow` because an `ext::` URL is
+because finalising the interpreter around a reader still parked on a descriptor
+git has torn down aborts the connector (`python3 died of signal 6`). git gates `ext::` behind `protocol.ext.allow` because an `ext::` URL is
 command execution; inside the sandbox that gate protects nothing, since the guest
 is already running untrusted code, so enable it per invocation with `-c` and leave
 the host's git config alone.
@@ -220,8 +220,8 @@ for ever. Two things bound that:
 
 `postern.stream`'s module docstring covers the mechanism under "Teardown and its
 caveats", including which platforms can observe a command's exit without reaping
-it (`waitid` on Linux and some macOS builds, `kqueue` on macOS and the BSDs) and
-what a platform with neither loses.
+it (`waitid` on Linux, and on darwin from CPython 3.13; `kqueue` on macOS and the
+BSDs) and what a platform with neither loses.
 
 **The command's stdin grammar is part of the capability.** A fixed argv means
 guest bytes never become *that* process's argv. It does not stop them becoming a

@@ -190,7 +190,7 @@ def test_an_adopted_popen_with_stderr_merged_into_the_guest_socket_is_refused() 
 
 
 def test_a_process_with_no_argv_still_checks_stderr() -> None:
-    """The stderr check used to sit *past* ``__post_init__``'s argv-None return."""
+    """``__post_init__`` checks stderr before the argv-None return, not after."""
     with pytest.raises(ValueError, match=r'stderr=subprocess\.STDOUT is not supported'):
         Process(stderr=subprocess.STDOUT)
     with pytest.raises(ValueError, match=r'stderr=subprocess\.PIPE is not supported'):
