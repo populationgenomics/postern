@@ -40,8 +40,9 @@ gate the host opens.
 
 - **StreamHatch** — the raw-stream adapter of the Hatch seam. One socket per
   resource; per accepted connection a handler decides whether its bytes are
-  spliced to a host-side subprocess's stdio. Named, so a sandbox carries several
-  (`$POSTERN_HATCH_<NAME>`). Stdlib-only.
+  spliced to a host-side subprocess's stdio (`Process`), relayed to a socket the
+  handler has already connected (`Upstream`), or refused. Named, so a sandbox
+  carries several (`$POSTERN_HATCH_<NAME>`). Stdlib-only.
 
 - **Allowlist** — the capability grant. The exact `/package.Service/Method`
   names the guest may call through the hatch; everything else is

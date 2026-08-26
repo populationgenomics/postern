@@ -4,19 +4,23 @@ Where `GrpcHatch` grants the guest a set of typed methods, `StreamHatch` gives i
 **one socket** and nothing else. Per accepted connection a handler you supply
 decides what the guest's bytes are spliced to:
 
-    handler(stream) -> Process | None
+    handler(stream) -> Process | Upstream | None
 
 * ``stream`` — the accepted connection (``stream.conn``) and the name of the hatch
   it arrived on (``stream.hatch``).
 * return ``Process(argv)`` to hand the connection to a subprocess as its stdin and
-  stdout, or ``None`` to refuse (the guest sees end-of-stream). The verdict
+  stdout, ``Upstream(sock)`` to relay it to a socket you have already connected, or
+  ``None`` to refuse (the guest sees end-of-stream). A `Process` verdict
   *describes* the command and the hatch spawns it, which is what puts the
   connection into ordinary-stdio shape before there is a child to race;
   `Process.from_popen` is the escape hatch, and says what it costs.
 * the hatch owns the *lifecycle* after the verdict — waiting for the command, then
-  terminate-then-kill teardown and reaping the process group. It does not own the
-  data path: the socket **is** the command's stdio, so the kernel moves the bytes.
-  No pump, so no payload ceiling to tune and no buffering to configure.
+  terminate-then-kill teardown and reaping the process group. On the `Process` path
+  it does not own the data *path*: the socket **is** the command's stdio, so the
+  kernel moves the bytes, with no payload ceiling to tune and no buffering to
+  configure. `Upstream` is the one verdict that cannot work that way, because two
+  sockets are different kernel objects and nothing joins them but a copy, so it
+  gets a thread per direction and the teardown ordering that implies.
 
 The motivating case is **git**: its native wire protocol is pkt-line over a raw
 bidirectional stream, and ``ext::`` carries that over a command's stdin/stdout, so
@@ -144,6 +148,8 @@ _FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 _ACCEPT_RETRY_DELAY = 0.05
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
+# Named so a leaked relay thread is identifiable in a thread dump.
+_RELAY_THREAD = 'postern-stream-relay'
 # A poll rather than `Popen.wait(timeout=...)` because that reaps, and the reap is
 # what invalidates the group id.
 _EXIT_POLL = 0.02
@@ -466,7 +472,69 @@ class Process:
             _reap(self._proc, grace, self._pgid)
 
 
-Handler = Callable[[Stream], 'Process | None']
+@dataclasses.dataclass
+class Upstream:
+    """Handler verdict: relay this connected socket to the guest, both ways.
+
+    The one verdict that needs a host-side relay. A `Process` gets the guest's
+    socket *as* its stdio, so the kernel moves the bytes and nothing in this process
+    is on the data path. Two sockets are different kernel objects and nothing joins
+    them but a copy, so this path has a thread per direction and every teardown
+    question the `Process` path does not have to answer (`_relay_sockets`).
+
+    The verdict owns ``sock`` from the moment the handler returns it:
+    :meth:`dispose` shuts it down and closes it, and the hatch disposes of every
+    verdict it was handed.
+
+    Args:
+        sock: A socket that is already connected to the destination.
+    """
+
+    sock: socket.socket
+
+    # A verdict relays *one* connection; see _claim.
+    _claimed: bool = dataclasses.field(default=False, init=False, repr=False)
+    _disposed: bool = dataclasses.field(default=False, init=False, repr=False)
+    _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, init=False, repr=False)
+
+    def _claim(self) -> bool:
+        """Take ownership of this verdict for one connection. False if taken.
+
+        A verdict relays *one* connection, so the hatch claims one before relaying
+        and refuses one it cannot claim — a handler that cached a verdict would
+        otherwise relay a second connection to a socket the first already owns and
+        will close. `StreamHatch._serve_conn` must forget a verdict it could not
+        claim before it raises: it is another connection's, and the per-connection
+        ``finally`` would tear that connection's upstream down.
+        """
+        with self._lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
+
+    def dispose(self, grace: float) -> None:
+        """Shut the upstream socket down, then close it. Idempotent.
+
+        ``shutdown`` before ``close`` because on Linux closing a socket another
+        thread is parked in ``recv`` on does not wake that thread, so a relay
+        direction with a silent peer would stay parked for ever.
+
+        Args:
+            grace: Unused. The signature matches `Process.dispose` so `_dispose`
+                releases either verdict the same way.
+        """
+        del grace
+        with self._lock:
+            if self._disposed:
+                return
+            self._disposed = True
+        _unblock(self.sock)
+        with contextlib.suppress(OSError):
+            self.sock.close()
+
+
+Handler = Callable[[Stream], 'Process | Upstream | None']
 
 
 # --------------------------------------------------------------------------- #
@@ -541,6 +609,35 @@ def splice_subprocess(
     return handler
 
 
+def splice_tcp(host: str, port: int, *, timeout: float = 10.0) -> Handler:
+    """Dial ``host:port`` per connection and relay it to the guest.
+
+    The destination is fixed here, so — unlike a proxy policing a guest-named host —
+    no guest input reaches the dial, and there is nothing to resolve-and-pin against
+    a rebinding race because the guest cannot name a destination at all. A dial that
+    fails is reported as a closed connection, which is all a raw stream can say.
+
+    Args:
+        host: The destination host, resolved per connection.
+        port: The destination port.
+        timeout: Seconds allowed for the *dial* only. It is cleared on the socket
+            before relaying: ``create_connection`` leaves it set, where it would act
+            as an idle read/write deadline on the relayed stream — tearing down any
+            exchange quiet for ``timeout`` seconds, dropping the unsent tail of a
+            ``sendall`` that hit it, and showing the guest nothing but an EOF.
+    """
+
+    def handler(_stream: Stream) -> Upstream | None:
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+        except OSError:
+            return None
+        sock.settimeout(None)
+        return Upstream(sock)
+
+    return handler
+
+
 def git_url(
     name: str = 'stream',
     *,
@@ -607,8 +704,9 @@ class StreamHatch:
         """Create a hatch that runs ``handler`` for each guest connection.
 
         Args:
-            handler: ``handler(stream) -> Process | None``. It owns all policy —
-                wrap `splice_subprocess` for the common case.
+            handler: ``handler(stream) -> Process | Upstream | None``. It owns all
+                policy — wrap `splice_subprocess` or `splice_tcp` for the common
+                cases.
             name: The capability's name in the guest: its socket is bound at
                 ``/run/postern/<name>.sock`` and exported as
                 ``POSTERN_HATCH_<NAME>``. A Python identifier, because it becomes
@@ -660,7 +758,7 @@ class StreamHatch:
         # Live connections and the verdict behind each, so close() can tear them
         # down rather than merely stop accepting new ones.
         self._lock = threading.Lock()
-        self._live: dict[socket.socket, Process | None] = {}
+        self._live: dict[socket.socket, Process | Upstream | None] = {}
 
     @property
     def socket_path(self) -> str:
@@ -770,7 +868,7 @@ class StreamHatch:
     def _serve_conn(self, conn: socket.socket) -> None:
         # A hostile connection must never take a pool worker down, and must always
         # give its slot back.
-        verdict: Process | None = None
+        verdict: Process | Upstream | None = None
         try:
             # Tracked *before* the verdict: a handler is entitled to read a preamble,
             # and until this connection is in _live, close() cannot shut it down.
@@ -779,18 +877,22 @@ class StreamHatch:
             if verdict is not None and not verdict._claim():  # noqa: SLF001 — the hatch owns the verdict's lifecycle
                 # Another connection's verdict. Forget it *before* raising: the
                 # `finally` below would otherwise dispose of that connection's live
-                # command. This one takes the refusal path.
+                # command or upstream. This one takes the refusal path.
                 verdict = None
-                raise ValueError('a Process verdict is single-use; this one is already attached to a connection')
-            if verdict is not None:
+                raise ValueError('a handler verdict is single-use; this one is already bound to a connection')
+            if isinstance(verdict, Process):
                 # Inside the try, so a refused verdict is contained to this
-                # connection like any other handler failure.
+                # connection like any other handler failure. Only a `Process`
+                # attaches: an `Upstream` has no command to spawn and no stdio to
+                # normalise.
                 verdict._attach(conn, self._grace)  # noqa: SLF001 — the hatch owns the verdict's lifecycle
             self._track(conn, verdict)
             if verdict is None:
                 # A raw stream has no way to say "no", so a refusal is end-of-stream
                 # and nothing else — no diagnostic, which here would be host state.
                 _drain(conn, self._grace)
+            elif isinstance(verdict, Upstream):
+                _relay_sockets(conn, verdict, self._grace)
             else:
                 _await_command(verdict)
         except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
@@ -805,7 +907,7 @@ class StreamHatch:
             self._slots.release()
 
     # -- live-connection bookkeeping, so close() can mean something ---------- #
-    def _track(self, conn: socket.socket, verdict: Process | None) -> None:
+    def _track(self, conn: socket.socket, verdict: Process | Upstream | None) -> None:
         with self._lock:
             if self._closing:
                 # close() already ran; do not let a verdict slip past its teardown.
@@ -972,7 +1074,7 @@ def _abnormal_stdio(conn: socket.socket) -> list[str]:
     return bad
 
 
-def _dispose(verdict: Process | None, grace: float) -> None:
+def _dispose(verdict: Process | Upstream | None, grace: float) -> None:
     """Release whatever a verdict was holding. Idempotent, never raises."""
     if verdict is not None:
         with contextlib.suppress(Exception):
@@ -1029,6 +1131,76 @@ def _unblock(sock: socket.socket) -> None:
     """
     with contextlib.suppress(OSError):
         sock.shutdown(socket.SHUT_RDWR)
+
+
+def _pump(src: socket.socket, dst: socket.socket) -> bool:
+    """Copy ``src`` -> ``dst`` until EOF, then half-close ``dst``'s write side.
+
+    Returns whether ``src`` ended cleanly: an orderly FIN rather than a reset, an
+    abort or a timeout. `_relay_sockets` needs that distinction to decide what the
+    guest is told, which is why it cannot be lost to a broad ``except OSError``
+    around both directions of the copy.
+
+    A failure *writing* to ``dst`` counts as clean, because it says nothing about
+    ``src``: the destination has gone away, and there is no longer anyone to report
+    a disposition to.
+    """
+    try:
+        while True:
+            try:
+                chunk = src.recv(_CHUNK)
+            except OSError:
+                return False  # the source died mid-stream: not an orderly end
+            if not chunk:
+                return True  # orderly FIN
+            try:
+                dst.sendall(chunk)
+            except OSError:
+                return True  # the destination left; src is not at fault
+    finally:
+        with contextlib.suppress(OSError):
+            dst.shutdown(socket.SHUT_WR)
+
+
+def _relay_sockets(guest: socket.socket, verdict: Upstream, grace: float) -> None:
+    """Relay bytes both ways between the guest and an upstream until both are done.
+
+    The upstream's FIN ends the upstream-to-guest direction and nothing else. It
+    means the upstream has nothing more to *say*, not that it has stopped listening,
+    so the guest-to-upstream direction runs to its own EOF rather than being cut off
+    ``grace`` later: an ordinary request/response upstream that half-closes after
+    its banner and keeps reading the body would otherwise lose every upload longer
+    than ``grace``, and ``grace`` bounds teardown rather than the stream. What
+    bounds this is the guest's own EOF plus :meth:`StreamHatch.close`, which shuts
+    every live connection down — and is why the connection stays registered until
+    this function returns.
+
+    How the upstream ended is propagated, not normalised. The drain suppresses an
+    ``ECONNRESET`` that would be purely a teardown artifact of this function's own
+    making: nothing went wrong on the wire, the guest's queued bytes were simply
+    never read, and the guest must not be told an exchange failed when it did not.
+    An upstream that genuinely reset is the opposite case — for a raw stream with no
+    framing of its own the reset *is* the only failure signal there is — so the
+    guest's queued bytes are left in place and the close delivers it
+    (``unix_release_sock``, as in `_drain`).
+
+    Best effort on that last point: ``AF_UNIX`` has no way to synthesise a reset, so
+    a guest whose receive queue happens to be empty reads end-of-stream whatever the
+    upstream did. The `Process` path has no such gap, because there the kernel
+    reports the command's disposition rather than this function reproducing it by
+    hand.
+    """
+    upstream = verdict.sock
+    reverse = threading.Thread(target=_pump, args=(guest, upstream), daemon=True, name=_RELAY_THREAD)
+    reverse.start()
+    clean = _pump(upstream, guest)  # ends with SHUT_WR towards the guest
+    reverse.join()
+    if clean:
+        _drain(guest, grace)
+        _unblock(guest)
+    verdict.dispose(grace)
+    with contextlib.suppress(OSError):
+        guest.close()
 
 
 def _await_command(verdict: Process) -> None:
@@ -1199,8 +1371,10 @@ __all__ = [
     'Process',
     'Stream',
     'StreamHatch',
+    'Upstream',
     'git_url',
     'guest_env_var',
     'guest_socket_path',
     'splice_subprocess',
+    'splice_tcp',
 ]

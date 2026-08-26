@@ -149,8 +149,8 @@ stream hatch (below) is stdlib-only.
 
 Some protocols are neither typed RPC nor request/response. `StreamHatch` gives
 the guest **one socket** and nothing else; per accepted connection a handler
-decides what its bytes are spliced to — a host-side subprocess's stdio, or
-nothing. The motivating case is git, whose native wire protocol is pkt-line over
+decides what its bytes are spliced to — a host-side subprocess's stdio, a socket
+the handler has already connected, or nothing. The motivating case is git, whose native wire protocol is pkt-line over
 a raw bidirectional stream and whose `ext::` transport carries that over a
 command's stdin/stdout.
 
@@ -181,12 +181,13 @@ differs in four ways.
   fixed too: a hatch bound to `git upload-pack` cannot be talked into
   `receive-pack`.
 - *No body buffering, and no copying.* A proxy that inspects request bodies has to
-  buffer them, and so has to cap them. Here the socket **is** the command's stdin
-  and stdout, so the kernel moves every byte and postern is not on the data path.
-  The kernel also propagates the command's disposition: a command that consumed
-  its input and exited gives the guest end-of-stream, one that died mid-request
-  gives it a reset — the only failure signal a stream with no framing of its own
-  has.
+  buffer them, and so has to cap them. On the `Process` path the socket **is** the
+  command's stdin and stdout, so the kernel moves every byte and postern is not on
+  the data path. The kernel also propagates the command's disposition: a command
+  that consumed its input and exited gives the guest end-of-stream, one that died
+  mid-request gives it a reset — the only failure signal a stream with no framing
+  of its own has. (The `Upstream` path cannot borrow either property; see
+  [below](#relaying-to-an-upstream-socket).)
 - *No protocol translation.* The host side runs a subprocess and splices its
   stdio, rather than decoding framing and re-emitting headers to reach the same
   subprocess.
@@ -233,6 +234,26 @@ for ever. Two things bound that:
   group. A shell's `&` child stays and is collected; a daemonising sidecar does
   not. Prefer a command that does not daemonise.
 
+### Relaying to an upstream socket
+
+Where the resource is another *socket* rather than a process, there is nothing to
+splice: two sockets are different kernel objects and nothing joins them but a
+copy. `Upstream(sock)` is the verdict for that case, and `splice_tcp(host, port)`
+the stock handler — the destination is fixed at construction like everything else
+here, so the guest cannot name it and no guest input reaches the dial.
+
+That path has a thread per direction, and pays for it in three ways the `Process`
+path does not. An upstream FIN ends one *direction*, so the guest-to-upstream
+direction runs to its own EOF rather than being cut off `grace` later — `grace`
+bounds teardown, not the stream, and what bounds a relay is the guest's own EOF
+plus `close()`. `splice_tcp`'s `timeout` bounds the dial only and is cleared
+before relaying, because `create_connection` leaves it set where it would become
+an idle deadline on the stream. And the upstream's disposition has to be relayed
+by hand: a clean FIN drains and closes orderly, a reset is left for the close to
+deliver, since for a raw stream the reset is the only failure signal there is.
+`AF_UNIX` cannot synthesise a reset, so that last part is best effort — a guest
+with an empty receive queue reads end-of-stream whatever the upstream did.
+
 `postern.stream`'s module docstring covers the mechanism under "Teardown and its
 caveats", including which platforms can observe a command's exit without reaping
 it (`waitid` on Linux, and on darwin from CPython 3.13; `kqueue` on macOS and the
@@ -264,11 +285,11 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by `run_python`'s shim, so they are inert under `run()`.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>`, so `run()` works and not only `run_python()`. Named, so several coexist: one socket per resource. Stdlib-only. `with hatch.accepting(): ...`, and `close()` is terminal as `GrpcHatch`'s is.
-  - `handler(stream) -> Process | None`: return `Process(argv, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, or `None` to refuse. The hatch spawns it, so the descriptor is in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race.
+  - `handler(stream) -> Process | Upstream | None`: return `Process(argv, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, `Upstream(sock)` to relay it to a socket the handler has already connected, or `None` to refuse. The hatch spawns it, so the descriptor is in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race.
   - `Process.from_popen(popen)` adopts a subprocess you spawned yourself, for what the declarative form does not cover (`pass_fds`, `user=`, an rlimit). An already-spawned verdict can only be validated, and it has none of the declarative path's `stderr`/`env`/`cwd` defaults.
   - `stderr=PIPE` is refused because nothing drains it and the command would deadlock; `stderr=STDOUT` is refused because stdout is the guest socket, so it would relay host-path diagnostics to the guest. Checked at construction for `Process(argv)`, and by detection for an adopted `Popen` where the platform allows, since `subprocess` keeps no record of the `stderr` it was passed.
   - `Stream.read_preamble(max_bytes, timeout)` bounds a preamble read without touching socket flags. Do not use `settimeout` for that: the command shares the descriptor.
-  - `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)` is the stock handler; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`.
+  - `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)` and `splice_tcp(host, port, *, timeout=10.0)` are the stock handlers; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`, member-vetting only — see below.
 - `available()` — whether bubblewrap is on the PATH.
 
