@@ -29,6 +29,7 @@ Operating directives for Claude (and any agent) in this repo; they counteract de
 ## Code style
 
 @docs/style/general.md
+@docs/style/python.md
 
 ## Docs
 
