@@ -12,7 +12,6 @@ import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -75,7 +74,7 @@ def _dial(hatch: StreamHatch, timeout: float = 20.0) -> socket.socket:
 # --------------------------------------------------------------------------- #
 # Teardown ownership                                                           #
 # --------------------------------------------------------------------------- #
-def test_response_survives_a_command_that_closes_stdin_first(tmp_path: Path) -> None:
+def test_response_survives_a_command_that_closes_stdin_first(tmp_path: pathlib.Path) -> None:
     """A command that closes stdin and then writes must still deliver everything.
 
     The shape: a request/response filter, ``head``, an ``upload-pack`` exiting while
@@ -176,7 +175,7 @@ def test_close_on_a_never_started_hatch_does_not_inflate_slots() -> None:
 def test_a_caller_supplied_socket_path_is_never_unlinked_unbound() -> None:
     """A path this hatch did not bind belongs to whoever did."""
     # Not pytest's tmp_path: sun_path is 108 bytes and pytest's is longer.
-    victim = Path(tempfile.mkdtemp(prefix='pv-')) / 's.sock'
+    victim = pathlib.Path(tempfile.mkdtemp(prefix='pv-')) / 's.sock'
     other = socket.socket(socket.AF_UNIX)
     other.bind(str(victim))
     other.listen(1)
@@ -309,7 +308,7 @@ def test_git_url_takes_its_interpreter_from_the_profile() -> None:
 
 def test_the_connector_path_has_one_definition() -> None:
     """`stream.py` must not keep its own copy of the guest connector path."""
-    source = (Path(__file__).resolve().parent.parent / 'src' / 'postern' / 'stream.py').read_text()
+    source = (pathlib.Path(__file__).resolve().parent.parent / 'src' / 'postern' / 'stream.py').read_text()
     assert '/run/postern/connect.py' not in source, 'stream.py redefines GUEST_CONNECT'
     assert git_url('x').split()[1] == GUEST_CONNECT
 
@@ -363,7 +362,7 @@ def test_a_legitimate_hatch_set_is_still_accepted() -> None:
 # --------------------------------------------------------------------------- #
 # The connector                                                                #
 # --------------------------------------------------------------------------- #
-_CONNECTOR = str(Path(__file__).resolve().parent.parent / 'src' / 'postern' / '_stream_connect.py')
+_CONNECTOR = str(pathlib.Path(__file__).resolve().parent.parent / 'src' / 'postern' / '_stream_connect.py')
 
 
 def test_connector_moves_bulk_bytes_both_ways() -> None:
@@ -431,7 +430,7 @@ def test_connector_works_when_stdin_is_not_a_pipe() -> None:
     assert done.stdout == b'HELLO\n', f'rc={done.returncode} stdout={done.stdout!r} stderr={done.stderr!r}'
 
 
-def test_connector_reports_a_failure_rather_than_exiting_zero(tmp_path: Path) -> None:
+def test_connector_reports_a_failure_rather_than_exiting_zero(tmp_path: pathlib.Path) -> None:
     done = subprocess.run(
         [sys.executable, _CONNECTOR, str(tmp_path / 'nothing-here.sock')],
         capture_output=True,
