@@ -52,9 +52,16 @@ comments, docstrings, `README.md` and `CONTEXT.md` describing it are part of tha
 - **Correct a pushed branch with a new commit on top**, not amend + force-push. PRs squash-merge, so `main` stays
   linear regardless and intermediate fixups vanish on merge. Reserve force-push for rebasing onto `main`.
 
-## Worktrees
+## `.claude/`
 
-Worktrees go in `.claude/worktrees/` (gitignored), never `../` siblings.
+The whole directory is gitignored and stays local — worktrees, `settings.local.json`, agent and skill definitions,
+slash commands, transcripts, scratch output. None of it is committed. Configuration meant for everyone working on the
+repo goes in a tracked file at the root (`CLAUDE.md`, `pyproject.toml`, `.pre-commit-config.yaml`) where review covers
+it; a `.claude/` file is one person's local setup and can change under anyone else's feet.
+
+### Worktrees
+
+Worktrees go in `.claude/worktrees/`, never `../` siblings.
 
 - **New branch** → the Claude Code worktree command.
 - **Existing branch** → `git worktree add .claude/worktrees/<name> <branch>` (the command only cuts fresh branches).
