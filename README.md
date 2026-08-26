@@ -59,11 +59,9 @@ and the arguments and results are typed and language-neutral.
   **`--die-with-parent`**, **`--clearenv`**;
 - **`--as-pid-1`** — the guest entrypoint *is* PID 1 of the guest's PID
   namespace. A resident bwrap there would share the guest uid, putting its
-  `/proc/1` (cmdline, maps, read/write mem, env) within reach from inside.
-  `run_python`'s shim is the init instead: it forks the guest, reaps orphaned
-  descendants, propagates the guest's exit status, and marks *itself*
-  `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot read the init
-  either;
+  `/proc/1` (cmdline, maps, read/write mem, env) within reach from inside. Who
+  plays init in its place depends on the entrypoint: see
+  [PID 1 and the resource backstops](#pid-1-and-the-resource-backstops) below;
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
   no capabilities inside its user namespace, and if the userns fails to
   materialise on a root host it still drops to a non-root real uid
@@ -75,13 +73,30 @@ and the arguments and results are typed and language-neutral.
 - a **seccomp denylist** blocking escape-enabling syscalls (`unshare`, `setns`,
   `mount`, `ptrace`, `bpf`, `keyctl`, `io_uring_setup`, …). `socket` is
   deliberately *not* blocked — network isolation is the netns's job, and the guest
-  needs `socket(AF_UNIX)` for the hatch;
-- **`RLIMIT_NPROC`** as a fork-bomb backstop (set inside the guest), and an
-  optional **`RLIMIT_AS`** memory backstop (`SandboxProfile(rlimit_as=...)`, off
-  by default; a cgroup `memory.max` at the deploy layer is the real isolation).
+  needs `socket(AF_UNIX)` for the hatch.
 
 The hatch UDS is bind-mounted in as the single controlled opening. Because the
 RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
+
+### PID 1 and the resource backstops
+
+Everything above is a bwrap flag, so every entrypoint gets it. These two are not,
+and they follow the entrypoint instead:
+
+- **`Sandbox.run_python`** binds in a shim (`_guest.py`) and makes *that* the
+  entrypoint. As PID 1 it is a real init: it forks the guest, reaps orphaned
+  descendants that reparent to it, propagates the guest's exit status, and marks
+  *itself* `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot read
+  the init. Before `exec`ing the guest code it applies **`RLIMIT_NPROC`**
+  (`SandboxProfile(rlimit_nproc=1024)`) as a fork-bomb backstop and, when set,
+  **`RLIMIT_AS`** (`SandboxProfile(rlimit_as=...)`, off by default; a cgroup
+  `memory.max` at the deploy layer is the real memory isolation).
+- **`Sandbox.run`** runs the caller's argv directly, with no shim. That argv is
+  PID 1 and must tolerate being it — nothing reaps orphans for it, nothing hides
+  its `/proc/1` from a same-uid child it spawns — and **neither rlimit is set**;
+  the entrypoint manages its own. `rlimit_nproc`/`rlimit_as` on the profile are
+  inert on this path. The stream hatch's `git_url` entrypoint is an example: git
+  is the PID 1 there.
 
 **Fail-closed boot check.** Every control is enforced on the launch path: the
 strict `--unshare-*` flags make bwrap abort if it can't create the namespaces,
@@ -245,8 +260,8 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
-- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch and get the identical bwrap profile; they differ in PID 1 and the rlimits ([above](#pid-1-and-the-resource-backstops)). `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by `run_python`'s shim, so they are inert under `run()`.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>`, so `run()` works and not only `run_python()`. Named, so several coexist: one socket per resource. Stdlib-only. `with hatch.accepting(): ...`, and `close()` is terminal as `GrpcHatch`'s is.
   - `handler(stream) -> Process | None`: return `Process(argv, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, or `None` to refuse. The hatch spawns it, so the descriptor is in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race.
