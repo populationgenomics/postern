@@ -236,7 +236,7 @@ class Workspace:
         except BaseException:
             os.close(fd)
             raise
-        os.set_blocking(fd, True)  # undo the O_NONBLOCK used to survive opening a FIFO
+        os.set_blocking(fd, True)  # clear the O_NONBLOCK that kept a FIFO open from blocking
         return fd
 
     def _open_write_fd(self, parts: tuple[str, ...]) -> int:
