@@ -251,6 +251,45 @@ diagnostics onto *stdout* routes around it (`git upload-archive` reports
 `fatal: '<path>' does not appear to be a git repository` on its pkt-line
 sideband), so pass `cwd` and a bare basename rather than an absolute host path.
 
+## Logging
+
+postern logs through the stdlib and configures nothing. Each module logs to
+`logging.getLogger('postern.<module>')`; the package attaches a `NullHandler` to
+`postern` and adds no handler, sets no level and installs no format. Wiring the
+sink is the application's job — on Cloud Run, structured stdout is ingested, so a
+`logging.basicConfig` (or the app's own JSON formatter) is the whole integration.
+There is no `google-cloud-logging` dependency and no OpenTelemetry: tracing is a
+separate concern and a separate dependency decision.
+
+```python
+logging.getLogger('postern').setLevel(logging.INFO)     # lifecycle + refusals of note
+logging.getLogger('postern').setLevel(logging.DEBUG)    # every guest-driven event
+```
+
+**The level split is a security property.** A guest reaches the hatch, so any
+per-event line on a guest-driven path is an amplifier the guest controls the rate
+of — bounded only by `run_python(timeout=)`.
+
+- **`WARNING`** — evidence about the *host*: a handler that raised (with the
+  traceback, so a host bug is not indistinguishable from hostile input), a reap or
+  dispose that failed and therefore leaked a subprocess, a `Workspace` the caller
+  never closed, `accept()` failing transiently because the embedding worker is out
+  of descriptors. Also a gRPC method called that is not on the allowlist: in
+  correct operation the guest only calls what the host allowlisted, so it is either
+  a misconfigured allowlist or a guest probing the boundary.
+- **`INFO`** — hatch lifecycle, one line per hatch per run.
+- **`DEBUG`** — everything a well-behaved guest can drive at its own rate: a
+  handler refusing by policy (that is the handler working), a connection turned
+  away at `max_conns`.
+
+Nothing is rate-limited or aggregated: every event gets a line, and the default
+level is what keeps that affordable.
+
+**Guest-controlled values are never interpolated raw.** A method name, hatch name
+or path derived from the guest goes through `postern._log.safe`, which `repr`s and
+length-caps it — so a newline cannot start what reads like a new host-attributed
+entry in an aggregated stream.
+
 ## Install
 
 ```bash
