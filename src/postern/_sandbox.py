@@ -23,11 +23,12 @@ import contextlib
 import dataclasses
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
 import typing
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from postern import _seccomp
 from postern._workspace import Workspace
@@ -38,12 +39,24 @@ if typing.TYPE_CHECKING:
     from typing_extensions import Self
 
 _GUEST_DIR = '/run/postern'
-_GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'
+_GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # the unnamed hatch (GrpcHatch) → POSTERN_HATCH
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
 _GUEST_STUBS = f'{_GUEST_DIR}/stubs'
 _GUEST_WORKSPACE = '/workspace'
 _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
+# The in-guest stdio↔UDS connector a stream hatch's guest side needs (see
+# postern._stream_connect); bound in read-only whenever a hatch asks for it.
+GUEST_CONNECT = f'{_GUEST_DIR}/connect.py'
+_CONNECT_SRC = str(pathlib.Path(__file__).with_name('_stream_connect.py'))
 _SYSTEM_DIRS = ('/usr', '/lib', '/lib64', '/bin', '/sbin')
+# A hatch name becomes both a path component under /run/postern and the tail of an
+# environment variable, hence a Python identifier: a '/' or '..' would bind the
+# socket somewhere unintended, and 'a-b' and 'a_b' collide on POSTERN_HATCH_A_B
+# while looking distinct.
+_GUEST_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+# sizeof(struct sockaddr_un.sun_path) on Linux. A name whose guest socket path
+# does not fit is a capability nothing in the guest can ever connect() to.
+_SUN_PATH_MAX = 108
 
 # bwrap's fresh `--proc /proc` is owned by the guest's user namespace and
 # discards the read-only /proc mask the container runtime applied. Because bwrap
@@ -75,12 +88,73 @@ _PROC_RO_PATHS = (
 
 
 class Hatch(typing.Protocol):
-    """What `Sandbox` needs of a hatch: a UDS path and a serving context."""
+    """What `Sandbox` needs of a hatch: a UDS path and a serving context.
+
+    Two optional attributes steer the wiring; a hatch declaring neither gets the
+    unnamed singleton treatment.
+
+    * ``guest_name`` (`StreamHatch`) — a *named* hatch binds at
+      ``/run/postern/<name>.sock`` and exports ``$POSTERN_HATCH_<NAME>`` instead of
+      the single unnamed ``$POSTERN_HATCH``, which is what lets a sandbox carry
+      several at once.
+    * ``guest_connector`` (`StreamHatch`) — bind `postern._stream_connect` in at
+      ``$POSTERN_CONNECT`` so the guest can splice a command's stdio to the socket.
+
+    Everything else is the hatch's own business: `Sandbox` binds the socket, sets
+    the environment, and enters ``accepting()``.
+    """
 
     @property
     def socket_path(self) -> str: ...
 
     def accepting(self) -> contextlib.AbstractContextManager[typing.Any]: ...
+
+
+def validate_guest_name(name: str) -> str:
+    """Check a hatch name is usable as a path component and an env-var tail.
+
+    Raises:
+        ValueError: if ``name`` is not a Python identifier (see ``_GUEST_NAME_RE``),
+            or is long enough that its guest socket path would not fit in a
+            ``sockaddr_un`` — a capability the guest could never ``connect()`` to.
+    """
+    if not _GUEST_NAME_RE.match(name):
+        raise ValueError(f'hatch name {name!r} must be a Python identifier (letters, digits, underscore)')
+    if len(f'{_GUEST_DIR}/{name}.sock') >= _SUN_PATH_MAX:
+        raise ValueError(f'hatch name {name!r} is too long: {_GUEST_DIR}/<name>.sock must fit in {_SUN_PATH_MAX} bytes')
+    return name
+
+
+def guest_socket_path(name: str) -> str:
+    """Where a hatch named ``name`` is bound inside the sandbox."""
+    return f'{_GUEST_DIR}/{validate_guest_name(name)}.sock'
+
+
+def guest_env_var(name: str) -> str:
+    """The environment variable naming a hatch named ``name`` inside the sandbox."""
+    return f'POSTERN_HATCH_{validate_guest_name(name).upper()}'
+
+
+def _guest_name(hatch: Hatch) -> str | None:
+    """A named hatch's name, or None for the unnamed singleton."""
+    name = getattr(hatch, 'guest_name', None)
+    return validate_guest_name(name) if name is not None else None
+
+
+def _wants_connector(hatch: Hatch) -> bool:
+    """Whether ``hatch``'s guest side needs the stdio↔UDS connector bound in."""
+    return bool(getattr(hatch, 'guest_connector', False))
+
+
+def _hatch_paths(hatch: Hatch) -> tuple[str, str]:
+    """The ``(guest socket path, guest env var)`` pair for one hatch.
+
+    The single place a hatch's guest-side contract is decided.
+    """
+    name = _guest_name(hatch)
+    if name is None:
+        return _GUEST_SOCK, 'POSTERN_HATCH'
+    return guest_socket_path(name), guest_env_var(name)
 
 
 def available() -> bool:
@@ -326,11 +400,23 @@ def _stub_binds(stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]
 
 
 class Sandbox:
-    """A hardened bubblewrap sandbox with an optional typed :class:`Hatch`."""
+    """A hardened bubblewrap sandbox with optional :class:`Hatch` channels.
 
-    def __init__(self, profile: SandboxProfile | None = None, *, hatch: Hatch | None = None) -> None:
+    ``hatch`` is opt-in and takes one hatch or a sequence: a `GrpcHatch` for typed
+    methods, any number of named `StreamHatch`es for raw streams, both, or none
+    (no channel is opened). At most one *unnamed* hatch, since that one owns a
+    fixed guest socket and environment variable.
+    """
+
+    def __init__(self, profile: SandboxProfile | None = None, *, hatch: Hatch | Sequence[Hatch] | None = None) -> None:
         self._profile = profile or SandboxProfile()
-        self._hatch = hatch
+        if hatch is None:
+            self._hatches: list[Hatch] = []
+        elif isinstance(hatch, (list, tuple)):
+            self._hatches = list(hatch)
+        else:
+            self._hatches = [typing.cast('Hatch', hatch)]
+        self._check_hatches()
         # The workspace persists for this Sandbox's lifetime and is bound
         # read-write at /workspace (the guest's cwd). An explicit profile path is
         # caller-owned; otherwise a private temp dir is created here and removed
@@ -343,6 +429,61 @@ class Sandbox:
         else:
             self._workspace = pathlib.Path(tempfile.mkdtemp(prefix='postern-ws-'))
             self._own_workspace = True
+
+    def _check_hatches(self) -> None:
+        """Reject a hatch set whose guest sockets, env vars or host paths collide.
+
+        Checked on the *derived* artefacts, not on names, because distinct names
+        still collide once derived — and each collision is a silent capability swap:
+
+        * **Guest socket path.** ``GrpcHatch()`` plus ``StreamHatch(name='hatch')``
+          both land on ``/run/postern/hatch.sock``, two ``--bind``s onto one target
+          where the later shadows the earlier, so a guest dialling
+          ``$POSTERN_HATCH`` for the gRPC surface reaches the raw stream splice.
+        * **Env var.** ``.upper()`` collides ``repo`` and ``REPO`` on
+          ``POSTERN_HATCH_REPO``.
+        * **Host socket path.** Two hatches given the same ``socket_path`` alias
+          whichever handler's ``start()`` bound last.
+
+        The unnamed hatch is capped at one for the same reason: it owns a fixed
+        guest path and env var, so a second would shadow the first's bind.
+        """
+        if sum(_guest_name(h) is None for h in self._hatches) > 1:
+            raise ValueError('a sandbox takes at most one unnamed hatch (e.g. GrpcHatch); name the rest')
+        for label, derive in (
+            ('guest socket paths', lambda h: _hatch_paths(h)[0]),
+            ('guest environment variables', lambda h: _hatch_paths(h)[1]),
+            ('host socket paths', lambda h: os.fspath(h.socket_path)),
+        ):
+            self._reject_duplicates(label, derive)
+
+    def _reject_duplicates(self, label: str, derive: Callable[[Hatch], str]) -> None:
+        """Raise if two configured hatches derive the same value."""
+        seen: dict[str, list[str]] = {}
+        for hatch in self._hatches:
+            name = _guest_name(hatch)
+            seen.setdefault(derive(hatch), []).append('<unnamed>' if name is None else name)
+        clashes = {value: names for value, names in seen.items() if len(names) > 1}
+        if clashes:
+            detail = '; '.join(f'{value!r} <- {sorted(names)}' for value, names in sorted(clashes.items()))
+            raise ValueError(f'hatches must not share {label}: {detail}')
+
+    def _hatch_wiring(self) -> tuple[list[str], dict[str, str]]:
+        """The bwrap binds and guest env for every configured hatch (no serving yet).
+
+        Shared by :meth:`run` and :meth:`run_python`: binding a socket in and naming
+        it in the environment is all a hatch needs, since the socket is just a file.
+        """
+        binds: list[str] = []
+        env: dict[str, str] = {}
+        for hatch in self._hatches:
+            guest_path, env_var = _hatch_paths(hatch)
+            binds += ['--bind', hatch.socket_path, guest_path]
+            env[env_var] = guest_path
+        if any(_wants_connector(h) for h in self._hatches):
+            binds += ['--ro-bind', _CONNECT_SRC, GUEST_CONNECT]
+            env['POSTERN_CONNECT'] = GUEST_CONNECT
+        return binds, env
 
     @property
     def workspace(self) -> pathlib.Path:
@@ -422,34 +563,48 @@ class Sandbox:
     def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
 
-        The raw primitive: it does not serve the hatch or set ``RLIMIT_NPROC``
-        (those are :meth:`run_python`'s job). Use it for a non-Python entrypoint
-        that manages its own limits.
+        The raw primitive for a non-Python entrypoint: it does not set
+        ``RLIMIT_NPROC`` (that is :meth:`run_python`'s job, applied by its shim),
+        so the entrypoint manages its own limits and must tolerate being PID 1.
+
+        It *does* bind and serve every configured :class:`Hatch`, so a bare
+        entrypoint — ``git`` reaching a `StreamHatch`, say — has the same
+        capabilities a `run_python` guest would: the socket is a file at
+        ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, with no in-guest relay to
+        start.
         """
-        return self._launch(list(argv), timeout=timeout)
+        binds, env = self._hatch_wiring()
+        with contextlib.ExitStack() as stack:
+            for hatch in self._hatches:
+                stack.enter_context(hatch.accepting())
+            return self._launch(list(argv), timeout=timeout, setenv=env, extra_binds=binds)
 
     def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
-        With a :class:`Hatch`, the hatch UDS is bound in and its path exported as
-        ``POSTERN_HATCH``; the guest reaches the host's allowlisted gRPC methods
-        by dialing ``unix:$POSTERN_HATCH`` with the generated stub (grpcio and
-        the stubs come from the bound environment). The guest shim applies
-        ``RLIMIT_NPROC`` before running the code.
+        Each configured :class:`Hatch` binds its own UDS in. The unnamed hatch
+        (e.g. `GrpcHatch`) exports its path as ``POSTERN_HATCH``, and the guest
+        reaches the host's allowlisted gRPC methods by dialing
+        ``unix:$POSTERN_HATCH`` with the generated stub (grpcio and the stubs come
+        from the bound environment); a *named* hatch (`StreamHatch`) exports
+        ``POSTERN_HATCH_<NAME>``. The guest shim applies ``RLIMIT_NPROC`` before
+        running the code.
         """
-        binds = ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+        binds, env = self._hatch_wiring()
+        binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+        # Pre-seed the variable the shim reads unconditionally, so an absent hatch
+        # is an empty string rather than a missing one under --clearenv.
         env = {
             'POSTERN_CODE': code,
             'POSTERN_NPROC': str(self._profile.rlimit_nproc),
             'POSTERN_AS': str(self._profile.rlimit_as or 0),
             'POSTERN_HATCH': '',
+            **env,
         }
         argv = [self._profile.python, '-u', _GUEST_SHIM]
-        if self._hatch is None:
-            return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
-        binds += ['--bind', self._hatch.socket_path, _GUEST_SOCK]
-        env['POSTERN_HATCH'] = _GUEST_SOCK
-        with self._hatch.accepting():
+        with contextlib.ExitStack() as stack:
+            for hatch in self._hatches:
+                stack.enter_context(hatch.accepting())
             return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
 
     def verify(self, *, timeout: float = 30) -> None:

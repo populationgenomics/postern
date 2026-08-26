@@ -84,6 +84,9 @@ ignore = [
 # The in-sandbox shim is stdlib-only, dynamic (host.<attr> dispatch), run as a
 # script and never imported by the package — held to correctness, not API rigor.
 "src/postern/_guest.py" = ["T201", "BLE001", "ANN", "D", "SLF001"]
+# Same category as the shim: a stdlib-only script that runs *inside* the sandbox,
+# bound in and exec'd by name, never imported by the package.
+"src/postern/_stream_connect.py" = ["T201", "BLE001", "ANN", "D", "SLF001"]
 "src/postern/_sandbox.py" = ["S603"]
 # Workspace (the confined-root capability) and WorkspacePath (its pathlib-like
 # facade) are one cohesive deep module: the facade delegates to the capability's
@@ -108,7 +111,7 @@ section-order = ["future", "standard-library", "third-party", "first-party", "lo
 # the uv-managed environment supplies the imports.
 pythonVersion = "3.10"
 include = ["src", "tests"]
-exclude = ["**/__pycache__", "src/postern/_guest.py"]
+exclude = ["**/__pycache__", "src/postern/_guest.py", "src/postern/_stream_connect.py"]
 typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]

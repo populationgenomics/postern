@@ -10,7 +10,9 @@
 # the e2e tests exercise.
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap \
+# git as well as bubblewrap: the stream-hatch e2e clones a real repository
+# through the hatch, with `git` itself as the sandbox entrypoint.
+RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap git \
     && rm -rf /var/lib/apt/lists/*
 
 # Toolchain only — no postern here; it is mounted at run time.
