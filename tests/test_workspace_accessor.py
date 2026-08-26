@@ -1,11 +1,10 @@
 """Reference-closure tests for the host-side `Workspace` accessor.
 
-These plant, in a workspace directory, exactly the hostile references a guest
-could leave behind — a symlink to an absolute host path, a symlink to
-``/proc/self/environ``, ``root -> /``, a FIFO — and assert the accessor never
-follows one out of the tree nor exposes its target, whether reading, walking,
-packing, or restoring. They are OS-filesystem tests (no bubblewrap), so they run
-anywhere ``O_NOFOLLOW`` + ``dir_fd`` work (Linux and macOS).
+These plant the hostile references a guest could leave in a workspace — a symlink
+to an absolute host path, one to ``/proc/self/environ``, ``root -> /``, a FIFO —
+and assert the accessor never follows one out of the tree nor exposes its target,
+whether reading, walking, packing or restoring. No bubblewrap: they run anywhere
+``O_NOFOLLOW`` + ``dir_fd`` work, Linux and macOS included.
 """
 
 from __future__ import annotations
@@ -51,12 +50,11 @@ def _plant_hostile(ws_dir, secret):
 def test_walk_surfaces_but_never_follows_references(ws_dir, secret):
     _plant_hostile(ws_dir, secret)
     with Workspace(ws_dir) as ws:
-        # The dir symlink and root symlink are NOT descended (they'd be dirs if
-        # followed); they appear as non-directory entries only.
+        # `root` and `dir_link` would be directories if followed, so is_dir() being
+        # false is what proves they were not.
         assert not (ws / 'root').is_dir()
         assert (ws / 'root').is_symlink()
         assert not (ws / 'dir_link').is_dir()
-        # Real nested dir *is* traversed.
         assert (ws / 'sub' / 'nested.txt').read_text() == 'nested output'
 
 
@@ -103,17 +101,13 @@ def test_pack_tar_excludes_all_references(ws_dir, secret):
     with tarfile.open(fileobj=buf) as tar:
         members = tar.getmembers()
         names = {m.name for m in members}
-        # Only regular files and dirs — reference-closed by construction.
         assert all(m.isreg() or m.isdir() for m in members), names
         assert 'good.txt' in names
         assert 'sub' in names
         assert 'sub/nested.txt' in names
-        # No symlink/fifo entries at all.
         for planted in ('abs_link', 'environ_link', 'root', 'rel_escape', 'dir_link', 'fifo'):
             assert planted not in names
-        # And the secret's contents are nowhere in the archive bytes.
         assert b'TOP-SECRET-HOST-TOKEN' not in buf.getvalue()
-    # The report is the audit trail of what was neutralized (never silent).
     reasons = dict(report.skipped)
     assert reasons['abs_link'] == 'symlink'
     assert reasons['fifo'] == 'fifo'
@@ -174,7 +168,6 @@ def test_restore_tar_neutralizes_malicious_members(tmp_path):
     with Workspace(dest) as ws:
         report = ws.restore_tar(_malicious_tar())
         assert (ws / 'ok.txt').read_bytes() == b'hi'
-    # Nothing escaped the destination.
     assert not (tmp_path / 'escaped_parent').exists()
     assert not os.path.exists('/tmp/pwned')  # noqa: S108
     assert not (dest / 'link_to_root').exists()
@@ -235,9 +228,8 @@ def test_reference_closed_filter_used_by_stock_extractall(tmp_path):
 
 
 def test_pack_tar_neutralizes_escaping_hardlink(ws_dir, secret):
-    # A hardlink inside the workspace to a file OUTSIDE it: the inode is also
-    # named outside, so its content is shared out of bounds. pack must not copy
-    # it out, and must record the neutralization (never silent).
+    # A hardlink inside the workspace to a file outside it: the inode is named
+    # outside too, so its content is shared out of bounds.
     os.link(str(secret), ws_dir / 'innocent.txt')  # secret nlink 1 -> 2
     (ws_dir / 'real.txt').write_text('legit')
     buf = io.BytesIO()
@@ -253,8 +245,8 @@ def test_pack_tar_neutralizes_escaping_hardlink(ws_dir, secret):
 
 
 def test_pack_tar_keeps_internal_hardlink(ws_dir):
-    # Two names inside the workspace for one inode: fully accounted for within
-    # the tree, so it is safe and both are packed.
+    # Two names inside the workspace for one inode: fully accounted for, so both
+    # are packed.
     (ws_dir / 'a.txt').write_text('shared')
     os.link(ws_dir / 'a.txt', ws_dir / 'b.txt')
     buf = io.BytesIO()
@@ -286,8 +278,8 @@ def test_pack_tar_exclude_prunes_subtree(ws_dir):
 
 
 def test_pack_tar_skips_unreadable_entry_without_aborting(ws_dir, monkeypatch):
-    # A concurrent type-swap makes the confined open fail; pack must record it
-    # and continue, not abort the whole archive (on_unsafe='skip').
+    # A concurrent type-swap makes the confined open fail; under on_unsafe='skip'
+    # pack records it and continues rather than abandoning the archive.
     (ws_dir / 'a.txt').write_text('a')
     (ws_dir / 'b.txt').write_text('b')
     buf = io.BytesIO()

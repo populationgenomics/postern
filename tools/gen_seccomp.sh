@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Regenerate src/postern/_seccomp.bpf from the syscall lists in
-# postern/_seccomp.py, using libseccomp inside a linux/amd64 container (so it
-# runs on any host, including macOS/arm64 via Docker Desktop emulation).
+# Regenerate src/postern/_seccomp.bpf and _seccomp.spec from the syscall lists in
+# src/postern/_seccomp.py, using libseccomp inside a linux/amd64 container so it
+# runs on any host including macOS/arm64.
 #
-# Run this whenever BLOCKED_EPERM / BLOCKED_ENOSYS or the arg-filtered rules
-# change. The committed .bpf is what ships; installing postern needs no
-# libseccomp. Building on amd64 resolves the full x86-centric syscall list; the
-# secondary arches (x86, x32, aarch64, arm) get whichever of those exist there.
+# Run it whenever BLOCKED_EPERM, BLOCKED_ENOSYS, the arg-filtered rules or
+# GEN_ARCHES change. Building on amd64 resolves the x86-centric syscall list; the
+# secondary arches get whichever of those syscalls exist there.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

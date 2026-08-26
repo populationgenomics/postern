@@ -52,7 +52,7 @@ def test_unlisted_method_is_permission_denied():
 
 
 def test_socket_perms_are_deterministic_and_guest_connectable():
-    # F9: explicit 0666 so a non-root guest can connect, not umask-dependent;
+    # Explicit 0666 so a non-root guest can connect whatever the umask;
     # host-side isolation rests on the 0700 mkdtemp dir, not the socket mode.
     hatch = GrpcHatch(allowlist={_ALLOWED})
     _install_echo(hatch._server)
@@ -65,8 +65,7 @@ def test_socket_perms_are_deterministic_and_guest_connectable():
 
 
 def test_hatch_reused_across_calls():
-    # A session makes many run_python calls against one hatch; the server must
-    # start once and stay up (a gRPC server cannot be restarted).
+    # A gRPC server cannot be restarted, so accepting() must be re-enterable.
     hatch = GrpcHatch(allowlist={_ALLOWED})
     _install_echo(hatch._server)
     with hatch.accepting(), grpc.insecure_channel(f'unix:{hatch.socket_path}') as channel:

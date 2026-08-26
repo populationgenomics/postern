@@ -11,8 +11,8 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Centre for Population Genomics" }]
 keywords = ["sandbox", "bubblewrap", "isolation", "untrusted-code", "seccomp", "rpc", "agent", "tool-use"]
-# The core has NO runtime dependencies — pure stdlib (subprocess, socket, json),
-# bubblewrap at the OS layer. gRPC hatch and provider adapters are extras.
+# The core is pure stdlib, with bubblewrap at the OS layer. The gRPC hatch is an
+# extra; the stream hatch is stdlib too.
 dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -36,14 +36,12 @@ grpc = ["grpcio>=1.60"]
 Repository = "https://github.com/populationgenomics/postern"
 Issues = "https://github.com/populationgenomics/postern/issues"
 
-# Supply-chain age gate: never resolve a release younger than 7 days (relative,
-# in-repo so CI and contributors inherit it).
+# Supply-chain age gate: never resolve a release younger than 7 days.
 [tool.uv]
 exclude-newer = "7 days"
 
-# grpcio (the `grpc` extra) is in the dev groups so the hatch tests run and
-# pyright resolves postern.grpc + the hatch tests; consumers opt in via the
-# `grpc` extra.
+# grpcio is in both groups so the hatch tests run and pyright resolves
+# postern.grpc; consumers opt in through the `grpc` extra instead.
 [dependency-groups]
 test = ["pytest", "grpcio>=1.60"]
 # typing-extensions: type-check-only backport of typing.Self for the 3.10 floor
@@ -81,17 +79,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# The in-sandbox shim is stdlib-only, dynamic (host.<attr> dispatch), run as a
-# script and never imported by the package — held to correctness, not API rigor.
+# The in-sandbox scripts: stdlib-only, bound in and exec'd by name, never imported
+# by the package. Held to correctness rather than API rigor.
 "src/postern/_guest.py" = ["T201", "BLE001", "ANN", "D", "SLF001"]
-# Same category as the shim: a stdlib-only script that runs *inside* the sandbox,
-# bound in and exec'd by name, never imported by the package.
 "src/postern/_stream_connect.py" = ["T201", "BLE001", "ANN", "D", "SLF001"]
 "src/postern/_sandbox.py" = ["S603"]
-# Workspace (the confined-root capability) and WorkspacePath (its pathlib-like
-# facade) are one cohesive deep module: the facade delegates to the capability's
-# internal confined primitives (_lstat/_open_dir/…), so intra-module private
-# access between the two is by design, not a leak.
+# WorkspacePath is the facade over Workspace's confined primitives (_lstat,
+# _open_dir, …), so private access between the two is by design.
 "src/postern/_workspace.py" = ["SLF001"]
 "tests/**" = ["S101", "S102", "S603", "S607", "SLF001", "ANN", "D", "PLR2004", "T201"]
 # Runnable examples: gRPC servicer methods are PascalCase; print is the UI; no

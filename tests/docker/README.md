@@ -1,10 +1,10 @@
 # Docker test harness
 
-postern is a Linux + bubblewrap primitive: the bubblewrap-gated e2e tests
-(`test_sandbox_e2e.py`, `test_hatch_e2e.py`) `skip` unless `postern.available()`
-finds `bwrap` on the PATH. On macOS there is no `bwrap`, so those tests never
-run locally. This harness runs the whole suite inside a Linux container instead,
-so a macOS/arm64 machine (Docker Desktop) exercises the real isolation path.
+postern is a Linux + bubblewrap primitive: the bubblewrap-gated e2e tests skip
+unless `postern.available()` finds `bwrap` on the PATH. On macOS there is no
+`bwrap`, so those tests never run locally. This harness runs the whole suite
+inside a Linux container instead, so a macOS/arm64 machine (Docker Desktop)
+exercises the real isolation path.
 
 ## Run
 
@@ -14,7 +14,7 @@ tests/docker/run.sh tests/test_hatch_e2e.py -v   # trailing args pass to pytest
 ```
 
 The image (`tests/docker/Dockerfile`) carries only the toolchain — bubblewrap,
-grpcio, pytest. The source is bind-mounted read-only at `/repo` and put on
+git, grpcio, pytest. The source is bind-mounted read-only at `/repo` and put on
 `PYTHONPATH`, so editing a test and re-running needs no rebuild.
 
 ## Why the two `--security-opt` flags
@@ -35,13 +35,14 @@ but grants far more than bubblewrap needs.
 
 ## Architecture notes
 
-The seccomp filter is now a prebuilt multi-arch BPF blob (see
-`tools/gen_seccomp.py`), so it loads and enforces on aarch64 too:
-`test_seccomp_blocks_unshare` proves it on the native arm64 container.
+The committed seccomp filter is a multi-arch BPF blob (see `tools/gen_seccomp.py`
+and `COVERED_ARCHES` in `src/postern/_seccomp.py`), so it enforces on aarch64 as
+well as x86_64: `test_seccomp_blocks_unshare` proves it on a native arm64
+container.
 
 Do **not** run this harness under `--platform linux/amd64` on an Apple Silicon
 host. Docker Desktop's x86_64 emulation (Rosetta/QEMU) cannot load *any*
 seccomp-BPF filter — `bwrap` fails with `prctl(PR_SET_SECCOMP) reported EINVAL`
 even for a trivial allow-all filter. That is an emulation limitation, not a
-postern bug. Validate the x86_64 filter on a real x86_64 Linux host (e.g. CI);
+postern bug. Validate the x86_64 filter on a real x86_64 Linux host (CI does);
 validate aarch64 with this harness natively.

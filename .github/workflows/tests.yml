@@ -38,7 +38,7 @@ jobs:
       - run: uv run pytest -q
 
   seccomp-drift:
-    # Authoritative F4 check: regenerate the blob from the syscall lists with
+    # The authoritative drift check: regenerate the blob from the syscall lists with
     # libseccomp and fail if the committed _seccomp.bpf / _seccomp.spec differ.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
