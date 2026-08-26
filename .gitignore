@@ -8,4 +8,5 @@ dist/
 .pytest_cache/
 .mypy_cache/
 attic/
+.claude/
 .DS_Store
