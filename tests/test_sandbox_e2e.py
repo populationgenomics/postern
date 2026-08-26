@@ -18,6 +18,45 @@ def test_run_python_sealed():
     assert result.stdout.strip() == '4'
 
 
+def test_run_python_propagates_exit_status():
+    # The status has to survive the re-exec, the fork and the reap.
+    result = Sandbox().run_python('import sys; sys.exit(7)')
+    assert result.returncode == 7
+
+
+def test_run_arbitrary_argv():
+    result = Sandbox().run(['echo', 'argv-works'])
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == 'argv-works'
+
+
+def test_run_bash():
+    result = Sandbox().run_bash('echo supervised')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == 'supervised'
+
+
+def test_run_bash_inherits_rlimit_nproc():
+    # The cap is set before the exec, so bash carries it across.
+    result = Sandbox(SandboxProfile(rlimit_nproc=8)).run_bash('ulimit -u')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '8'
+
+
+def test_run_missing_program_is_127():
+    result = Sandbox().run(['definitely-not-a-program'])
+    assert result.returncode == 127
+    assert 'cannot exec' in result.stderr
+
+
+def test_run_python_address_space_limit_does_not_break_startup():
+    # RLIMIT_AS lands after the re-exec'd interpreter is up: a fresh CPython's
+    # virtual size at startup would trip a cap applied before the execvp.
+    result = Sandbox(SandboxProfile(rlimit_as=1024 * 1024 * 1024)).run_python('print(sum(range(1000)))')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '499500'
+
+
 def test_seccomp_blocks_unshare():
     # unshare(CLONE_NEWUSER) needs no capability, so --cap-drop ALL would let it
     # through; only the seccomp filter stops it.
@@ -76,7 +115,7 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
 
 
 def test_pid1_is_the_guest_entrypoint_not_bwrap():
-    # --as-pid-1 runs the shim as PID 1; the shim then forks the guest.
+    # --as-pid-1 runs the shim as PID 1; the shim then forks the work.
     result = Sandbox().run_python('import os; print(os.getpid(), open("/proc/1/comm").read().strip())')
     assert result.ok, result.stderr
     pid, comm = result.stdout.split()

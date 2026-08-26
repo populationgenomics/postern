@@ -18,8 +18,8 @@ gate the host opens.
 - **Sandbox** — the sealed wall. One bubblewrap-launched process with the
   hardened profile: empty network namespace (no egress), surgical read-only
   filesystem, `--cap-drop ALL`, `--new-session` and a seccomp denylist. Runs a
-  guest via `run` (raw argv) or `run_python` (the shim path, which adds the
-  `RLIMIT_NPROC` backstop). The security-critical module.
+  guest via `run` (an argv), `run_bash` (a shell script) or `run_python` (Python
+  code), all three under the shim. The security-critical module.
 
 - **SandboxProfile** — the description of a sealed wall: workspace, rootfs,
   interpreter, extra read-only binds, stubs, env, and the seccomp/rlimit knobs.
@@ -74,10 +74,11 @@ gate the host opens.
   image-build time (never a runtime container engine). `None` binds the host's
   own system dirs — convenient for dev, exposes the host userland read-only.
 
-- **Shim** (`_guest.py`) — the in-sandbox entrypoint for `run_python`. Runs
-  *inside* the wall, so it is stdlib-only: it applies `RLIMIT_NPROC` and
-  `RLIMIT_AS`, then `exec`s the guest code as PID 1's forked child. The host↔shim
-  handshake rides three env vars (`POSTERN_CODE`, `POSTERN_NPROC`,
+- **Shim** (`_guest.py`) — the in-sandbox entrypoint for every run, and PID 1 of
+  the guest's namespace. Runs *inside* the wall, so it is stdlib-only: it forks,
+  the child applies `RLIMIT_NPROC` and `RLIMIT_AS` and then `exec`s the work, and
+  the shim reaps the namespace. The host↔shim handshake rides five env vars
+  (`POSTERN_ARGV`, `POSTERN_CODE`, `POSTERN_RECODE`, `POSTERN_NPROC`,
   `POSTERN_AS`).
 
 - **Stubs** — importable modules injected at `/run/postern/stubs` (on the
