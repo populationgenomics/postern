@@ -29,8 +29,7 @@ import tempfile
 import typing
 from collections.abc import Callable, Sequence
 
-from postern import _seccomp
-from postern._workspace import Workspace
+from postern import _seccomp, _workspace
 
 if typing.TYPE_CHECKING:
     # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
@@ -441,7 +440,7 @@ class Sandbox:
         """The host directory bound read-write at ``/workspace`` (the guest cwd)."""
         return self._workspace
 
-    def accessor(self) -> Workspace:
+    def accessor(self) -> _workspace.Workspace:
         """A reference-closed :class:`~postern.Workspace` over the workspace.
 
         Read, pack or restore the guest's workspace through this rather than
@@ -451,7 +450,7 @@ class Sandbox:
         Sandbox. Use it as a context manager, or call ``close()``, to release its
         anchor fd.
         """
-        return Workspace(self._workspace)
+        return _workspace.Workspace(self._workspace)
 
     def _launch(
         self,

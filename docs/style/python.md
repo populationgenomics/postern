@@ -47,8 +47,10 @@ The cost is a little extra typing at call sites. It's worth it.
 - Names from `typing` (`Any`, `Protocol`, `TypeVar`, `NoReturn`, …) and from `collections.abc` (`Iterator`, `Iterable`,
   `Mapping`, `Sequence`, `Callable`, …). These are language vocabulary; qualifying them adds noise without clarity.
 - `from __future__ import ...` — future-statement syntax, not a normal import.
-- The re-exports in [`../../src/postern/__init__.py`](../../src/postern/__init__.py). That file *is* the public API
-  surface; naming each exported symbol is its job.
+- A module's own `__all__` re-exports: [`../../src/postern/__init__.py`](../../src/postern/__init__.py) is the
+  package's public API surface, and `postern.stream` re-exports `guest_env_var` and `guest_socket_path` as the surface a
+  caller building a guest command line by hand reaches them through. Naming each exported symbol is that line's job.
+  Everything a module imports for its *own* use goes through the module, even from a sibling in the same package.
 - Tests and examples importing postern's own public API (`from postern import Sandbox`), which reads as the consumer
   code it stands in for.
 
