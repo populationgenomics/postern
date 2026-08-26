@@ -27,8 +27,10 @@ from postern.stream import (
     Process,
     Stream,
     StreamHatch,
+    Upstream,
     git_url,
     splice_subprocess,
+    splice_tcp,
 )
 
 _DEADLINE = 10.0
@@ -148,6 +150,36 @@ def test_cwd_is_honoured(tmp_path):
     handler = splice_subprocess(['cat', 'marker'], cwd=tmp_path)
     with _serving(StreamHatch(handler)) as hatch:
         assert _exchange(hatch, b'') == b'here\n'
+
+
+# -- batteries: an upstream socket ------------------------------------------ #
+def test_upstream_socket_is_spliced_both_ways():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(('127.0.0.1', 0))
+    server.listen(1)
+
+    def echo_once():
+        conn, _ = server.accept()
+        while chunk := conn.recv(65536):
+            conn.sendall(chunk.upper())
+        conn.close()
+
+    threading.Thread(target=echo_once, daemon=True).start()
+    host, port = server.getsockname()
+    with _serving(StreamHatch(splice_tcp(host, port))) as hatch:
+        assert _exchange(hatch, b'shout') == b'SHOUT'
+    server.close()
+
+
+def test_splice_tcp_refusal_is_just_a_closed_connection():
+    # A raw stream has no way to say "no"; a failed dial is end-of-stream and
+    # nothing else.
+    dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    dead.bind(('127.0.0.1', 0))
+    port = dead.getsockname()[1]
+    dead.close()  # nothing listens there now
+    with _serving(StreamHatch(splice_tcp('127.0.0.1', port, timeout=1))) as hatch:
+        assert _exchange(hatch, b'anyone home') == b''
 
 
 # -- core: the handler is the policy ---------------------------------------- #
@@ -477,3 +509,10 @@ def test_verdicts_are_plain_data():
         proc.wait(timeout=30)
         left.close()
         right.close()
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert Upstream(sock).sock is sock
+        assert dataclasses.is_dataclass(Upstream(sock))
+    finally:
+        sock.close()
