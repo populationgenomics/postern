@@ -1,9 +1,8 @@
 # postern — domain glossary
 
-The shared vocabulary for postern. Architecture reviews and design discussions
-should use these names for the domain, and the `/codebase-design` terms
-(module, interface, depth, seam, adapter, leverage, locality) for the structure
-— e.g. "the **Hatch** seam", not "the gRPC service".
+The shared vocabulary for postern. Reviews and design discussions should use these
+names for the domain and structural terms (module, interface, depth, seam,
+adapter) for the shape — e.g. "the **Hatch** seam", not "the gRPC service".
 
 The founding metaphor: a *postern* is the small guarded gate through an
 otherwise sealed wall. Guest code runs behind a sealed wall (no network, no
@@ -18,10 +17,9 @@ gate the host opens.
 
 - **Sandbox** — the sealed wall. One bubblewrap-launched process with the
   hardened profile: empty network namespace (no egress), surgical read-only
-  filesystem, `--cap-drop ALL`, `--new-session`, a seccomp denylist, and an
-  `RLIMIT_NPROC` backstop. Runs a guest via `run` (raw argv) or `run_python`
-  (the shim path). The security-critical module — the one the design exists to
-  protect.
+  filesystem, `--cap-drop ALL`, `--new-session` and a seccomp denylist. Runs a
+  guest via `run` (raw argv) or `run_python` (the shim path, which adds the
+  `RLIMIT_NPROC` backstop). The security-critical module.
 
 - **SandboxProfile** — the description of a sealed wall: workspace, rootfs,
   interpreter, extra read-only binds, stubs, env, and the seccomp/rlimit knobs.
@@ -31,14 +29,19 @@ gate the host opens.
 
 - **Hatch** — the gate: the guest's *only* channel to the outside. A `Protocol`
   (`socket_path`, `accepting()`) the Sandbox binds in and nothing else. The
-  security boundary is not a permission flag but *the set of methods the hatch
-  exposes*. Today the sole adapter is the gRPC hatch.
+  security boundary is not a permission flag but *what the hatch exposes*. Two
+  adapters: `GrpcHatch` and `StreamHatch`.
 
 - **GrpcHatch** — the gRPC adapter of the Hatch seam. Serves host-provided
   servicers over the sandbox's Unix domain socket, gated by a method
   **allowlist**. The servicer runs in the trusted host process; the guest calls
   it with a generated stub over `unix:$POSTERN_HATCH`. Requires the `grpc`
   extra.
+
+- **StreamHatch** — the raw-stream adapter of the Hatch seam. One socket per
+  resource; per accepted connection a handler decides whether its bytes are
+  spliced to a host-side subprocess's stdio. Named, so a sandbox carries several
+  (`$POSTERN_HATCH_<NAME>`). Stdlib-only.
 
 - **Allowlist** — the capability grant. The exact `/package.Service/Method`
   names the guest may call through the hatch; everything else is
@@ -61,10 +64,9 @@ gate the host opens.
   `root -> /`, a FIFO) that are inert in the jail but turn the host into a
   confused deputy when it reads/tars/restores the tree. postern enforces closure
   with a **confined root** — `Workspace` (the capability, modelled on Go's
-  `os.Root`) and `WorkspacePath` (its `pathlib`-like facade) — that resolves
+  `os.Root`) and `WorkspacePath` (its `pathlib`-like facade) — which resolves
   every component with `O_NOFOLLOW` and never exposes a dereferenceable host
-  path, so consumers get "read/pack/restore this workspace safely" as an API
-  instead of reimplementing confinement. A sticky world-writable workspace and
+  path. A sticky world-writable workspace and
   `reference_closed_filter` (for stock `tarfile`) are the supporting defenses.
 
 - **Rootfs** — a curated base directory bound as the guest's `/usr`, `/lib`, …
@@ -73,9 +75,10 @@ gate the host opens.
   own system dirs — convenient for dev, exposes the host userland read-only.
 
 - **Shim** (`_guest.py`) — the in-sandbox entrypoint for `run_python`. Runs
-  *inside* the wall, so it is stdlib-only: it applies `RLIMIT_NPROC` and then
-  `exec`s the guest code. The host↔shim handshake rides three env vars
-  (`POSTERN_CODE`, `POSTERN_NPROC`, `POSTERN_HATCH`).
+  *inside* the wall, so it is stdlib-only: it applies `RLIMIT_NPROC` and
+  `RLIMIT_AS`, then `exec`s the guest code as PID 1's forked child. The host↔shim
+  handshake rides three env vars (`POSTERN_CODE`, `POSTERN_NPROC`,
+  `POSTERN_AS`).
 
 - **Stubs** — importable modules injected at `/run/postern/stubs` (on the
   guest's `PYTHONPATH`). Lets one shared rootfs carry the heavy base while the
@@ -84,7 +87,7 @@ gate the host opens.
 
 ## Layering
 
-The bare **Sandbox** is a Linux + bubblewrap primitive with no third-party and
-no cloud dependency. The **GrpcHatch** lives behind the `grpc` extra. Consumers
-inject *policy* (which servicers, which allowlist, which profile), not isolation
-mechanics — the hardened wall is meant to live in one reviewed place.
+The bare **Sandbox** is a Linux + bubblewrap primitive with no third-party and no
+cloud dependency. **GrpcHatch** lives behind the `grpc` extra; **StreamHatch** is
+stdlib. Consumers inject *policy* — which servicers, which allowlist, which
+handler, which profile — not isolation mechanics.

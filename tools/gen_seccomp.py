@@ -1,13 +1,13 @@
 """Compile postern's seccomp denylist to a committed multi-arch BPF blob.
 
-Run on Linux with the libseccomp Python bindings (Debian: python3-libseccomp).
+Run on Linux with the libseccomp Python bindings (Debian: ``python3-seccomp``).
 ``tools/gen_seccomp.sh`` wraps this in a linux/amd64 container so it runs on any
-host. The syscall lists come from ``postern._seccomp`` (the source of truth);
-this script only turns them into the ``_seccomp.bpf`` the runtime loads.
+host. The syscall lists come from ``postern._seccomp``; this script only turns
+them into the ``_seccomp.bpf`` the runtime loads.
 
-Generate on amd64 so the full (x86-centric) Flatpak list resolves against the
-native syscall table; the secondary architectures added below get whichever of
-those syscalls exist there and silently skip the rest.
+Generate on amd64 so the x86-centric Flatpak list resolves against the native
+syscall table; the secondary architectures get whichever of those syscalls exist
+there and skip the rest.
 """
 
 from __future__ import annotations
@@ -28,10 +28,8 @@ from postern import _seccomp  # import after sys.path tweak — needs the src pa
 _OUT = _ROOT / 'src' / 'postern' / _seccomp._BPF_RESOURCE
 _SPEC_OUT = _ROOT / 'src' / 'postern' / _seccomp._SPEC_RESOURCE
 
-# Cover the compat ABIs too (Flatpak does the same) so a blocked syscall cannot
-# be reached via a different architecture's syscall table. The arch set lives in
-# postern._seccomp (the source of truth the drift digest hashes); the native
-# arch of the build host is already present, so re-adding it is a harmless no-op.
+# The compat ABIs too, so a blocked syscall cannot be reached through a different
+# architecture's syscall table.
 _ARCHES = tuple(getattr(seccomp.Arch, name) for name in _seccomp.GEN_ARCHES)
 
 
@@ -39,7 +37,7 @@ def build() -> seccomp.SyscallFilter:
     f = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
     for arch in _ARCHES:
         with contextlib.suppress(ValueError, RuntimeError):
-            f.add_arch(arch)  # already present (native) — fine
+            f.add_arch(arch)  # the build host's native arch is already present
     for name in _seccomp.BLOCKED_EPERM:
         f.add_rule(seccomp.ERRNO(errno.EPERM), name)
     for name in _seccomp.BLOCKED_ENOSYS:
@@ -61,9 +59,7 @@ def main() -> None:
     with _OUT.open('wb') as out:
         f.export_bpf(out)
     print(f'wrote {_OUT.relative_to(_ROOT)} ({_OUT.stat().st_size} bytes)')
-    # Record the drift manifest alongside: the source-spec digest plus the blob
-    # hash, so a stale blob is caught without libseccomp (see _seccomp.manifest
-    # and tests/test_seccomp.py). Written after the blob so the hash is current.
+    # After the blob, so the hash it records is current.
     _SPEC_OUT.write_text(json.dumps(_seccomp.manifest(), indent=2, sort_keys=True) + '\n')
     print(f'wrote {_SPEC_OUT.relative_to(_ROOT)}')
 

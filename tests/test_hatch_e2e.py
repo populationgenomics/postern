@@ -1,13 +1,12 @@
 """End-to-end: sealed sandbox + gRPC hatch + allowlist, all at once.
 
-The rest of the e2e suite covers the *sealed* sandbox (no hatch). This is the
-whole postern promise in one run: untrusted guest code, no network and no host
-filesystem, reaching the outside world *only* by dialing the bound hatch UDS —
-an allowlisted method succeeds, a non-allowlisted one is ``PERMISSION_DENIED``.
+Untrusted guest code with no network and no host filesystem, reaching the outside
+world only by dialing the bound hatch UDS: an allowlisted method succeeds, a
+non-allowlisted one is ``PERMISSION_DENIED``.
 
 Requires Linux + bubblewrap (skipped elsewhere) and grpcio in the guest's
-environment. The default profile binds the host ``/usr`` read-only, so grpcio
-installed in site-packages is importable by the guest interpreter — no venv or
+environment. The default profile binds the host ``/usr`` read-only, so grpcio in
+the system site-packages is importable by the guest interpreter — no venv or
 generated stubs needed. Like ``test_grpc_hatch``, it uses a raw-bytes generic
 handler instead of protoc output so it runs anywhere grpcio is installed.
 """
@@ -22,8 +21,7 @@ pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubble
 
 _ALLOWED = '/svc.Echo/Allowed'
 
-# Guest code: dial the hatch, call an allowlisted method (echoes back), then a
-# non-allowlisted one (must be refused). Prints outcomes for the host to assert.
+# Prints its outcomes for the host to assert on.
 _GUEST = """
 import os, grpc
 
@@ -60,14 +58,13 @@ def test_guest_reaches_allowlisted_method_and_is_denied_the_rest():
     result = Sandbox(SandboxProfile(), hatch=hatch).run_python(_GUEST)
     hatch.close()
     assert result.ok, result.stderr
-    assert 'ALLOWED ping' in result.stdout  # allowlisted call went through and echoed
-    assert 'DENIED PERMISSION_DENIED' in result.stdout  # non-allowlisted call refused
+    assert 'ALLOWED ping' in result.stdout
+    assert 'DENIED PERMISSION_DENIED' in result.stdout
     assert 'DENIED reached' not in result.stdout
 
 
 def test_guest_has_no_network_but_still_reaches_the_hatch():
-    # The hatch works over the bound UDS even though the netns has no route out:
-    # proves the socket the guest opens is the hatch, not egress.
+    # The hatch works over the bound UDS even though the netns has no route out.
     hatch = GrpcHatch(allowlist={_ALLOWED})
     _install_echo(hatch._server)
     code = (

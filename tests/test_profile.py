@@ -12,8 +12,8 @@ def test_hardened_flags_present():
 
 def test_user_and_cgroup_namespaces_are_strict():
     # Explicit --unshare-user/--unshare-cgroup upgrade --unshare-all's best-effort
-    # -try variants, so a missing user namespace is a hard launch failure (F1)
-    # rather than a silent fall-through to a real-root guest.
+    # -try variants, so a missing user namespace is a launch failure rather than a
+    # silent fall-through to a real-root guest.
     argv = build_base_argv(SandboxProfile(), seccomp_fd=None)
     assert '--unshare-user' in argv
     assert '--unshare-cgroup' in argv
@@ -61,8 +61,7 @@ def test_proc_sysctl_surface_masked_read_only():
 
 
 def test_bwrap_credentials_no_drop_by_default():
-    # host_uid unset: no privilege drop (the /proc/sys mask is the default fix,
-    # and dropping needs the deploy to make bind sources reachable).
+    # host_uid unset: no privilege drop, at either euid.
     assert bwrap_credentials(SandboxProfile(), euid=0) == {}
     assert bwrap_credentials(SandboxProfile(), euid=1000) == {}
 
@@ -70,10 +69,9 @@ def test_bwrap_credentials_no_drop_by_default():
 def test_bwrap_credentials_opt_in_when_root():
     # host_uid set + we are root: run bwrap non-root, dropping supplementary groups.
     creds = bwrap_credentials(SandboxProfile(host_uid=65534), euid=0)
-    assert creds == {'user': 65534, 'group': 65534, 'extra_groups': []}
-    # host_gid overrides; falls back to guest_gid otherwise.
+    assert creds == {'user': 65534, 'group': 65534, 'extra_groups': []}  # gid from guest_gid
     creds = bwrap_credentials(SandboxProfile(host_uid=100000, host_gid=100000, guest_gid=65534), euid=0)
-    assert creds == {'user': 100000, 'group': 100000, 'extra_groups': []}
+    assert creds == {'user': 100000, 'group': 100000, 'extra_groups': []}  # host_gid wins
 
 
 def test_bwrap_credentials_ignored_when_not_root():

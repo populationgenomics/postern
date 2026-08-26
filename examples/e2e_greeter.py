@@ -7,9 +7,9 @@ grpcio + pandas + the generated greeter stubs:
         --grpc_python_out=<site-packages> examples/greeter.proto
     <venv>/bin/python examples/e2e_greeter.py
 
-The guest, inside the sealed sandbox, dials the hatch, calls the *allowlisted*
-SayHello, uses pandas, confirms a non-allowlisted method is denied, and confirms
-there is no network. The servicer runs in this trusted host process.
+The guest dials the hatch, calls the allowlisted ``SayHello``, uses pandas, and
+confirms that a non-allowlisted method is denied and that there is no network.
+The servicer runs in this trusted host process.
 """
 
 from __future__ import annotations

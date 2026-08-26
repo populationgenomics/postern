@@ -78,8 +78,8 @@ number the kernel has since handed to somebody else.
 Three tiers observe the exit, in ``_WAITID``'s order, because no single interface
 is portable:
 
-1. ``os.waitid(..., WNOWAIT)``. Always present on Linux; on macOS its presence is a
-   property of the *build* rather than of the platform, hence the ``getattr``.
+1. ``os.waitid(..., WNOWAIT)``. Always present on Linux. On darwin CPython exposes
+   it only from 3.13, and the floor here is 3.10, hence the ``getattr``.
 2. ``kqueue``/``EVFILT_PROC``/``NOTE_EXIT`` on macOS and the BSDs. ``EVFILT_PROC``
    reports an immediate ``NOTE_EXIT`` for a pid that does not exist *at all*, so a
    registration only answers the question for a pid we own and have not reaped.
@@ -123,13 +123,10 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from concurrent import futures
 
-from postern._sandbox import (
-    GUEST_CONNECT,
-    SandboxProfile,
-    guest_env_var,
-    guest_socket_path,
-    validate_guest_name,
-)
+from postern import _sandbox
+
+# Bound as names, not reached through _sandbox: __all__ below re-exports these two.
+from postern._sandbox import guest_env_var, guest_socket_path
 
 _CHUNK = 65536
 # Concurrent connections a hatch serves at once; gates accepting, not dispatch.
@@ -154,7 +151,7 @@ _EXIT_POLL = 0.02
 # empty: a quiet-period test, not a share of `grace`, which caps the whole drain.
 _DRAIN_QUIET = 0.1
 # The exit-observation tiers; see "Teardown and its caveats" above. waitid through
-# getattr because its presence on macOS is a property of the build.
+# getattr: CPython exposes it on darwin only from 3.13, and the floor here is 3.10.
 _WAITID = getattr(os, 'waitid', None)
 _P_PID = getattr(os, 'P_PID', 0)
 _WEXITED = getattr(os, 'WEXITED', 0)
@@ -203,8 +200,9 @@ class Stream:
 
     **The socket is handed over, not lent.** A `Process` verdict makes it the
     command's stdin and stdout, so it is normalised at handover — blocking, no
-    signal-driven I/O, no socket timeouts — and anything a handler configured on it
-    is undone. In particular do not reach for :meth:`socket.socket.settimeout` to
+    signal-driven I/O, no socket timeouts — and a handler's settings for those
+    properties are undone (:func:`_normalise_stdio` lists what it leaves alone). In
+    particular do not reach for :meth:`socket.socket.settimeout` to
     bound a preamble read: CPython implements it by setting ``O_NONBLOCK``, which
     lives on the open file description the command's fds 0 and 1 are dup2's of, so
     it truncates the command's response and the guest reads that as a clean
@@ -305,8 +303,8 @@ class Process:
         return self._pgid
 
     def __post_init__(self) -> None:
-        # Before the argv check and before from_popen's early return, so no
-        # construction path skips it.
+        # Ahead of the argv check, so a Process() with no argv is still checked.
+        # An adopted Popen's real fd 2 is not visible here — _attach checks that.
         _check_stderr(self.stderr)
         if self.argv is None:
             return  # from_popen, or a Process() the hatch will refuse at attach
@@ -506,9 +504,10 @@ def splice_subprocess(
             repository``), so relaying them hands the guest a map of the host
             filesystem. Point it at a file or an fd to keep them.
 
-            ``subprocess.PIPE`` is refused: nothing reads it, so a command that
-            fills the pipe blocks in ``write(2)`` for ever and never exits, pinning
-            the connection's slot until :meth:`StreamHatch.close`.
+            ``subprocess.STDOUT`` is refused for that reason, and
+            ``subprocess.PIPE`` because nothing reads it, so a command that fills the
+            pipe blocks in ``write(2)`` for ever and never exits, pinning the
+            connection's slot until :meth:`StreamHatch.close`.
 
             This covers fd 2 and nothing more. A command that multiplexes its own
             diagnostics onto **stdout** routes around it, and git does: ``git
@@ -545,7 +544,7 @@ def splice_subprocess(
 def git_url(
     name: str = 'stream',
     *,
-    profile: SandboxProfile | None = None,
+    profile: _sandbox.SandboxProfile | None = None,
     python: str | None = None,
 ) -> str:
     """The ``ext::`` URL a guest uses to reach the stream hatch called ``name``.
@@ -564,18 +563,17 @@ def git_url(
 
     Args:
         name: The hatch to reach.
-        profile: The profile the guest will run under. **Pass this.** The interpreter
-            comes from ``profile.python``, the same place :meth:`Sandbox.run_python`
-            gets it, so the URL cannot disagree with the sandbox it runs in. Without
-            it the default is a bare ``python3`` resolved from the guest ``PATH``,
+        profile: The profile the guest will run under; the interpreter comes from
+            ``profile.python``, so the URL cannot disagree with the sandbox it runs
+            in. Omitting it falls back to a bare ``python3`` off the guest ``PATH``,
             which ``SandboxProfile.with_venv`` does not touch and a curated
-            ``rootfs`` need not populate at all; the failure surfaces inside git's
-            helper as ``cannot run python3: No such file or directory``.
+            ``rootfs`` need not populate, and git reports that as
+            ``cannot run python3: No such file or directory``.
         python: An explicit interpreter, overriding ``profile``.
     """
-    validate_guest_name(name)
+    _sandbox.validate_guest_name(name)
     interpreter = python or (profile.python if profile is not None else 'python3')
-    return f'ext::{interpreter} {GUEST_CONNECT} {guest_socket_path(name)}'
+    return f'ext::{interpreter} {_sandbox.GUEST_CONNECT} {guest_socket_path(name)}'
 
 
 # --------------------------------------------------------------------------- #
@@ -616,14 +614,13 @@ class StreamHatch:
                 ``POSTERN_HATCH_<NAME>``. A Python identifier, because it becomes
                 both a path component and an environment variable name.
             socket_path: Where to bind the host-side UDS. Defaults to a fresh
-                ``0700`` temp dir (host-side isolation rests on that dir, per F9).
-                **The socket itself is chmod'd 0666**, deterministically rather than
-                by umask, because the guest runs as an unrelated uid and has to be
-                able to connect — so the containing directory is the entire
-                host-side access control. Pass a path only in a directory no other
-                local uid can traverse: a stable path somewhere convenient
-                (``/tmp/myservice.sock``) publishes the capability to every user on
-                the box.
+                ``0700`` temp dir. **The socket itself is chmod'd 0666**,
+                deterministically rather than by umask, because the guest runs as an
+                unrelated uid and has to be able to connect — so the containing
+                directory is the entire host-side access control. Pass a path only in
+                a directory no other local uid can traverse: a stable path somewhere
+                convenient (``/tmp/myservice.sock``) publishes the capability to
+                every user on the box.
             max_conns: Concurrent connections served. Gates **accepting**, not
                 dispatch to a worker pool: a stream connection is long-lived by
                 definition, so a queue of already-accepted connections would be a
@@ -641,7 +638,7 @@ class StreamHatch:
                 before ``kill()``, and for the guest to close after we half-close.
                 Bounds teardown; it is not a limit on the stream's lifetime.
         """
-        validate_guest_name(name)
+        _sandbox.validate_guest_name(name)
         self._handler = handler
         self._name = name
         self._grace = grace
@@ -677,7 +674,7 @@ class StreamHatch:
     @property
     def guest_env_var(self) -> str:
         """The environment variable naming this hatch's socket inside the sandbox."""
-        return guest_env_var(self._name)
+        return _sandbox.guest_env_var(self._name)
 
     # -- serving lifecycle (mirrors GrpcHatch) ------------------------------- #
     def start(self) -> None:
@@ -695,8 +692,9 @@ class StreamHatch:
         srv.bind(self._path)
         self._bound = True
         srv.listen(self._backlog)
-        # Deterministic perms, not umask-dependent (F9): the guest runs as a
-        # non-root uid so must connect; host-side isolation rests on the 0700 dir.
+        # The guest runs as an unrelated uid and must be able to connect, and umask
+        # would otherwise decide whether it can. Host-side access control is the
+        # containing directory (see the socket_path argument), never this mode.
         with contextlib.suppress(OSError):
             os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
         self._srv = srv
@@ -997,10 +995,10 @@ def _readable(sock_or_fd: socket.socket | int, timeout: float) -> bool:
 def _drain(guest: socket.socket, grace: float) -> None:
     """Discard what the guest is still sending, bounded by ``grace``.
 
-    Closing an ``AF_UNIX`` socket while bytes remain unread in its receive queue
-    makes the kernel set ``ECONNRESET`` on the *peer* (``unix_release_sock``), so
-    the guest's next read fails with a reset instead of reporting end-of-stream, and
-    a client such as git reads that as a protocol error. Draining first turns the
+    On Linux, closing an ``AF_UNIX`` socket while bytes remain unread in its receive
+    queue makes the kernel set ``ECONNRESET`` on the *peer* (``unix_release_sock``),
+    so the guest's next read fails with a reset instead of reporting end-of-stream,
+    and a client such as git reads that as a protocol error. Draining first turns the
     close into an orderly one. ``grace`` bounds the whole drain, so a guest that
     keeps writing for ever gives up its slot anyway, at the price of the reset it
     brought on itself.
@@ -1083,7 +1081,7 @@ def _kq_exited(pid: int, timeout: float | None) -> bool | None:
         return None
     try:
         kq = _KQUEUE()
-    except OSError:  # pragma: no cover - only if the platform lies about kqueue
+    except OSError:  # only if the platform claims kqueue and then refuses it
         return None
     try:
         event = _KEVENT(

@@ -6,7 +6,7 @@ def test_auto_workspace_created_and_removed():
     workspace = sandbox.workspace
     assert workspace.is_dir()
     sandbox.close()
-    assert not workspace.exists()  # Sandbox-owned temp dir is cleaned up
+    assert not workspace.exists()
 
 
 def test_explicit_workspace_is_kept(tmp_path):
@@ -15,7 +15,7 @@ def test_explicit_workspace_is_kept(tmp_path):
     assert sandbox.workspace == ws
     assert ws.is_dir()
     sandbox.close()
-    assert ws.exists()  # caller-owned, not removed
+    assert ws.exists()
 
 
 def test_context_manager_cleans_up():

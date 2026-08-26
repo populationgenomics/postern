@@ -1,4 +1,4 @@
-# The static-check gate. `pre-commit run --all-files` is the whole gate.
+# `pre-commit run --all-files` is the whole static-check gate.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

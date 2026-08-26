@@ -1,7 +1,8 @@
 """End-to-end sandbox tests — require Linux + bubblewrap, skipped elsewhere.
 
-These cover the sealed sandbox (no hatch). The full gRPC-hatch + environment
-path is exercised by the standalone example against a real venv on a Linux host.
+These cover the sealed sandbox: no hatch is configured, so what is under test is
+the wall itself. The hatch paths are covered by ``test_hatch_e2e`` and
+``test_stream_e2e``.
 """
 
 import pytest
@@ -19,8 +20,7 @@ def test_run_python_sealed():
 
 def test_seccomp_blocks_unshare():
     # unshare(CLONE_NEWUSER) needs no capability, so --cap-drop ALL would let it
-    # through; only the seccomp filter stops it. A -1/EPERM proves the committed
-    # BPF blob loaded and is enforcing on this kernel/arch.
+    # through; only the seccomp filter stops it.
     code = (
         'import ctypes\n'
         'libc = ctypes.CDLL(None, use_errno=True)\n'
@@ -33,8 +33,7 @@ def test_seccomp_blocks_unshare():
 
 
 def test_seccomp_disabled_lets_unshare_through():
-    # The negative control: with seccomp off, the same call succeeds — so the
-    # test above is really measuring the filter, not some other layer.
+    # The negative control for the test above: with seccomp off the call succeeds.
     code = "import ctypes\nlibc = ctypes.CDLL(None, use_errno=True)\nprint('rc', libc.unshare(0x10000000))\n"
     result = Sandbox(SandboxProfile(seccomp=False)).run_python(code)
     assert result.ok, result.stderr
@@ -58,15 +57,12 @@ def test_network_is_denied():
 
 
 def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
-    # bwrap is PID 1 in the guest's PID namespace and (because --uid applies to
-    # it too) runs at the guest uid, so its /proc/1/environ is a same-uid read
-    # from inside the jail. --clearenv only scrubs the *guest's* env, not bwrap's
-    # own image, so a secret inherited from the trusted worker would leak here.
-    # The launcher must exec bwrap with a scrubbed environment.
+    # --clearenv scrubs the guest's environment, not bwrap's own process image, and
+    # bwrap runs at the guest uid, so a worker secret it inherited would be a
+    # same-uid environ read away. Two controls cover it — bwrap_env scrubbing what
+    # bwrap is exec'd with, and --as-pid-1 keeping bwrap out of the guest's PID
+    # namespace so /proc/1 is the shim's own non-dumpable init. Either is "clean".
     monkeypatch.setenv('WORKER_SESSION_TOKEN', 'worker-SECRET-should-not-leak')
-    # No secret must reach the guest via PID 1 — whether because bwrap's env is
-    # scrubbed or because --as-pid-1 makes PID 1 the guest's own non-dumpable init
-    # (so the read is denied outright). Either outcome is "clean".
     code = (
         'try:\n'
         '    data = open("/proc/1/environ", "rb").read()\n'
@@ -80,18 +76,17 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
 
 
 def test_pid1_is_the_guest_entrypoint_not_bwrap():
-    # --as-pid-1 runs the shim as PID 1, so there is no separate bwrap process in
-    # the namespace for the guest to read; the shim forks the guest (PID 2).
+    # --as-pid-1 runs the shim as PID 1; the shim then forks the guest.
     result = Sandbox().run_python('import os; print(os.getpid(), open("/proc/1/comm").read().strip())')
     assert result.ok, result.stderr
     pid, comm = result.stdout.split()
-    assert pid != '1'  # the guest is a child of the init, not PID 1 itself
-    assert comm != 'bwrap'  # PID 1 is our entrypoint, not a resident bwrap reaper
+    assert pid != '1'
+    assert comm != 'bwrap'
 
 
 def test_init_pid1_is_non_dumpable():
-    # The PID 1 init marks itself non-dumpable, so a co-uid guest cannot read its
-    # /proc/1 memory/environ/maps even though they share a uid.
+    # The init marks itself non-dumpable, so the co-uid guest cannot read its
+    # /proc/1 memory, environ or maps.
     code = (
         'import os\n'
         'try:\n'
@@ -107,23 +102,20 @@ def test_init_pid1_is_non_dumpable():
 def test_guest_runs_as_non_root_by_default():
     result = Sandbox().run_python('import os; print(os.getuid(), os.getgid())')
     assert result.ok, result.stderr
-    assert result.stdout.strip() == '65534 65534'  # nobody, not uid 0 in the userns (F2)
+    assert result.stdout.strip() == '65534 65534'  # nobody, not uid 0 in the userns
 
 
 def test_verify_passes_on_the_hardened_profile():
-    Sandbox().verify()  # must not raise on a correctly-configured sandbox
+    Sandbox().verify()
 
 
 def test_verify_fails_closed_without_seccomp():
-    # verify() is the "am I fully hardened" gate; a seccomp-disabled profile is
-    # not, so it must refuse rather than let the caller serve under it.
     with pytest.raises(IsolationError, match='seccomp'):
         Sandbox(SandboxProfile(seccomp=False)).verify()
 
 
 def test_rlimit_as_caps_guest_memory():
-    # A 256 MiB address-space cap makes a larger allocation fail inside the
-    # guest, without killing the co-located worker (F3 backstop).
+    # A 256 MiB address-space cap makes a larger allocation fail inside the guest.
     profile = SandboxProfile(rlimit_as=256 * 1024 * 1024)
     code = (
         'try:\n'
@@ -152,9 +144,8 @@ def test_workspace_persists_across_calls_and_is_host_readable(tmp_path):
     sandbox = Sandbox(SandboxProfile(workspace=tmp_path / 'ws'))
     # cwd is /workspace, so the relative write lands there.
     assert sandbox.run_python("open('note.txt', 'w').write('hello')").ok
-    second = sandbox.run_python("print(open('note.txt').read())")  # a separate sandbox invocation
+    second = sandbox.run_python("print(open('note.txt').read())")
     assert second.ok
     assert second.stdout.strip() == 'hello'
-    # the host sees it too
     assert (sandbox.workspace / 'note.txt').read_text() == 'hello'
     sandbox.close()

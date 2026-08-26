@@ -1,12 +1,10 @@
 """The gRPC escape hatch: the sandbox's typed doorway to the outside.
 
 A `GrpcHatch` serves host-provided `grpc` servicers over the sandbox's Unix
-domain socket, gated by a **method allowlist** — only the exact
+domain socket, gated by a method allowlist — only the exact
 ``/package.Service/Method`` names you list are reachable; anything else is
 `PERMISSION_DENIED`. The servicer runs in the trusted host process; the guest
-calls it with the generated stub over ``unix:$POSTERN_HATCH``. The proto is the
-typed contract, so arguments and results are typed and language-neutral, and the
-allowlist is the capability grant — the security boundary is that method set.
+calls it with the generated stub over ``unix:$POSTERN_HATCH``.
 
 Requires the ``grpc`` extra (``pip install 'postern[grpc]'``). ``import
 postern.grpc`` only where you use it; the bare `Sandbox` stays dependency-free.
@@ -51,10 +49,8 @@ class _Allowlist(grpc.ServerInterceptor):
         def deny(_request: object, context: grpc.ServicerContext) -> typing.NoReturn:
             context.abort(grpc.StatusCode.PERMISSION_DENIED, f'{method} is not on the hatch allowlist')
 
-        # A unary deny handler aborts before any message flows. Streaming methods
-        # on the deny path may surface a cardinality mismatch client-side, but the
-        # call is still refused; allowed methods keep their real (any-cardinality)
-        # handler via ``continuation``.
+        # A unary handler aborts before any message flows. A denied *streaming*
+        # method may surface a cardinality mismatch client-side; it is still refused.
         return grpc.unary_unary_rpc_method_handler(deny)
 
 
@@ -98,12 +94,12 @@ class GrpcHatch:
         if not self._started:
             self._server.start()
             self._started = True
-            # Deterministic socket perms, not umask-dependent (F9). The guest
-            # runs as a non-root uid, so it must be able to connect; host-side
-            # isolation rests on the 0700 mkdtemp dir above, which keeps other
-            # host users from reaching the socket at all.
+            # The non-root guest must be able to connect, and umask would otherwise
+            # decide whether it can. Host-side isolation rests on the 0700 mkdtemp
+            # dir when the hatch owns its path, or on the caller's own directory
+            # when ``socket_path`` was supplied — never on the socket mode.
             with contextlib.suppress(OSError):
-                os.chmod(self._path, 0o666)  # noqa: S103 — intentional; see the comment above
+                os.chmod(self._path, 0o666)  # noqa: S103 — see above
 
     @contextlib.contextmanager
     def accepting(self) -> Generator[GrpcHatch, None, None]:

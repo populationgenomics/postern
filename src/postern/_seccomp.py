@@ -1,23 +1,20 @@
-"""The seccomp-BPF denylist: a maintained, multi-arch backstop.
+"""The seccomp-BPF denylist: a multi-arch backstop.
 
 Defense in depth on top of the empty network namespace and dropped capabilities:
 block the syscalls that would let guest code re-gain namespaces, mount, trace,
 load code into the kernel, or fake terminal input. It is a denylist (default
 allow) — a backstop, not the primary boundary.
 
-The filter is compiled **ahead of time** by ``tools/gen_seccomp.py`` (which uses
-libseccomp) and committed as ``_seccomp.bpf`` next to this module. The runtime
-only *loads* that blob and hands its fd to ``bwrap --seccomp`` — so installing or
-running postern needs no libseccomp, keeping the core dependency-free. The blob
-is a single multi-arch program (x86_64, x86, x32, aarch64, arm); on any other
-architecture its default-allow would make it a silent no-op, so :func:`load_filter`
-**refuses to load it** there (fail closed) rather than run with an unenforced
-filter — that arch check is the only thing that isn't self-evident from the
-kernel accepting the filter, so there is no runtime probe.
+``tools/gen_seccomp.py`` compiles the syscall lists below with libseccomp and
+commits the result as ``_seccomp.bpf`` next to this module; the runtime only
+loads that blob and hands its fd to ``bwrap --seccomp``, so postern itself needs
+no libseccomp. The blob is one multi-arch program; on an architecture it does not
+cover its default-allow enforces nothing, so :func:`load_filter` refuses to load
+it there.
 
-The syscall lists below are the source of truth the generator consumes; they are
-derived from Flatpak's seccomp policy (``common/flatpak-run.c``). Editing them
-requires regenerating the blob — see ``tools/gen_seccomp.sh``.
+The syscall lists are the source of truth the generator consumes, derived from
+Flatpak's policy (``common/flatpak-run.c``). Editing them requires regenerating
+the blob — see ``tools/gen_seccomp.sh``.
 """
 
 from __future__ import annotations
@@ -32,10 +29,7 @@ import typing
 _BPF_RESOURCE = '_seccomp.bpf'
 _SPEC_RESOURCE = '_seccomp.spec'
 
-# The machine architectures the committed blob actually carries a program for
-# (the ``uname -m`` names for ``tools/gen_seccomp._ARCHES``). On anything else
-# the filter's default-allow makes it a silent no-op, so ``load_filter`` refuses
-# to load it there rather than run with a filter that enforces nothing.
+# The ``uname -m`` spellings of the architectures GEN_ARCHES compiles into the blob.
 COVERED_ARCHES: frozenset[str] = frozenset(
     {'x86_64', 'amd64', 'i386', 'i486', 'i586', 'i686', 'aarch64', 'arm64', 'armv6l', 'armv7l', 'armv8l', 'arm'}
 )
@@ -44,15 +38,17 @@ COVERED_ARCHES: frozenset[str] = frozenset(
 def arch_is_covered(machine: str | None = None) -> bool:
     """Whether the committed filter carries a program for ``machine``.
 
-    Defaults to the running host's ``platform.machine()``. False means the blob
-    would load but enforce nothing here (default-allow no-op).
+    Args:
+        machine: A ``uname -m`` name; defaults to the host's ``platform.machine()``.
+
+    Returns:
+        False if the blob would load here but enforce nothing (default-allow).
     """
     return (machine or platform.machine()).lower() in COVERED_ARCHES
 
 
-# Blocked with EPERM: escape-enabling or dangerous syscalls the guest never
-# legitimately needs. (Flatpak's main blocklist plus its non-devel additions —
-# ptrace and perf_event_open.)
+# Blocked with EPERM. Flatpak's main blocklist plus its non-devel additions
+# (ptrace, perf_event_open).
 BLOCKED_EPERM: tuple[str, ...] = (
     # Re-gaining namespaces / changing the mount or root view (bwrap already set
     # ours up before applying this filter).
@@ -81,9 +77,8 @@ BLOCKED_EPERM: tuple[str, ...] = (
     'uselib',
     'acct',
     'quotactl',
-    # Kernel modules, eBPF, kexec, reboot, swap. Redundant with --cap-drop ALL
-    # (each needs a capability the guest lacks) but kept as cheap defense in
-    # depth — postern blocked these before adopting Flatpak's list.
+    # Kernel modules, eBPF, kexec, reboot, swap. Each also needs a capability the
+    # guest lacks; blocked anyway as defense in depth.
     'bpf',
     'init_module',
     'finit_module',
@@ -93,19 +88,16 @@ BLOCKED_EPERM: tuple[str, ...] = (
     'reboot',
     'swapon',
     'swapoff',
-    # io_uring: a recurring kernel-LPE surface, and a submission interface that
-    # performs operations (openat, read, …) as ring entries which never pass back
-    # through this syscall filter — so leaving it open would let a guest do
-    # filtered operations out-of-band. The guest has no need for it.
+    # io_uring performs operations (openat, read, …) as ring entries that never
+    # pass back through this syscall filter.
     'io_uring_setup',
     'io_uring_enter',
     'io_uring_register',
 )
 
-# Blocked with ENOSYS (not EPERM): clone3 and the new mount API. seccomp cannot
-# inspect clone3's argument struct, so it is refused wholesale; returning ENOSYS
-# (rather than EPERM) lets glibc fall back to the classic clone/mount paths
-# instead of treating the call as a hard failure.
+# clone3 and the new mount API. seccomp cannot inspect clone3's argument struct,
+# so it is refused wholesale; ENOSYS (not EPERM) makes glibc fall back to the
+# classic clone/mount paths instead of failing hard.
 BLOCKED_ENOSYS: tuple[str, ...] = (
     'clone3',
     'open_tree',
@@ -117,32 +109,28 @@ BLOCKED_ENOSYS: tuple[str, ...] = (
     'mount_setattr',
 )
 
-# Argument-filtered rules (generator applies these). clone's flags are arg0 on
-# every architecture postern targets; ioctl's request is arg1.
-CLONE_NEWUSER = 0x10000000  # block clone(CLONE_NEWUSER, ...) — the gap unshare/setns alone leave open
+# Argument-filtered rules the generator applies. clone's flags are arg0 on every
+# architecture in GEN_ARCHES; ioctl's request is arg1.
+CLONE_NEWUSER = 0x10000000  # clone(CLONE_NEWUSER, ...) — the gap unshare/setns alone leave open
 TIOCSTI = 0x5412  # fake terminal input (CVE-2017-5226)
-TIOCLINUX = 0x541C  # ditto via the linux console ioctl
+TIOCLINUX = 0x541C  # the same via the linux console ioctl
 
-# The libseccomp Arch names the generator compiles into the blob. Kept here as
-# the source of truth (not in the generator) so the drift digest below covers
-# them without this module importing libseccomp.
+# The libseccomp Arch names the generator compiles into the blob. Here rather
+# than in the generator so spec_digest covers them without importing libseccomp.
 GEN_ARCHES: tuple[str, ...] = ('X86_64', 'X86', 'X32', 'AARCH64', 'ARM')
 
-# Deliberately NOT blocked: socket / socketpair. Network isolation is the empty
-# netns's job (no interface, no route); the guest needs socket(AF_UNIX) to reach
-# the hatch UDS, so blocking it breaks the hatch while adding nothing.
+# socket and socketpair stay allowed: the guest needs socket(AF_UNIX) to reach the
+# hatch UDS, and network isolation is the empty netns's job.
 
 
 def spec_digest() -> str:
     """A stable digest of the syscall spec the committed blob was built from.
 
-    Hashes the source-of-truth rule lists and the generator's arch set, so a
-    change to them that was *not* followed by regenerating ``_seccomp.bpf`` is
-    detectable with no libseccomp dependency — the generator records this digest
-    (and the blob's own hash) in ``_seccomp.spec``, and a test compares. It does
-    not prove the blob is what libseccomp would emit today (only the CI
-    regenerate-and-diff does); it catches the common drift of editing a list and
-    forgetting to regenerate.
+    ``tools/gen_seccomp.py`` records it in ``_seccomp.spec`` and
+    ``tests/test_seccomp.py`` compares, so editing a rule list without
+    regenerating the blob is caught without a libseccomp dependency. It does not
+    prove the blob is what libseccomp would emit today — the regenerate-and-diff
+    job in ``.github/workflows/tests.yml`` is what proves that.
     """
     payload = json.dumps(
         {
@@ -167,11 +155,13 @@ def manifest() -> dict[str, str]:
 def load_filter() -> typing.IO[bytes]:
     """Load the prebuilt BPF denylist into an open temp file positioned at 0.
 
-    The caller passes its fd to ``bwrap --seccomp`` and keeps it open for the
-    child's lifetime, then closes it. Fails closed rather than run with an
-    unenforced filter: raises on an architecture the blob doesn't cover (where it
-    would be a default-allow no-op), or if the blob is missing from the install
-    (a packaging error).
+    Returns:
+        An open temp file; the caller passes its fd to ``bwrap --seccomp``, keeps
+        it open for the child's lifetime, and closes it.
+
+    Raises:
+        RuntimeError: On an architecture the blob does not cover (where it would
+            enforce nothing), or if the blob is missing from the install.
     """
     if not arch_is_covered():
         raise RuntimeError(

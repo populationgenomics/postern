@@ -18,13 +18,13 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import pathlib
 import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -217,7 +217,7 @@ def test_so_linger_is_deliberately_left_alone() -> None:
 # --------------------------------------------------------------------------- #
 # The behaviour behind the two flags that actually bite                         #
 # --------------------------------------------------------------------------- #
-def test_a_nonblocking_connection_no_longer_truncates_the_response(tmp_path: Path) -> None:
+def test_a_nonblocking_connection_no_longer_truncates_the_response(tmp_path: pathlib.Path) -> None:
     """A truncated response must not be reported to the guest as a clean EOF.
 
     A slow reader forces the command to block in ``write``; on a non-blocking socket

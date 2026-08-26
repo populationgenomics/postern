@@ -22,9 +22,8 @@ def test_blocklist_covers_escape_syscalls():
 
 
 def test_io_uring_blocked():
-    # io_uring is a recurring kernel-LPE surface and lets a guest perform
-    # filtered operations (openat, read, …) as ring entries that never re-enter
-    # this syscall filter, so the whole family is blocked.
+    # Ring entries (openat, read, …) never re-enter the syscall filter, so the
+    # whole family has to go.
     for name in ('io_uring_setup', 'io_uring_enter', 'io_uring_register'):
         assert name in _seccomp.BLOCKED_EPERM
 
@@ -43,9 +42,9 @@ def test_socket_not_blocked():
 
 
 def test_committed_blob_is_not_stale():
-    # Drift guard (F4): if the syscall lists change without regenerating the
-    # blob, or the blob is hand-edited, the committed manifest no longer matches.
-    # Dependency-free — the authoritative regenerate-and-diff runs in CI.
+    # Drift guard: editing a syscall list without regenerating the blob, or
+    # hand-editing the blob, desyncs it from the committed manifest. Needs no
+    # libseccomp; the authoritative regenerate-and-diff runs in CI.
     manifest = json.loads(importlib.resources.files('postern').joinpath(_seccomp._SPEC_RESOURCE).read_text())
     assert manifest['source_digest'] == _seccomp.spec_digest(), (
         'seccomp syscall lists changed without regenerating _seccomp.bpf — run tools/gen_seccomp.sh'
@@ -57,8 +56,6 @@ def test_committed_blob_is_not_stale():
 
 
 def test_load_filter_fails_closed_on_uncovered_arch(monkeypatch):
-    # On an arch the blob doesn't cover, the filter is a default-allow no-op, so
-    # load_filter refuses rather than run untrusted code unfiltered.
     monkeypatch.setattr(_seccomp, 'arch_is_covered', lambda: False)
     monkeypatch.setattr(_seccomp.platform, 'machine', lambda: 'riscv64')
     with pytest.raises(RuntimeError, match='no coverage for this architecture'):
@@ -66,7 +63,7 @@ def test_load_filter_fails_closed_on_uncovered_arch(monkeypatch):
 
 
 def test_load_filter_loads_on_covered_arch():
-    # The negative control: on a covered host the blob loads normally.
+    # The negative control for the test above.
     if not _seccomp.arch_is_covered():
         pytest.skip('test host architecture is not covered by the committed blob')
     f = _seccomp.load_filter()
@@ -77,8 +74,8 @@ def test_load_filter_loads_on_covered_arch():
 
 
 def test_arch_is_covered_recognises_supported_and_rejects_others():
-    # The blob carries programs for x86 and ARM families; anything else is a
-    # default-allow no-op the caller must treat as fail-closed (F4).
+    # The blob carries programs for the x86 and ARM families; anything else would
+    # be a default-allow no-op.
     assert _seccomp.arch_is_covered('x86_64')
     assert _seccomp.arch_is_covered('AARCH64')  # case-insensitive
     assert _seccomp.arch_is_covered('armv7l')
