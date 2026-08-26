@@ -31,9 +31,10 @@ def _set_nondumpable() -> None:
 
     With the flag off the kernel roots ownership of ``/proc/self`` and gates
     ``ptrace_may_access`` on CAP_SYS_PTRACE, so no same-uid process the guest
-    spawns can read this init's memory, environ or maps. Best-effort: the init's
-    own environment is already cleared by ``--clearenv``, so a failure here costs
-    a layer of defense rather than a secret.
+    spawns can read this init's memory, environ or maps. Best-effort: ``--clearenv``
+    already drops the worker's environment, and all ``--setenv`` puts back is the
+    guest's own code and its hatch paths, so a failure here costs a layer of defense
+    rather than a secret.
     """
     with contextlib.suppress(OSError):
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
