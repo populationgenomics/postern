@@ -41,11 +41,12 @@ on an unprivileged host (e.g. a Cloud Run container that cannot mount).
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
+import logging
 import os
 import pathlib
 import stat
+import sys
 import tarfile
 import typing
 from collections.abc import Iterator
@@ -60,6 +61,9 @@ if typing.TYPE_CHECKING:
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
 _ANCHOR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC
 _DIR_FLAGS = _ANCHOR_FLAGS | os.O_NOFOLLOW
+
+
+log = logging.getLogger(__name__)
 
 
 class WorkspaceError(RuntimeError):
@@ -169,8 +173,14 @@ class Workspace:
     def __del__(self) -> None:
         # Best-effort if the caller never closed: at interpreter teardown `os` may
         # already be gone.
-        with contextlib.suppress(Exception):
+        try:
             self.close()
+        except Exception:  # noqa: BLE001 — __del__ must not raise, whatever close() hit
+            # Not during finalization: `logging`'s own module globals may already be
+            # torn down, and an exception raised out of __del__ there is printed to
+            # stderr by the interpreter rather than handled.
+            if not sys.is_finalizing():
+                log.warning('Workspace was never closed and closing it now failed', exc_info=True)
 
     # -- confined primitives (parts = normalized tuple, never a path string) --
 

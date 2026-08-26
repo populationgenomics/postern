@@ -110,6 +110,7 @@ import contextlib
 import dataclasses
 import errno
 import fcntl
+import logging
 import os
 import select
 import selectors
@@ -123,10 +124,12 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from concurrent import futures
 
-from postern import _sandbox
+from postern import _log, _sandbox
 
 # Bound as names, not reached through _sandbox: __all__ below re-exports these two.
 from postern._sandbox import guest_env_var, guest_socket_path
+
+log = logging.getLogger(__name__)
 
 _CHUNK = 65536
 # Concurrent connections a hatch serves at once; gates accepting, not dispatch.
@@ -462,8 +465,12 @@ class Process:
             self._disposed = True
         if self._proc is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             _reap(self._proc, grace, self._pgid)
+        except Exception:  # noqa: BLE001 — teardown must not raise; the log is the report
+            # A reap that fails leaves a live subprocess the hatch no longer tracks,
+            # so the host's process table grows silently. Never fatal to teardown.
+            log.warning('failed to reap the command for a stream verdict', exc_info=True)
 
 
 Handler = Callable[[Stream], 'Process | None']
@@ -755,6 +762,9 @@ class StreamHatch:
                 # Transient: EMFILE/ENFILE when the *embedding* worker momentarily
                 # runs out of descriptors, ECONNABORTED when a dial dies during the
                 # handshake, EINTR. Riding these out rather than retiring the hatch.
+                # Host-side condition, and the sleep below bounds how often this
+                # can be logged, so it is not a guest-driven rate.
+                log.warning('accept() failed transiently on hatch %s: %s; retrying', _log.safe(self._name), exc)
                 self._slots.release()
                 time.sleep(_ACCEPT_RETRY_DELAY)
                 continue
@@ -790,10 +800,17 @@ class StreamHatch:
             if verdict is None:
                 # A raw stream has no way to say "no", so a refusal is end-of-stream
                 # and nothing else — no diagnostic, which here would be host state.
+                # DEBUG: a handler that refuses by policy is working correctly, and
+                # the guest picks the rate.
+                log.debug('handler refused a connection on hatch %s', _log.safe(self._name))
                 _drain(conn, self._grace)
             else:
                 _await_command(verdict)
         except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
+            # The handler is host code, so this is usually a host bug rather than
+            # hostile input — and without the traceback the two are indistinguishable
+            # from the guest's clean end-of-stream.
+            log.warning('handler raised for hatch %s; connection dropped', _log.safe(self._name), exc_info=True)
             _drain(conn, self._grace)
         finally:
             # The verdict must not outlive the connection: an abandoned subprocess
@@ -975,8 +992,10 @@ def _abnormal_stdio(conn: socket.socket) -> list[str]:
 def _dispose(verdict: Process | None, grace: float) -> None:
     """Release whatever a verdict was holding. Idempotent, never raises."""
     if verdict is not None:
-        with contextlib.suppress(Exception):
+        try:
             verdict.dispose(grace)
+        except Exception:  # noqa: BLE001 — teardown must not raise; the log is the report
+            log.warning('failed to dispose a stream verdict', exc_info=True)
 
 
 def _readable(sock_or_fd: socket.socket | int, timeout: float) -> bool:
@@ -1183,8 +1202,11 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
             # way an unreaped zombie pins the pid, so the group id is still valid.
             # The re-check matters because `_exited`'s last-resort tier reaps.
             _signal_group(proc, pgid, signal.SIGKILL)
-    with contextlib.suppress(Exception):
+    try:
         proc.wait()
+    except Exception:  # noqa: BLE001 — teardown must not raise; the log is the report
+        # The pid stays unreaped, so it lingers as a zombie for the worker's life.
+        log.warning('failed to wait on pid %d after signalling it', proc.pid, exc_info=True)
     # stderr too: `splice_subprocess` refuses PIPE, but a handler may build its own
     # Popen, and an unclosed read end leaks until the Popen is collected.
     for pipe in (proc.stdin, proc.stdout, proc.stderr):
