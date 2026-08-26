@@ -1,13 +1,13 @@
 # postern
 
-Run untrusted Python in an OS-isolated sandbox whose **only** exit is a set of
-host-defined, typed gRPC methods.
+Run untrusted Python in an OS-isolated sandbox whose **only** exit is what the
+host opens: a set of typed gRPC methods, or one raw stream per resource.
 
 A postern is the small guarded gate through an otherwise sealed wall. That is the
 model: guest code runs with no network, no filesystem beyond a workspace, no
-capabilities — and reaches the outside world only by calling the specific gRPC
-methods the host allowlists. The security boundary is that method set, not a
-coarse permission flag.
+capabilities — and reaches the outside world only through the hatch the host
+binds in. The security boundary is what that hatch exposes, not a coarse
+permission flag.
 
 ```python
 from postern import Sandbox, SandboxProfile
@@ -35,9 +35,9 @@ the guest reaches only through that shape, never directly.
 This is the design [enclave](https://github.com/populationgenomics/enclave-py)
 prototyped over WebAssembly (WASI-compiled CPython). postern delivers the same
 "fine-grained function injection is the boundary" promise over a different
-substrate — **OS isolation (bubblewrap) + a gRPC-over-UDS hatch** — which means
-real CPython with arbitrary third-party packages (no custom toolchain), and
-typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
+substrate — OS isolation (bubblewrap) plus a hatch over a Unix socket — so the
+guest is real CPython with arbitrary third-party packages, no custom toolchain,
+and the arguments and results are typed and language-neutral.
 
 ## Isolation
 
@@ -58,13 +58,12 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
   **`--die-with-parent`**, **`--clearenv`**;
 - **`--as-pid-1`** — the guest entrypoint *is* PID 1 of the guest's PID
-  namespace, so no resident bwrap process sits there for the guest to read. That
-  bwrap shared the guest uid, so its `/proc/1` (cmdline, maps, read/write mem,
-  and env) was reachable from inside; with the entrypoint as PID 1 there is no
-  such process. `run_python`'s shim then acts as a minimal init — it forks the
-  guest, reaps orphaned descendants, propagates the guest's exit status, and
-  marks *itself* `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot
-  read the init either;
+  namespace. A resident bwrap there would share the guest uid, putting its
+  `/proc/1` (cmdline, maps, read/write mem, env) within reach from inside.
+  `run_python`'s shim is the init instead: it forks the guest, reaps orphaned
+  descendants, propagates the guest's exit status, and marks *itself*
+  `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot read the init
+  either;
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
   no capabilities inside its user namespace, and if the userns fails to
   materialise on a root host it still drops to a non-root real uid
@@ -75,9 +74,8 @@ typed, language-neutral arguments/results (proto, `buf breaking`-gateable).
   because the deploy must then make every bind source reachable by that uid;
 - a **seccomp denylist** blocking escape-enabling syscalls (`unshare`, `setns`,
   `mount`, `ptrace`, `bpf`, `keyctl`, `io_uring_setup`, …). `socket` is
-  deliberately *not* blocked — network isolation is the netns's job, and the
-  guest needs `socket(AF_UNIX)`
-  for the hatch;
+  deliberately *not* blocked — network isolation is the netns's job, and the guest
+  needs `socket(AF_UNIX)` for the hatch;
 - **`RLIMIT_NPROC`** as a fork-bomb backstop (set inside the guest), and an
   optional **`RLIMIT_AS`** memory backstop (`SandboxProfile(rlimit_as=...)`, off
   by default; a cgroup `memory.max` at the deploy layer is the real isolation).
@@ -88,11 +86,11 @@ RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
 **Fail-closed boot check.** Every control is enforced on the launch path: the
 strict `--unshare-*` flags make bwrap abort if it can't create the namespaces,
 apply `--uid`, or drop capabilities, and the seccomp loader refuses an uncovered
-architecture — so a successful launch *is* the proof (no runtime probe, like
-Chrome's sandbox). `Sandbox(profile).verify()` just triggers one trivial launch
-at startup so a broken platform (no user namespace, gVisor, uncovered arch)
-raises `IsolationError` there rather than on the first request. Call it at worker
-startup and refuse to serve if it raises (`examples/worker.py` does this).
+architecture — so a successful launch *is* the proof, and there is no runtime
+probe. `Sandbox(profile).verify()` triggers one trivial launch at startup so a
+broken platform (no user namespace, gVisor, uncovered arch) raises
+`IsolationError` there rather than on the first request. Call it at worker startup
+and refuse to serve if it raises, as `examples/worker.py` does.
 
 ## The environment (getting pandas etc. in)
 
@@ -137,9 +135,9 @@ stream hatch (below) is stdlib-only.
 Some protocols are neither typed RPC nor request/response. `StreamHatch` gives
 the guest **one socket** and nothing else; per accepted connection a handler
 decides what its bytes are spliced to — a host-side subprocess's stdio, or
-nothing. The motivating case is git: git's native wire
-protocol is pkt-line over a raw bidirectional stream, and `ext::` carries it over
-a command's stdin/stdout, so a byte pump reaches the socket.
+nothing. The motivating case is git, whose native wire protocol is pkt-line over
+a raw bidirectional stream and whose `ext::` transport carries that over a
+command's stdin/stdout.
 
 ```python
 from postern import Sandbox, SandboxProfile
@@ -157,92 +155,85 @@ Pass `profile=` to `git_url`: the in-guest interpreter comes from
 with the sandbox it runs in. Without it the default is a bare `python3` off the
 guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`.
 
-This is the sharpest form of the postern thesis: **the socket is the
-capability.** The same access could be brokered through an HTTP forward proxy
-with a handler policing each request; a bound stream socket is better in four
-ways, and the first is the reason the hatch exists.
+**The socket is the capability.** The same access could be brokered through an
+HTTP forward proxy with a handler policing each request; a bound stream socket
+differs in four ways.
 
 - *Capability by descriptor, not policy by parser.* Through a proxy the guest
-  names a URL, so "only this one repository" means parsing and validating request
-  targets in a handler — a parser in the policy path, fed attacker-controlled
-  input. One socket per resource makes the wrong resource unrepresentable, and
-  nothing parses anything. The service is fixed too — a hatch bound to `git
-  upload-pack` cannot be talked into `receive-pack`, so read-only is read-only by
-  construction rather than by a rule about verbs.
-- *No body buffering, and no copying at all.* A proxy that lets a handler inspect
-  request bodies has to buffer them, and so has to cap them. Here the socket **is**
-  the command's stdin and stdout, so the kernel moves every byte and postern is not
-  on the data path: no ceiling, no cap, no pump. It also means the kernel
-  propagates the command's disposition for free — a command that consumed its
-  input and exited gives the guest end-of-stream, one that died mid-request gives
-  it a reset, which for a stream with no framing of its own is the only failure
-  signal there is.
-- *No protocol translation.* The host side is "run a subprocess, splice its
-  stdio", not a bridge that decodes framing and re-emits headers to reach the
-  same subprocess.
-- *It works with `Sandbox.run`.* A hatch needs nothing in-guest — the socket is
-  just a file — so a bare `git` entrypoint reaches it, not only a `run_python`
-  guest. Both entrypoints bind and serve every configured hatch.
+  names a URL, so "only this one repository" means validating request targets in
+  a handler — a parser in the policy path, fed attacker-controlled input. One
+  socket per resource makes the wrong resource unrepresentable. The service is
+  fixed too: a hatch bound to `git upload-pack` cannot be talked into
+  `receive-pack`.
+- *No body buffering, and no copying.* A proxy that inspects request bodies has to
+  buffer them, and so has to cap them. Here the socket **is** the command's stdin
+  and stdout, so the kernel moves every byte and postern is not on the data path.
+  The kernel also propagates the command's disposition: a command that consumed
+  its input and exited gives the guest end-of-stream, one that died mid-request
+  gives it a reset — the only failure signal a stream with no framing of its own
+  has.
+- *No protocol translation.* The host side runs a subprocess and splices its
+  stdio, rather than decoding framing and re-emitting headers to reach the same
+  subprocess.
+- *It works with `Sandbox.run`.* A hatch needs nothing in-guest, so a bare `git`
+  entrypoint reaches it, not only a `run_python` guest. Both entrypoints bind and
+  serve every configured hatch.
 
 Stream hatches are **named**, so a sandbox carries as many as it has resources:
 each binds at `/run/postern/<name>.sock` and is exported as
-`$POSTERN_HATCH_<NAME>` (the unnamed `GrpcHatch` keeps `$POSTERN_HATCH`, and
-`hatch=` now takes one hatch or a sequence). The in-guest connector that bridges
-a command's stdio to the socket is bound in at `$POSTERN_CONNECT` (stdlib-only,
-one blocking thread per direction; it leaves with `os._exit` rather than
-finalising, because a daemon reader parked on a descriptor git has torn down is
-what used to abort under git). git gates `ext::` behind
-`protocol.ext.allow` because an `ext::` URL is command execution; inside the
-sandbox that gate protects nothing, since the guest is already running untrusted
-code, so enable it per invocation with `-c` and leave the host's git config alone.
+`$POSTERN_HATCH_<NAME>`, while the unnamed `GrpcHatch` keeps `$POSTERN_HATCH`.
+`hatch=` takes one hatch or a sequence. The in-guest connector that bridges a
+command's stdio to the socket is bound in at `$POSTERN_CONNECT` — stdlib-only,
+one blocking thread per direction, leaving with `os._exit` rather than finalising,
+because a daemon reader parked on a descriptor git has torn down aborts the git
+process. git gates `ext::` behind `protocol.ext.allow` because an `ext::` URL is
+command execution; inside the sandbox that gate protects nothing, since the guest
+is already running untrusted code, so enable it per invocation with `-c` and leave
+the host's git config alone.
 
 Guest bytes reach a host-side process only as its **stdin** — never its argv,
 env, cwd, or a dial's destination, all fixed when the hatch is constructed.
 `splice_subprocess` gives the process a fixed minimal `PATH` and a fixed `cwd`
-(not the worker's, which is where the secrets the hatch exists to withhold live
-and which would let ambient host state decide what the capability even is), and
-discards its stderr, because a command's diagnostics quote host paths.
+rather than the worker's, so ambient host state cannot decide what the capability
+is, and discards its stderr, because a command's diagnostics quote host paths.
 `max_conns` gates *accepting* rather than dispatch: a stream connection is
-long-lived by definition, so a queue of accepted-but-unserved connections would
-be a queue of host file descriptors — past the cap, dials wait in the kernel
-backlog costing the host nothing.
+long-lived, so a queue of accepted-but-unserved connections would be a queue of
+host file descriptors. Past the cap, dials wait in the kernel backlog.
 
 **Teardown has two known holes.** Per connection the hatch waits for the command
 and then signals its whole process *group*, because a child the command left
 behind inherits the guest's socket and would otherwise hold the connection open
-for ever. Two things bound that, both open in this release and both to be closed
-in a follow-up:
+for ever. Two things bound that:
 
 - *Another reaper in your process voids it.* If the embedding process reaps
   arbitrary children — a supervisor loop calling `waitpid(-1)`, `multiprocessing`,
   an asyncio child watcher, `SIGCHLD` set to `SIG_IGN` — then `Popen` synthesises
   an exit status of `0` on `ECHILD`, which is indistinguishable from a clean exit,
-  and the group signal is skipped. Declining is the correct answer to that
-  ambiguity rather than a bug: the foreign reap freed the pid, so signalling
-  anyway could land on a recycled one. It leaks the command's *children*, not a
-  thread, and it does not hang the worker. If your host process has its own
-  reaper, keep the outer `Sandbox.run(timeout=...)` short.
+  and the group signal is skipped. Declining is the answer to that ambiguity: the
+  foreign reap freed the pid, so signalling anyway could land on a recycled one.
+  What leaks is the command's *children*; the worker thread and the slot come
+  back. If your host process has its own reaper, keep the outer
+  `Sandbox.run(timeout=...)` short.
 - *A grandchild that calls `setsid()` escapes it*, because it is no longer in the
-  group. A shell's `&` child stays and is collected; a correctly daemonising
-  sidecar does not. Prefer a command that does not daemonise.
+  group. A shell's `&` child stays and is collected; a daemonising sidecar does
+  not. Prefer a command that does not daemonise.
 
-Mechanism, measurements and the fix plan are in `postern.stream`'s module
-docstring under "Teardown and its caveats"; the same docstring records which
-platforms can observe a command's exit without reaping it (`waitid` on Linux and
-some macOS builds, `kqueue` on macOS and the BSDs) and what a platform with
-neither loses.
+`postern.stream`'s module docstring covers the mechanism under "Teardown and its
+caveats", including which platforms can observe a command's exit without reaping
+it (`waitid` on Linux and some macOS builds, `kqueue` on macOS and the BSDs) and
+what a platform with neither loses.
 
-**Know this before you pick a command.** A fixed argv means guest bytes never
-become *that* process's argv. It does not mean they cannot become a *downstream*
-process's argv or a shell command, because the command's own **stdin grammar** is
-part of the capability and `splice_subprocess` cannot check it for you. `git
-upload-pack` grants nothing beyond the repository. `sqlite3` — even
-`-readonly` — has `.shell`, so splicing it is host command execution; so are
-`psql` (`\!`, `COPY … FROM PROGRAM`), `mysql` (`system`), `redis-cli`, `ftp`,
-`gdb` and `ed`. Choose a command whose stdin grants only what you meant to grant.
-Relatedly, `stderr=DEVNULL` covers fd 2 and nothing else: a command that
-multiplexes diagnostics onto *stdout* routes around it (`git upload-archive`
-reports `fatal: '<path>' does not appear to be a git repository` on its pkt-line
+**The command's stdin grammar is part of the capability.** A fixed argv means
+guest bytes never become *that* process's argv. It does not stop them becoming a
+*downstream* process's argv or a shell command, and `splice_subprocess` cannot
+check a grammar for you. `git upload-pack` grants nothing beyond the repository.
+`sqlite3` — even `-readonly` — has `.shell`, so splicing it is host command
+execution; so are `psql` (`\!`, `COPY … FROM PROGRAM`), `mysql` (`system`),
+`redis-cli`, `ftp`, `gdb` and `ed`.
+
+`stderr=DEVNULL` covers fd 2 and nothing else: a command that multiplexes
+diagnostics onto *stdout* routes around it (`git upload-archive` reports
+`fatal: '<path>' does not appear to be a git repository` on its pkt-line
 sideband), so pass `cwd` and a bare basename rather than an absolute host path.
 
 ## Install
@@ -254,12 +245,17 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch. `hatch` is opt-in and takes one hatch or a sequence — a `GrpcHatch` (typed methods), any number of named `StreamHatch`es (raw streams), both, or none (no channel opened); at most one *unnamed* hatch, since it owns a fixed guest env var.
-- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` opts bwrap into running at a non-root real uid (defense in depth for the sysctl surface; the deploy must make bind sources reachable by it). `stubs=` injects a dir or list of files at `/run/postern/stubs` (on `PYTHONPATH`) — a shared rootfs carries the heavy base, per-agent stubs bind in selectively.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
-- `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>` (so `run()` works, not just `run_python()`). `handler(stream) -> Process | None`: return `Process(argv, *, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, or refuse. The verdict describes the command and the hatch spawns it, so the descriptor is put in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race; `Process.from_popen(popen)` adopts one you spawned yourself, for what the declarative form does not cover (`pass_fds`, `user=`, an rlimit), and states what it costs — a verdict that arrives already spawned can only be validated, and a `Popen` you built has none of the declarative path's `stderr`/`env`/`cwd` defaults. `Stream.read_preamble(max_bytes, timeout)` bounds a preamble read without touching socket flags — do not use `settimeout` for that, the command shares the descriptor. Battery: `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)`; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`. `close()` is terminal, as `GrpcHatch`'s is. `stderr=PIPE` is refused (nothing drains it, so the command deadlocks) and so is `stderr=STDOUT` (stdout is the guest socket, so it would relay the command's host-path diagnostics to the guest) — at construction for `Process(argv)`, and for an adopted `Popen` by detection where the platform allows, since `subprocess` keeps no record of the `stderr` it was passed. Named, so several coexist — one socket per resource. Stdlib-only. `with hatch.accepting(): ...`.
-- `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)` (member-vetting only — see below).
-- `available()` — bubblewrap present?
+- `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>`, so `run()` works and not only `run_python()`. Named, so several coexist: one socket per resource. Stdlib-only. `with hatch.accepting(): ...`, and `close()` is terminal as `GrpcHatch`'s is.
+  - `handler(stream) -> Process | None`: return `Process(argv, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, or `None` to refuse. The hatch spawns it, so the descriptor is in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race.
+  - `Process.from_popen(popen)` adopts a subprocess you spawned yourself, for what the declarative form does not cover (`pass_fds`, `user=`, an rlimit). An already-spawned verdict can only be validated, and it has none of the declarative path's `stderr`/`env`/`cwd` defaults.
+  - `stderr=PIPE` is refused because nothing drains it and the command would deadlock; `stderr=STDOUT` is refused because stdout is the guest socket, so it would relay host-path diagnostics to the guest. Checked at construction for `Process(argv)`, and by detection for an adopted `Popen` where the platform allows, since `subprocess` keeps no record of the `stderr` it was passed.
+  - `Stream.read_preamble(max_bytes, timeout)` bounds a preamble read without touching socket flags. Do not use `settimeout` for that: the command shares the descriptor.
+  - `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)` is the stock handler; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`.
+- `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`, member-vetting only — see below.
+- `available()` — whether bubblewrap is on the PATH.
 
 ## Reading the workspace safely
 
@@ -270,10 +266,9 @@ jail these are inert; the danger is when the **host** later reads, tars, or
 restores the tree in its own namespace and privileges and becomes a confused
 deputy (exfiltrating its own secrets, or writing through the link to a host path).
 
-postern guarantees the workspace is **reference-closed**: read/pack/restore it
-through the host-side accessor and no guest-planted symlink, `..`, or special
-file is ever followed out of the tree — by construction, not by consumer
-vigilance.
+postern guarantees the workspace is **reference-closed**: read, pack or restore it
+through the host-side accessor and no guest-planted symlink, `..`, or special file
+is ever followed out of the tree.
 
 ```python
 with sandbox.accessor() as ws:                 # or Workspace(some_dir)
@@ -287,44 +282,44 @@ with sandbox.accessor() as ws:                 # or Workspace(some_dir)
 
 Every path resolves one component at a time with `O_NOFOLLOW` relative to a
 directory fd (the model is Go's `os.Root` / Rust's `cap-std::Dir`); the accessor
-never hands back a dereferenceable host path. It is pure stdlib and needs no
-mount privilege, so it runs on an unprivileged host (e.g. a Cloud Run container).
-A sticky world-writable workspace (`0o1777`) additionally stops the guest
-unlinking host-written files to swap in escaping symlinks. `restore_tar`'s
+never hands back a dereferenceable host path. Pure stdlib, no mount privilege, so
+it runs on an unprivileged host such as a Cloud Run container. A sticky
+world-writable workspace (`0o1777`) additionally stops the guest unlinking
+host-written files to swap in escaping symlinks. `restore_tar`'s
 `max_entries`/`max_bytes` bound a decompression bomb from an untrusted store.
 
 `reference_closed_filter` plugs into stock `TarFile.extractall(filter=...)` for
 consumers that keep `tarfile`, but it only **vets members** — stock extraction
 still follows a symlink that already exists in the destination, so it is safe
 only into a fresh host-controlled directory. To extract into a workspace a guest
-may have touched, use `restore_tar`: it writes *through the confined root* (never
-through an in-tree symlink, pre-existing or planted) and reports what it
-neutralized.
+may have touched, use `restore_tar`: it writes *through the confined root*, never
+through an in-tree symlink, and reports what it neutralized.
 
-See `examples/e2e_greeter.py` for an end-to-end run (typed hatch call + pandas,
-verified on a Linux host).
+`examples/e2e_greeter.py` is a runnable end-to-end example: a typed hatch call
+plus pandas, on a Linux host.
 
 ## Deploy: bundle the rootfs into the Job image
 
-For a Cloud Run Job you build an image anyway, so bundle the guest rootfs into
-it and let postern bind it — no runtime container engine. `examples/Dockerfile`
-is the recipe: a multi-stage build that (1) generates the stubs, (2) builds a
-minimal guest rootfs (`python:slim` + grpcio + your data libs + the client
-stubs), and (3) assembles the worker (bubblewrap + `postern[grpc]` + your
-servicer) with the guest rootfs copied to `/opt/guest-root`. The worker
-(`examples/worker.py`) binds it with `SandboxProfile(rootfs='/opt/guest-root')`,
-so the guest sees only that curated image, never the worker's userland. Cloud
-Run gen2 provides the unprivileged user namespaces bubblewrap needs.
+For a Cloud Run Job you build an image anyway, so bundle the guest rootfs into it
+and let postern bind it, with no runtime container engine. `examples/Dockerfile`
+is the recipe: a three-stage build that generates the stubs, builds a minimal
+guest rootfs (`python:3.12-slim` + grpcio + your data libs + the client stubs),
+and assembles the worker (bubblewrap + `postern[grpc]` + your servicer) with the
+guest rootfs copied to `/opt/guest-root`. `examples/worker.py` binds it with
+`SandboxProfile(rootfs='/opt/guest-root')`, so the guest sees only that curated
+image. Cloud Run gen2 provides the unprivileged user namespaces bubblewrap needs.
 
 ## Roadmap
 
-- **Checkpoint/restore** — a `Store` protocol + durable-glob workspace snapshots
-  for run-lived state continuity, sitting on the reference-closed `Workspace`
-  accessor (`pack_tar`/`restore_tar`) so snapshots are safe by construction.
+Not implemented:
+
+- **Checkpoint/restore** — a `Store` protocol and durable-glob workspace
+  snapshots, sitting on the reference-closed `Workspace` accessor
+  (`pack_tar`/`restore_tar`).
 - **`overlay=` profile mode** — emit `bwrap --ro-overlay` to stack layers with a
   tmpfs upper, instead of a single `--ro-bind` rootfs.
-- **Agent-runtime adapters** — drive the sandbox from Anthropic Managed Agents,
-  Google ADK, or MCP (the same sandbox, provider-agnostic).
+- **Agent-runtime adapters** — drive the same sandbox from Anthropic Managed
+  Agents, Google ADK, or MCP.
 
 ## License
 
