@@ -41,6 +41,7 @@ on an unprivileged host (e.g. a Cloud Run container that cannot mount).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import os
@@ -171,16 +172,19 @@ class Workspace:
         self.close()
 
     def __del__(self) -> None:
-        # Best-effort if the caller never closed: at interpreter teardown `os` may
-        # already be gone.
+        # Best-effort if the caller never closed.
         try:
             self.close()
         except Exception:  # noqa: BLE001 — __del__ must not raise, whatever close() hit
-            # Not during finalization: `logging`'s own module globals may already be
-            # torn down, and an exception raised out of __del__ there is printed to
-            # stderr by the interpreter rather than handled.
+            # `logging` is torn down by an atexit hook, so a record emitted after
+            # that reaches closed handlers. is_finalizing() is False throughout
+            # atexit and so does not cover that window on its own; the suppress is
+            # what makes this unable to raise out of __del__ — a Filter an
+            # application installed is entitled to raise, and does so before any
+            # handler's handleError net.
             if not sys.is_finalizing():
-                log.warning('Workspace was never closed and closing it now failed', exc_info=True)
+                with contextlib.suppress(Exception):
+                    log.warning('closing an unclosed Workspace failed', exc_info=True)
 
     # -- confined primitives (parts = normalized tuple, never a path string) --
 

@@ -42,9 +42,13 @@ from postern._workspace import (
     reference_closed_filter,
 )
 
-# A library attaches no handler of its own; without this, a host that configures
-# no logging at all gets Python's "No handlers could be found" fallback.
-logging.getLogger(__name__).addHandler(logging.NullHandler())
+# A library attaches no handler of its own. Without this, a host that configures
+# no logging at all gets `logging.lastResort`, which prints WARNING and above to
+# stderr — a library deciding on the application's behalf that a record is worth
+# a line. Guarded so a re-import cannot stack a second one.
+_root = logging.getLogger(__name__)
+if not any(isinstance(h, logging.NullHandler) for h in _root.handlers):
+    _root.addHandler(logging.NullHandler())
 
 try:
     __version__ = importlib.metadata.version('postern')
