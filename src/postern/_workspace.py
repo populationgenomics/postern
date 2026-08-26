@@ -44,14 +44,15 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import pathlib
 import stat
 import tarfile
 import typing
-from pathlib import Path, PurePosixPath
+from collections.abc import Iterator
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Iterator
-
+    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
+    # the floor is 3.10, so the backport must stay behind this guard.
     from typing_extensions import Self
 
 # The anchor is host-trusted, so a symlinked prefix reaching it is fine; every
@@ -105,7 +106,7 @@ def _split(rel: object) -> tuple[str, ...]:
     if isinstance(rel, WorkspacePath):
         return rel._parts
     text = os.fspath(rel) if isinstance(rel, os.PathLike) else str(rel)
-    pure = PurePosixPath(text)
+    pure = pathlib.PurePosixPath(text)
     if pure.is_absolute() or text.startswith('/'):
         raise WorkspaceError(f'absolute path escapes the workspace: {text!r}')
     parts: list[str] = []
@@ -141,11 +142,11 @@ class Workspace:
     """
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
-        self._root = Path(root)
+        self._root = pathlib.Path(root)
         self._fd: int | None = os.open(self._root, _ANCHOR_FLAGS)
 
     @property
-    def host_root(self) -> Path:
+    def host_root(self) -> pathlib.Path:
         """The anchor directory on the host: the trusted path the caller handed in.
 
         Child paths are never exposed this way — `WorkspacePath` raises from
