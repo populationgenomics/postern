@@ -44,8 +44,8 @@ comments, docstrings, `README.md` and `CONTEXT.md` describing it are part of tha
 
 - **Stage explicit paths**, not `git add -A` / `.`. Explicit staging is what stops an untracked scratch file being
   swept into a commit.
-- **Pre-commit is the whole static gate** (`.pre-commit-config.yaml`: ruff, ruff-format, markdownlint, yamlfmt,
-  pyright, hygiene hooks). Run `uv run pre-commit run --all-files` before committing. Ensure hooks are installed
+- **Pre-commit is the whole static gate** — `.pre-commit-config.yaml` is the list of hooks; there is no second gate
+  elsewhere. Run `uv run pre-commit run --all-files` before committing. Ensure hooks are installed
   (`pre-commit install`) — never bypass with `--no-verify`.
 - **Tests before committing**: `uv run --group test pytest`. The bubblewrap e2e tests skip off Linux;
   `tests/docker/run.sh` runs the whole suite in a Linux container.
