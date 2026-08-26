@@ -36,14 +36,23 @@ seccomp = _seccomp.load_filter()  # returned open: bwrap needs the fd for the ch
 ```
 
 ```python
-# Bad — restates the rationale, and cites a review finding no document defines
-argv += ['--unshare-all', '--unshare-user']  # --unshare-all leaves the user namespace
-# best-effort, which is the silent-degradation risk (F1) the review called out in §3;
-# re-listing it strict is what turns that into a hard failure.
+# Bad — argues for the code, and cites a review finding no document defines
+# --unshare-all leaves the user namespace best-effort, which is the silent-degradation
+# risk (F1) the review called out in §3; re-listing it strict is what turns that into a
+# hard failure, which is why we do it that way.
+argv = ['bwrap', '--unshare-all', '--unshare-user', '--unshare-cgroup']
 
-# Good — the one non-obvious mechanism, terse
-argv += ['--unshare-all', '--unshare-user']  # --unshare-all's user ns is best-effort; strict makes a missing one fatal
+# Good — mechanism only, and this much of it because a reader cannot recover any of it
+# from the flag names (`build_base_argv`)
+# --unshare-all makes the user and cgroup namespaces best-effort
+# (--unshare-user-try/--unshare-cgroup-try): without a user namespace bwrap
+# continues silently and the guest runs as real root. Listing them strict makes
+# that a launch failure. --unshare-all still supplies the strict ipc/pid/net/uts.
+argv = ['bwrap', '--unshare-all', '--unshare-user', '--unshare-cgroup']
 ```
+
+"One line where possible" is a ceiling on *persuasion*, not on mechanism: four lines that each
+state a fact a reader cannot get from the code are four earned lines.
 
 ## Reference nothing that does not exist
 

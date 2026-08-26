@@ -125,8 +125,7 @@ from concurrent import futures
 
 from postern import _sandbox
 
-# Symbol imports because __all__ re-exports these two: postern.stream is the surface
-# a caller building a guest command line by hand reaches for them through.
+# Bound as names, not reached through _sandbox: __all__ below re-exports these two.
 from postern._sandbox import guest_env_var, guest_socket_path
 
 _CHUNK = 65536
@@ -615,15 +614,13 @@ class StreamHatch:
                 ``POSTERN_HATCH_<NAME>``. A Python identifier, because it becomes
                 both a path component and an environment variable name.
             socket_path: Where to bind the host-side UDS. Defaults to a fresh
-                ``0700`` temp dir, which is then the whole of the host-side
-                access control.
-                **The socket itself is chmod'd 0666**, deterministically rather than
-                by umask, because the guest runs as an unrelated uid and has to be
-                able to connect — so the containing directory is the entire
-                host-side access control. Pass a path only in a directory no other
-                local uid can traverse: a stable path somewhere convenient
-                (``/tmp/myservice.sock``) publishes the capability to every user on
-                the box.
+                ``0700`` temp dir. **The socket itself is chmod'd 0666**,
+                deterministically rather than by umask, because the guest runs as an
+                unrelated uid and has to be able to connect — so the containing
+                directory is the entire host-side access control. Pass a path only in
+                a directory no other local uid can traverse: a stable path somewhere
+                convenient (``/tmp/myservice.sock``) publishes the capability to
+                every user on the box.
             max_conns: Concurrent connections served. Gates **accepting**, not
                 dispatch to a worker pool: a stream connection is long-lived by
                 definition, so a queue of already-accepted connections would be a
