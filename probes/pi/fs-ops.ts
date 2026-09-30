@@ -3,8 +3,8 @@
 // from `proto/pi-loop-outside`, where the seam question was answered.
 //
 // The rest of Pi's tool operations over the same socket `bash-ops.ts` uses. Pi's read, write, edit,
-// grep, find and ls tools all reduce to a handful of primitives — readFile, writeFile, mkdir,
-// access, exists, stat, readdir, glob — so one request type serves all six.
+// find and ls tools all reduce to a handful of primitives — readFile, writeFile, mkdir, access,
+// exists, stat, readdir, glob — so one request type serves all five. grep does not: see `grep.ts`.
 //
 // Confinement is the executor's, not ours: a path that escapes the workspace comes back as an error
 // frame. Doing it here would put the check on the untrusted side of the seam.
@@ -12,7 +12,6 @@
 import type {
   EditOperations,
   FindOperations,
-  GrepOperations,
   LsOperations,
   ReadOperations,
   WriteOperations,
@@ -22,7 +21,7 @@ import { connect } from 'node:net';
 export type FileOpStats = { calls: number; backendMs: number };
 
 /** One request, one response, one connection — the shape the executor serves. */
-function request(socketPath: string, payload: Record<string, unknown>, stats?: FileOpStats): Promise<unknown> {
+export function request(socketPath: string, payload: Record<string, unknown>, stats?: FileOpStats): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath);
     let pending = '';
@@ -77,11 +76,6 @@ export function createSeamFileOperations(socketPath: string, stats?: FileOpStats
 
   const edit: EditOperations = { readFile, writeFile: write.writeFile, access: read.access };
 
-  const grep: GrepOperations = {
-    isDirectory: async (absolutePath) => (await call({ op: 'isDirectory', path: absolutePath })) as boolean,
-    readFile: async (absolutePath) => (await readFile(absolutePath)).toString('utf8'),
-  };
-
   const find: FindOperations = {
     exists: async (absolutePath) => (await call({ op: 'exists', path: absolutePath })) as boolean,
     glob: async (pattern, cwd, options) =>
@@ -97,5 +91,5 @@ export function createSeamFileOperations(socketPath: string, stats?: FileOpStats
     readdir: async (absolutePath) => (await call({ op: 'readdir', path: absolutePath })) as string[],
   };
 
-  return { read, write, edit, grep, find, ls };
+  return { read, write, edit, find, ls };
 }

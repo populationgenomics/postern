@@ -28,12 +28,15 @@ COPY pyproject.toml README.md LICENSE /tmp/postern/
 COPY src /tmp/postern/src
 RUN pip install --no-cache-dir /tmp/postern && rm -rf /tmp/postern
 COPY --from=pi /opt/pi-probe/node_modules /opt/pi-probe/node_modules
-COPY probes/pi/package.json probes/pi/index.ts probes/pi/bash-ops.ts probes/pi/fs-ops.ts \
+COPY probes/pi/package.json probes/pi/index.ts probes/pi/bash-ops.ts probes/pi/fs-ops.ts probes/pi/grep.ts \
     probes/pi/seam.ts probes/pi/tools.ts probes/pi/executor.py probes/pi/entrypoint.sh /opt/pi-probe/
 RUN ln -s /opt/pi-probe/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js /usr/local/bin/pi \
     && node --version && pi --version
 # Pi's own state — sessions, settings, the models catalog — outside the workspace the tools see.
 ENV PI_AGENT_DIR=/var/lib/pi
+# Pi fetches rg and fd from GitHub on first use when they are missing. Nothing here should need
+# either, so a tool that still reaches for one fails loudly instead of fetching a host binary.
+ENV PI_OFFLINE=1
 RUN mkdir -p /var/lib/pi
 ENTRYPOINT ["/opt/pi-probe/entrypoint.sh"]
 CMD ["seam"]

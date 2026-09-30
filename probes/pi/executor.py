@@ -83,8 +83,10 @@ def _to_guest(workspace: pathlib.Path, path: str) -> str:
     return str(_GUEST_WORKSPACE / absolute.relative_to(root))
 
 
-# The file primitives Pi's read/write/edit/grep/find/ls tools reduce to, run inside the guest.
-# `readFile` answers base64 so a Buffer survives the hop; everything else is JSON-native.
+# The file primitives Pi's read/write/edit/find/ls tools reduce to, plus the search Pi's grep does
+# not route through its operations, run inside the guest. `readFile` answers base64 so a Buffer
+# survives the hop; everything else is JSON-native. `grep` is Python's `re`, not ripgrep's regex
+# engine, and does not read `.gitignore`; it skips `.git`, `node_modules`, symlinks and binaries.
 _GUEST_FILE_OPS = """
 import base64, glob, json, pathlib
 request = json.loads({payload!r})
@@ -107,6 +109,45 @@ elif op == 'readdir':
 elif op == 'glob':
     matches = glob.glob(request['pattern'], root_dir=request['cwd'], recursive=True)
     print(json.dumps(sorted(matches)[: request['limit']]))
+elif op == 'grep':
+    import fnmatch, os, re
+    source = request['pattern'] if not request.get('literal') else re.escape(request['pattern'])
+    matcher = re.compile(source, re.IGNORECASE if request.get('ignoreCase') else 0)
+    wanted, context, limit = request.get('glob'), request['context'], request['limit']
+    def candidates():
+        if not target.is_dir():
+            yield target, target.name
+            return
+        for root, dirs, names in os.walk(target):  # does not follow symlinked dirs
+            dirs[:] = sorted(d for d in dirs if d not in ('.git', 'node_modules'))
+            for name in sorted(names):
+                file = pathlib.Path(root, name)
+                if not file.is_symlink():
+                    yield file, str(file.relative_to(target))
+    matches, limited = [], False
+    for file, shown in candidates():
+        if wanted and not (fnmatch.fnmatch(shown, wanted) or fnmatch.fnmatch(file.name, wanted)):
+            continue
+        try:
+            data = file.read_bytes()
+        except OSError:
+            continue
+        if b'\\0' in data[:8192]:  # binary, as rg judges it
+            continue
+        lines = data.decode('utf-8', 'replace').replace('\\r\\n', '\\n').replace('\\r', '\\n').split('\\n')
+        if lines and lines[-1] == '':
+            lines.pop()
+        for index, line in enumerate(lines):
+            if not matcher.search(line):
+                continue
+            span = range(max(0, index - context), min(len(lines), index + context + 1))
+            matches.append({{'path': shown, 'block': [[at + 1, lines[at], at == index] for at in span]}})
+            if len(matches) >= limit:
+                limited = True
+                break
+        if limited:
+            break
+    print(json.dumps({{'matches': matches, 'limitReached': limited}}))
 else:
     raise SystemExit(f'unknown op {{op}}')
 """

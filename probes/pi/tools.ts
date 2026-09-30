@@ -8,15 +8,15 @@ import {
   createBashTool,
   createEditTool,
   createFindTool,
-  createGrepTool,
   createLsTool,
   createReadTool,
   createWriteTool,
 } from '@earendil-works/pi-coding-agent';
-import { symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSeamBashOperations } from './bash-ops.ts';
 import { createSeamFileOperations, type FileOpStats } from './fs-ops.ts';
+import { createSeamGrepToolDefinition } from './grep.ts';
 
 const SOCKET = process.env.PI_POSTERN_SOCKET!;
 const WORKSPACE = process.env.PI_POSTERN_WORKSPACE!;
@@ -41,7 +41,7 @@ const tools: ToolLike[] = [
   createReadTool(WORKSPACE, { operations: files.read }),
   createWriteTool(WORKSPACE, { operations: files.write }),
   createEditTool(WORKSPACE, { operations: files.edit }),
-  createGrepTool(WORKSPACE, { operations: files.grep }),
+  createSeamGrepToolDefinition(WORKSPACE, SOCKET, stats),
   createFindTool(WORKSPACE, { operations: files.find }),
   createLsTool(WORKSPACE, { operations: files.ls }),
   createBashTool(WORKSPACE, { operations: bash }),
@@ -72,15 +72,25 @@ console.log(`  write   ${await call('write', { path: 'new.md', content: 'written
 const edits = [{ oldText: 'alpha', newText: 'ALPHA' }];
 console.log(`  edit    ${await call('edit', { path: 'notes.txt', edits })}`);
 console.log(`  grep    ${await call('grep', { pattern: 'CANARY' })}`);
+console.log(`  grep -C ${await call('grep', { pattern: 'beta', context: 1, glob: '*.txt' })}`);
 console.log(`  find    ${await call('find', { pattern: '*.md' })}`);
 console.log(`  ls      ${await call('ls', { path: '.' })}`);
 console.log(`  bash    ${await call('bash', { command: 'echo from-the-guest; id -u; pwd' })}`);
 const elapsed = performance.now() - started;
 
+// Pi's own grep would have spawned rg on this side; there must be none here to spawn.
+const hostRg = [process.env.PATH ?? '', join(process.env.PI_AGENT_DIR ?? '', 'bin')]
+  .flatMap((dirs) => dirs.split(':'))
+  .some((dir) => dir && existsSync(join(dir, 'rg')));
+console.log(`\nrg on Pi's side: ${hostRg ? 'PRESENT' : 'absent'} — grep ran in the guest`);
+
 console.log('\ndoes anything confine a path to the workspace?');
 for (const escape of ['../escaped.txt', '/etc/hosts', 'planted']) {
   console.log(`  read ${escape.padEnd(16)} ${await call('read', { path: escape })}`);
 }
+console.log(`  grep /etc            ${await call('grep', { pattern: 'root', path: '/etc' })}`);
+// `planted` points at /etc/hostname: a walk that followed it would match the container's hostname.
+console.log(`  grep . (via planted) ${await call('grep', { pattern: '.', glob: 'planted' })}`);
 
 console.log(`\nseven tool calls in ${elapsed.toFixed(0)} ms; ` +
   `${stats.calls} file primitives served, ${stats.backendMs.toFixed(1)} ms of that in the guest`);

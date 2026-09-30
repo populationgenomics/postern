@@ -19,13 +19,13 @@ import {
   createBashTool,
   createEditTool,
   createFindTool,
-  createGrepTool,
   createLsTool,
   createReadTool,
   createWriteTool,
 } from '@earendil-works/pi-coding-agent';
 import { createSeamBashOperations } from './bash-ops.ts';
 import { createSeamFileOperations } from './fs-ops.ts';
+import { createSeamGrepToolDefinition } from './grep.ts';
 
 /** Set by `entrypoint.sh`; there is no default, because a default would be a tool running on the host. */
 function required(name: string): string {
@@ -47,7 +47,7 @@ export default function activate(pi: ExtensionAPI): void {
   pi.registerTool(createReadTool(workspace, { operations: files.read }));
   pi.registerTool(createWriteTool(workspace, { operations: files.write }));
   pi.registerTool(createEditTool(workspace, { operations: files.edit }));
-  pi.registerTool(createGrepTool(workspace, { operations: files.grep }));
+  pi.registerTool(createSeamGrepToolDefinition(workspace, socket));
   pi.registerTool(createFindTool(workspace, { operations: files.find }));
   pi.registerTool(createLsTool(workspace, { operations: files.ls }));
   pi.registerTool(createBashTool(workspace, { operations: bash }));

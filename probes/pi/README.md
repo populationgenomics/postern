@@ -62,7 +62,7 @@ a streaming `run` over the existing stdout pipe, plus a kill on cancel.
 `/etc/hosts` and a workspace symlink to `/etc/hostname` are all refused by the executor before
 reaching the guest. Pi itself passes all three through without complaint.
 
-**New: Pi's `grep` does not run in the guest.** Neither themis prototype caught this. In 0.85.1,
+**New: Pi's `grep` did not run in the guest.** Neither themis prototype caught this. In 0.85.1,
 `createGrepTool(cwd, { operations })` only uses the operations for `isDirectory` (on the root) and
 `readFile` (for context lines). The search itself runs `ensureTool('rg')`, which **downloads
 ripgrep from GitHub at runtime if it is missing**, then **spawns `rg` on the host** against the
@@ -70,15 +70,17 @@ resolved path (`dist/core/tools/grep.js`). So in both prototypes grep ran beside
 credential. On `pi-vm` that meant on the VM's trusted side, not in the guest. The `isDirectory` gate does
 confine the search root, and `rg` does not follow symlinks by default, so this is not a read-out
 here. It is still a host exec, on a model-chosen pattern and glob, of a binary fetched at runtime.
-It is also why the `tools` run spends about 1.5 s wall-clock against about 0.45 s in the guest.
-Pi's own Gondolin example avoids it by replacing grep's whole `execute` with a walk-and-match over
-the VM's filesystem rather than supplying operations. `find` is fine: it uses `operations.glob`
-when one is provided and only falls back to `fd` otherwise.
+It is also why the `tools` run took about 1.5 s wall-clock against about 0.45 s in the guest.
+Pi's own Gondolin example avoids it by replacing grep's whole `execute` rather than supplying
+operations, and so does this probe now (`grep.ts`). A `grep` op walks and matches in the guest, and
+the TS side only formats, reproducing Pi's output line for line. The seven calls now take about
+0.4 s. `PI_OFFLINE=1` stops Pi fetching rg or fd if anything reaches for them again. `find` was
+already fine: it uses `operations.glob` when one is provided and only falls back to `fd` otherwise.
+The guest grep uses Python's `re` rather than ripgrep's regex engine and does not read
+`.gitignore`. It skips `.git`, `node_modules`, symlinks and binary files.
 
 ## Open
 
-- **Route grep into the guest**, the way Gondolin does: a `grep` op the executor runs in the guest,
-  and a registered grep tool whose `execute` calls it.
 - **File primitives through the `Workspace` accessor** instead of a guest per call. The accessor is
   reference-closed by construction, so it would satisfy the confinement requirement host-side
   without a 28 ms interpreter start. It lacks `mkdir` and `glob` today.
