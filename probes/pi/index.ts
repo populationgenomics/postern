@@ -11,8 +11,9 @@
 // factory already yields the built-in's name, description and schema — so what the model sees is
 // Pi's own tool set, ours only in where the work lands.
 //
-// What is *not* here is a path check: Pi resolves a tool's path and hands it over without confining
-// it to the workspace, so that check lives in the executor, on the trusted side.
+// Pi resolves a tool's path and hands it over without confining it to the workspace. The check that
+// matters is the executor's, on the trusted side; `confined` only keeps Pi's own local probes of a
+// path (see `confine.ts`) off anything outside the workspace.
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
@@ -24,6 +25,7 @@ import {
   createWriteTool,
 } from '@earendil-works/pi-coding-agent';
 import { createSeamBashOperations } from './bash-ops.ts';
+import { confined } from './confine.ts';
 import { createSeamFileOperations } from './fs-ops.ts';
 import { createSeamGrepToolDefinition } from './grep.ts';
 
@@ -44,12 +46,12 @@ export default function activate(pi: ExtensionAPI): void {
   // Pi's default operations and runs on the host, beside the model credential — so the list is the
   // whole boundary. Registered one by one rather than over a list: each factory's parameter schema is
   // its own type, and a list of them unifies to something `registerTool` will not take.
-  pi.registerTool(createReadTool(workspace, { operations: files.read }));
-  pi.registerTool(createWriteTool(workspace, { operations: files.write }));
-  pi.registerTool(createEditTool(workspace, { operations: files.edit }));
-  pi.registerTool(createSeamGrepToolDefinition(workspace, socket));
-  pi.registerTool(createFindTool(workspace, { operations: files.find }));
-  pi.registerTool(createLsTool(workspace, { operations: files.ls }));
+  pi.registerTool(confined(workspace, createReadTool(workspace, { operations: files.read })));
+  pi.registerTool(confined(workspace, createWriteTool(workspace, { operations: files.write })));
+  pi.registerTool(confined(workspace, createEditTool(workspace, { operations: files.edit })));
+  pi.registerTool(confined(workspace, createSeamGrepToolDefinition(workspace, socket)));
+  pi.registerTool(confined(workspace, createFindTool(workspace, { operations: files.find })));
+  pi.registerTool(confined(workspace, createLsTool(workspace, { operations: files.ls })));
   pi.registerTool(createBashTool(workspace, { operations: bash }));
 
   // `!command` in the TUI is the user's own shell, and it goes to the same place the agent's does.

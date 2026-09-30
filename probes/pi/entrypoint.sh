@@ -9,11 +9,16 @@
 set -euo pipefail
 
 SOCKET=/run/pi-probe/exec.sock
+# Two directories, one name. The guest's /workspace is HOST_WORKSPACE, bound in by postern. Pi's
+# /workspace is this empty directory: Pi is told the guest's path, and anything Pi's own code does
+# with a path locally (stat, realpath, an edit preview) lands here and finds nothing.
 WORKSPACE=/workspace
-mkdir -p "$(dirname "$SOCKET")" "$WORKSPACE"
+HOST_WORKSPACE=/var/lib/pi-probe/workspace
+mkdir -p "$(dirname "$SOCKET")" "$WORKSPACE" "$HOST_WORKSPACE"
+chmod 0555 "$WORKSPACE"
 
 # The executor gets none of this environment, so it never holds the model credential Pi does.
-env -i PATH="$PATH" PYTHONUNBUFFERED=1 python /opt/pi-probe/executor.py "$SOCKET" "$WORKSPACE" &
+env -i PATH="$PATH" PYTHONUNBUFFERED=1 python /opt/pi-probe/executor.py "$SOCKET" "$HOST_WORKSPACE" &
 executor=$!
 until [[ -S $SOCKET ]]; do
   # verify() failing is the executor exiting here: refuse rather than run tools anywhere else.

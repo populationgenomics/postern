@@ -58,9 +58,23 @@ arrive as **1 frame** after 1038 ms. `sleep 5` cancelled at 300 ms returns after
 the postern-side work both themis docs name, and it applies whichever harness sits above postern:
 a streaming `run` over the existing stdout pipe, plus a kill on cancel.
 
-**Confinement holds on the trusted side, including against a planted symlink.** `../escaped.txt`,
-`/etc/hosts` and a workspace symlink to `/etc/hostname` are all refused by the executor before
-reaching the guest. Pi itself passes all three through without complaint.
+**Confinement holds, including against a planted symlink.** `../escaped.txt`, `/etc/hosts` and a
+workspace symlink to `/etc/hostname` are all refused. Pi itself passes all three through without
+complaint. The first two are refused lexically, before a guest is launched. The symlink is refused
+by a `realpath` inside the guest, so the host never dereferences a link the guest planted.
+
+**New: supplying operations does not keep a tool's paths off the host.** Even with our operations,
+Pi's `read` stat-probes the path locally for macOS filename variants, and `write`/`edit` `realpath`
+it locally to key their mutation queue. So in both themis prototypes the host looked up whatever
+path the model named, and on `pi-vm` the host's workspace was the real one. Two fixes, in layers:
+
+- **Pi's `/workspace` is a decoy.** The guest's `/workspace` lives on the host at
+  `/var/lib/pi-probe/workspace`. The `/workspace` Pi sees is an empty directory, so a local probe of
+  any workspace path finds nothing, and every file the tools touch exists only on the guest's side
+  (`tools` checks this).
+- **`confine.ts`** refuses a path outside the workspace before Pi's execute runs, so Pi never
+  probes `/etc/hosts` on its own side either. The executor refuses the same paths again; this layer
+  exists to protect Pi's host, not to be the boundary.
 
 **New: Pi's `grep` did not run in the guest.** Neither themis prototype caught this. In 0.85.1,
 `createGrepTool(cwd, { operations })` only uses the operations for `isDirectory` (on the root) and

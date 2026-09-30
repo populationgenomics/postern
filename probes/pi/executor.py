@@ -12,12 +12,16 @@ successor to `proto/pi-loop-outside`'s comparison executor. What it kept from ea
   credential. This refuses to start unless `Sandbox.verify()` passes.
 - **A timeout ceiling.** Pi's bash tool takes `timeout` from the model and `Sandbox.run` cannot be
   interrupted, so an unclamped value is a command nothing can stop.
-- **Confinement on the trusted side.** Pi resolves a tool's path and hands it over without a
-  workdir check, so `read ../../etc/shadow` arrives here as an absolute path outside the workspace.
-  It is refused here, because this is the only place the check can go.
+- **Confinement.** Pi resolves a tool's path and hands it over without a workdir check, so
+  `read ../../etc/shadow` arrives here as an absolute path outside the workspace, and is refused.
 
-What it adds: host paths are translated to guest paths rather than assumed equal, so the probe does
-not depend on the host workspace happening to live at `/workspace`.
+What it changes: paths on the wire are *guest* paths, and nothing on the host resolves them. Pi's
+`/workspace` is an empty directory on its own side (see `entrypoint.sh`), so nothing Pi does to a
+path locally reaches a real file. The check happens in two places. Here it is lexical: normalise,
+and refuse anything outside `/workspace` before a guest is launched. In the guest it is a
+`realpath`, so `..` and symlinks resolve in the guest's own namespace. The host never dereferences
+a guest-planted link, which is the confused-deputy hazard `postern.Workspace` exists to close. The
+host-side `Path.resolve()` this replaced did exactly that.
 
 Protocol, newline-delimited JSON, one request per connection:
 
@@ -33,7 +37,8 @@ Protocol, newline-delimited JSON, one request per connection:
     out  {"t": "result", "value": <json>, "backend_ms": float}
     out  {"t": "error", "message": str}
 
-Run: `python executor.py <socket-path> <workspace>`; `entrypoint.sh` does this for you.
+Run: `python executor.py <socket-path> <host-workspace>`; `entrypoint.sh` does this for you. The
+host workspace is where the guest's `/workspace` lives on the host, and nothing else here uses it.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ import contextlib
 import json
 import logging
 import pathlib
+import posixpath
 import shlex
 import sys
 import time
@@ -66,21 +72,18 @@ class ConfinedError(Exception):
     """A path that resolved outside the workspace."""
 
 
-def _to_guest(workspace: pathlib.Path, path: str) -> str:
-    """The guest path for host `path`, or raise if it leaves the workspace.
+def _to_guest(path: str) -> str:
+    """Guest `path`, normalised against the workspace, or raise if it lexically leaves it.
 
-    Resolved on the host before the check, so `..` and a symlink both land where they really point.
-    A guest-planted symlink that escapes is therefore refused here rather than followed in the guest.
+    Lexical only: symlinks are the guest's to resolve, in the guest (see `_GUEST_FILE_OPS`).
 
     Raises:
-        ConfinedError: If the resolved path is not under the workspace.
+        ConfinedError: If the normalised path is not under the workspace.
     """
-    root = workspace.resolve()
-    candidate = pathlib.Path(path)
-    absolute = (candidate if candidate.is_absolute() else root / candidate).resolve()
-    if absolute != root and root not in absolute.parents:
-        raise ConfinedError(f'{path} resolves to {absolute}, outside the workspace {root}')
-    return str(_GUEST_WORKSPACE / absolute.relative_to(root))
+    normalised = posixpath.normpath(posixpath.join(str(_GUEST_WORKSPACE), path))
+    if normalised != str(_GUEST_WORKSPACE) and not normalised.startswith(f'{_GUEST_WORKSPACE}/'):
+        raise ConfinedError(f'{path} resolves to {normalised}, outside the workspace {_GUEST_WORKSPACE}')
+    return normalised
 
 
 # The file primitives Pi's read/write/edit/find/ls tools reduce to, plus the search Pi's grep does
@@ -88,9 +91,14 @@ def _to_guest(workspace: pathlib.Path, path: str) -> str:
 # survives the hop; everything else is JSON-native. `grep` is Python's `re`, not ripgrep's regex
 # engine, and does not read `.gitignore`; it skips `.git`, `node_modules`, symlinks and binaries.
 _GUEST_FILE_OPS = """
-import base64, glob, json, pathlib
+import base64, glob, json, os, pathlib, sys
 request = json.loads({payload!r})
 op, path = request['op'], request.get('path')
+for named in (path, request.get('cwd')):
+    real = named and os.path.realpath(named)
+    if real and real != '/workspace' and not real.startswith('/workspace/'):
+        print(f'ConfinedError: {{named}} resolves to {{real}}, outside the workspace /workspace', file=sys.stderr)
+        raise SystemExit(3)
 target = pathlib.Path(path) if path else None
 if op == 'readFile':
     print(json.dumps(base64.b64encode(target.read_bytes()).decode()))
@@ -110,7 +118,7 @@ elif op == 'glob':
     matches = glob.glob(request['pattern'], root_dir=request['cwd'], recursive=True)
     print(json.dumps(sorted(matches)[: request['limit']]))
 elif op == 'grep':
-    import fnmatch, os, re
+    import fnmatch, re
     source = request['pattern'] if not request.get('literal') else re.escape(request['pattern'])
     matcher = re.compile(source, re.IGNORECASE if request.get('ignoreCase') else 0)
     wanted, context, limit = request.get('glob'), request['context'], request['limit']
@@ -183,7 +191,7 @@ async def _run_command(
     return result.returncode
 
 
-async def _file_op(sandbox: postern.Sandbox, workspace: pathlib.Path, request: dict[str, object]) -> object:
+async def _file_op(sandbox: postern.Sandbox, request: dict[str, object]) -> object:
     """Serve one file primitive inside the guest.
 
     Raises:
@@ -192,9 +200,9 @@ async def _file_op(sandbox: postern.Sandbox, workspace: pathlib.Path, request: d
     """
     resolved = dict(request)
     if 'path' in resolved:
-        resolved['path'] = _to_guest(workspace, str(resolved['path']))
+        resolved['path'] = _to_guest(str(resolved['path']))
     if 'cwd' in resolved:
-        resolved['cwd'] = _to_guest(workspace, str(resolved['cwd'] or '.'))
+        resolved['cwd'] = _to_guest(str(resolved['cwd'] or '.'))
     code = _GUEST_FILE_OPS.format(payload=json.dumps(resolved))
     result = await asyncio.to_thread(sandbox.run_python, code, timeout=_FILE_OP_TIMEOUT_S)
     if result.returncode != 0:
@@ -204,7 +212,6 @@ async def _file_op(sandbox: postern.Sandbox, workspace: pathlib.Path, request: d
 
 async def _handle(
     sandbox: postern.Sandbox,
-    workspace: pathlib.Path,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
@@ -223,7 +230,7 @@ async def _handle(
 
     if 'op' in request:
         try:
-            value = await _file_op(sandbox, workspace, request)
+            value = await _file_op(sandbox, request)
         except (ConfinedError, OSError, RuntimeError, ValueError) as exc:
             _logger.warning('file op %s refused: %s', request.get('op'), exc)
             await emit({'t': 'error', 'message': f'{type(exc).__name__}: {exc}'})
@@ -239,7 +246,7 @@ async def _handle(
 
     watching = asyncio.create_task(watch_for_cancel())
     try:
-        cwd = _to_guest(workspace, str(request.get('cwd') or workspace))
+        cwd = _to_guest(str(request.get('cwd') or '.'))
         timeout = min(float(request.get('timeout') or _DEFAULT_TIMEOUT_S), _MAX_TIMEOUT_S)
         code = await _run_command(sandbox, str(request['command']), cwd, timeout, emit, cancelled)
     except Exception as exc:  # a guest failure is the model's to see, not the executor's to die on
@@ -253,7 +260,7 @@ async def _handle(
     await emit({'t': 'exit', 'code': code, 'backend_ms': (time.monotonic() - started) * 1000})
 
 
-async def serve(sandbox: postern.Sandbox, workspace: pathlib.Path, socket_path: pathlib.Path) -> asyncio.Server:
+async def serve(sandbox: postern.Sandbox, socket_path: pathlib.Path) -> asyncio.Server:
     """Start serving Pi's tool operations for `sandbox` on `socket_path`.
 
     The caller owns the sandbox, which it must already have verified, and the returned server.
@@ -261,7 +268,7 @@ async def serve(sandbox: postern.Sandbox, workspace: pathlib.Path, socket_path: 
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            await _handle(sandbox, workspace, reader, writer)
+            await _handle(sandbox, reader, writer)
         finally:
             writer.close()
             with contextlib.suppress(Exception):
@@ -271,7 +278,7 @@ async def serve(sandbox: postern.Sandbox, workspace: pathlib.Path, socket_path: 
     server = await asyncio.start_unix_server(handle, path=str(socket_path))
     # Only Pi, running as this user, should reach it; the guest is never bound to it.
     socket_path.chmod(0o600)
-    _logger.info('executor serving %s for workspace %s', socket_path, workspace)
+    _logger.info('executor serving %s', socket_path)
     return server
 
 
@@ -281,7 +288,7 @@ async def main(socket_path: pathlib.Path, workspace: pathlib.Path) -> None:
     sandbox = postern.Sandbox(postern.SandboxProfile(workspace=workspace))
     sandbox.verify()  # raises IsolationError: there is no host path to fall back to
     _logger.info('isolation verified')
-    server = await serve(sandbox, workspace, socket_path)
+    server = await serve(sandbox, socket_path)
     async with server:
         await server.serve_forever()
 

@@ -28,7 +28,7 @@ COPY pyproject.toml README.md LICENSE /tmp/postern/
 COPY src /tmp/postern/src
 RUN pip install --no-cache-dir /tmp/postern && rm -rf /tmp/postern
 COPY --from=pi /opt/pi-probe/node_modules /opt/pi-probe/node_modules
-COPY probes/pi/package.json probes/pi/index.ts probes/pi/bash-ops.ts probes/pi/fs-ops.ts probes/pi/grep.ts \
+COPY probes/pi/package.json probes/pi/index.ts probes/pi/bash-ops.ts probes/pi/fs-ops.ts probes/pi/grep.ts probes/pi/confine.ts \
     probes/pi/seam.ts probes/pi/tools.ts probes/pi/executor.py probes/pi/entrypoint.sh /opt/pi-probe/
 RUN ln -s /opt/pi-probe/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js /usr/local/bin/pi \
     && node --version && pi --version

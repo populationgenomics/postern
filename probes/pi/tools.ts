@@ -12,9 +12,10 @@ import {
   createReadTool,
   createWriteTool,
 } from '@earendil-works/pi-coding-agent';
-import { existsSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSeamBashOperations } from './bash-ops.ts';
+import { confined } from './confine.ts';
 import { createSeamFileOperations, type FileOpStats } from './fs-ops.ts';
 import { createSeamGrepToolDefinition } from './grep.ts';
 
@@ -26,24 +27,28 @@ type ToolLike = {
   execute: (id: string, params: unknown, signal: AbortSignal, onUpdate?: (u: unknown) => void) => Promise<unknown>;
 };
 
-// Seeded from the host side, as a caller restoring a workspace would.
-writeFileSync(join(WORKSPACE, 'working_document.md'), '# Working document\n\nseeded by the probe\n');
-writeFileSync(join(WORKSPACE, 'notes.txt'), 'alpha\nbeta CANARY gamma\n');
-// What a guest could plant: a symlink out of the workspace. It must be refused, not followed.
-symlinkSync('/etc/hostname', join(WORKSPACE, 'planted'));
-
 const stats: FileOpStats = { calls: 0, backendMs: 0 };
 const files = createSeamFileOperations(SOCKET, stats);
 const bash = createSeamBashOperations(SOCKET);
 
+// Seeded from inside the guest: Pi's /workspace is an empty decoy, and the real one is not on its
+// side at all. `planted` is what a guest could leave behind — a symlink out of the workspace, which
+// must be refused, not followed.
+await bash.exec(
+  "printf '# Working document\\n\\nseeded by the probe\\n' > working_document.md" +
+    " && printf 'alpha\\nbeta CANARY gamma\\n' > notes.txt && ln -s /etc/hostname planted",
+  WORKSPACE,
+  { onData: () => {} },
+);
+
 // Pi's own tools; ours only in where the work lands.
 const tools: ToolLike[] = [
-  createReadTool(WORKSPACE, { operations: files.read }),
-  createWriteTool(WORKSPACE, { operations: files.write }),
-  createEditTool(WORKSPACE, { operations: files.edit }),
-  createSeamGrepToolDefinition(WORKSPACE, SOCKET, stats),
-  createFindTool(WORKSPACE, { operations: files.find }),
-  createLsTool(WORKSPACE, { operations: files.ls }),
+  confined(WORKSPACE, createReadTool(WORKSPACE, { operations: files.read })),
+  confined(WORKSPACE, createWriteTool(WORKSPACE, { operations: files.write })),
+  confined(WORKSPACE, createEditTool(WORKSPACE, { operations: files.edit })),
+  confined(WORKSPACE, createSeamGrepToolDefinition(WORKSPACE, SOCKET, stats)),
+  confined(WORKSPACE, createFindTool(WORKSPACE, { operations: files.find })),
+  confined(WORKSPACE, createLsTool(WORKSPACE, { operations: files.ls })),
   createBashTool(WORKSPACE, { operations: bash }),
 ] as unknown as ToolLike[];
 
@@ -83,6 +88,8 @@ const hostRg = [process.env.PATH ?? '', join(process.env.PI_AGENT_DIR ?? '', 'bi
   .flatMap((dirs) => dirs.split(':'))
   .some((dir) => dir && existsSync(join(dir, 'rg')));
 console.log(`\nrg on Pi's side: ${hostRg ? 'PRESENT' : 'absent'} — grep ran in the guest`);
+const decoy = readdirSync(WORKSPACE);
+console.log(`Pi's ${WORKSPACE}: ${decoy.length ? `NOT EMPTY (${decoy.join(', ')})` : 'empty'} — the files above are the guest's alone`);
 
 console.log('\ndoes anything confine a path to the workspace?');
 for (const escape of ['../escaped.txt', '/etc/hosts', 'planted']) {
