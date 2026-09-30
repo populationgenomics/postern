@@ -3,9 +3,9 @@
 # PROBE — throwaway, lives on `pi-probe`. Pi, the extension, and this checkout's postern, in one
 # Linux image. `run.sh` builds and runs it; build context is the repo ROOT.
 #
-# The guest's system dirs are this image's (SandboxProfile's default rootfs), so the guest has the
-# same bash, python and coreutils the executor does. A real deploy would point `rootfs` at a curated
-# tree instead — see examples/Dockerfile.
+# The guest gets its own rootfs, assembled at build time in the `guest` stage and bound read-only
+# by postern (SandboxProfile(rootfs='/opt/guest-root')), as themis's sandbox worker image does. So
+# the guest sees none of the trusted side's userland: not node, not Pi or its extension, not postern.
 
 ARG NODE_IMAGE=node:24-bookworm-slim
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
@@ -15,6 +15,21 @@ FROM ${NODE_IMAGE} AS pi
 WORKDIR /opt/pi-probe
 COPY probes/pi/package.json probes/pi/package-lock.json ./
 RUN npm ci --ignore-scripts --omit=dev
+
+# --- the guest rootfs: ONLY what the tools need. This stage's whole filesystem becomes the guest's
+#     world. Python for the executor's file primitives (stdlib only), bash and coreutils for `bash`,
+#     and the git and ripgrep a model reaches for through `bash` without being told to. postern binds
+#     the rootfs's /usr, /lib and /bin but not its /etc, so the executor binds the system gitconfig
+#     (the identity commits carry) on its own. ---
+FROM ${PYTHON_IMAGE} AS guest
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --system user.name 'Pi probe agent' \
+    && git config --system user.email 'agent@localhost' \
+    && python -m compileall -q "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')"
+# The official image strips the stdlib's bytecode, and the rootfs is read-only to the guest, so
+# without this every file primitive recompiles json, pathlib and friends: about 4x per call.
 
 # --- bubblewrap, postern from this checkout, and a node to run Pi with. ---
 FROM ${PYTHON_IMAGE}
@@ -38,5 +53,7 @@ ENV PI_AGENT_DIR=/var/lib/pi
 # either, so a tool that still reaches for one fails loudly instead of fetching a host binary.
 ENV PI_OFFLINE=1
 RUN mkdir -p /var/lib/pi
+# Copying '/' preserves the usrmerge symlink layout postern's binds expect.
+COPY --from=guest / /opt/guest-root
 ENTRYPOINT ["/opt/pi-probe/entrypoint.sh"]
 CMD ["seam"]

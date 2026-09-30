@@ -81,6 +81,10 @@ console.log(`  grep -C ${await call('grep', { pattern: 'beta', context: 1, glob:
 console.log(`  find    ${await call('find', { pattern: '*.md' })}`);
 console.log(`  ls      ${await call('ls', { path: '.' })}`);
 console.log(`  bash    ${await call('bash', { command: 'echo from-the-guest; id -u; pwd' })}`);
+// The guest's userland is its own rootfs: its tools are there, the trusted side's are not.
+const userland = 'for c in python3 git rg node pi; do command -v $c >/dev/null && echo -n "$c " || echo -n "!$c "; done;' +
+  ' python3 -c "import postern" 2>/dev/null && echo postern || echo !postern';
+console.log(`  bash    ${await call('bash', { command: userland })}`);
 const elapsed = performance.now() - started;
 
 // Pi's own grep would have spawned rg on this side; there must be none here to spawn.

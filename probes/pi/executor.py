@@ -37,8 +37,10 @@ Protocol, newline-delimited JSON, one request per connection:
     out  {"t": "result", "value": <json>, "backend_ms": float}
     out  {"t": "error", "message": str}
 
-Run: `python executor.py <socket-path> <host-workspace>`; `entrypoint.sh` does this for you. The
-host workspace is where the guest's `/workspace` lives on the host, and nothing else here uses it.
+Run: `python executor.py <socket-path> <host-workspace> <guest-rootfs>`; `entrypoint.sh` does this
+for you. The host workspace is where the guest's `/workspace` lives on the host, and nothing else
+here uses it. The guest rootfs is required, not defaulted: postern's default binds the host's own
+system dirs, which would put the trusted side's userland (node, Pi, postern) in the guest.
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ _MAX_TIMEOUT_S = 120.0
 _FILE_OP_TIMEOUT_S = 60.0
 # Where postern binds the workspace inside the guest.
 _GUEST_WORKSPACE = pathlib.PurePosixPath('/workspace')
+_GUEST_GITCONFIG = '/etc/gitconfig'
 _logger = logging.getLogger(__name__)
 
 
@@ -282,10 +285,16 @@ async def serve(sandbox: postern.Sandbox, socket_path: pathlib.Path) -> asyncio.
     return server
 
 
-async def main(socket_path: pathlib.Path, workspace: pathlib.Path) -> None:
-    """Verify a guest over `workspace`, then serve on `socket_path` until killed."""
+async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathlib.Path) -> None:
+    """Verify a guest over `workspace` and `rootfs`, then serve on `socket_path` until killed."""
     workspace.mkdir(parents=True, exist_ok=True)
-    sandbox = postern.Sandbox(postern.SandboxProfile(workspace=workspace))
+    profile = postern.SandboxProfile(
+        rootfs=rootfs,
+        workspace=workspace,
+        # postern binds the rootfs's system dirs but not its /etc; git's identity lives there.
+        ro_binds=[(str(rootfs / _GUEST_GITCONFIG.lstrip('/')), _GUEST_GITCONFIG)],
+    )
+    sandbox = postern.Sandbox(profile)
     sandbox.verify()  # raises IsolationError: there is no host path to fall back to
     _logger.info('isolation verified')
     server = await serve(sandbox, socket_path)
@@ -296,4 +305,4 @@ async def main(socket_path: pathlib.Path, workspace: pathlib.Path) -> None:
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='executor: %(message)s')
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])))
+        asyncio.run(main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])))

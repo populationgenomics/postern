@@ -25,8 +25,14 @@ postern.
  executor.py (no credential: started with `env -i`)
         │ confines every path to the workspace, clamps timeouts
         ▼
- postern guest: Sandbox.run / run_python, empty netns, uid 65534, seccomp
+ postern guest: Sandbox.run / run_python, empty netns, uid 65534, seccomp,
+               its own rootfs (/opt/guest-root: python, bash, git, ripgrep)
 ```
+
+The guest's rootfs is a separate build stage, bound read-only by postern, as in themis's sandbox
+worker image (`themis/services/sandbox_worker/Dockerfile`). Without it postern binds the trusted
+side's own system dirs, and the guest can see node, Pi and its extension, and the postern package.
+`tools` checks what the guest has: `python3 git rg !node !pi !postern`.
 
 ## Running it
 
@@ -100,6 +106,12 @@ extension now registers the `…ToolDefinition` factories. That brings back the 
 pre-call preview, which reads the target file locally with whatever path the model named, so
 `index.ts` renders the edit call as though its arguments were still streaming, which skips the
 preview. The diff shown after the call comes from the result, computed in the guest.
+
+**A separate rootfs needs its stdlib precompiled.** The official `python` images strip stdlib
+bytecode. While the guest shared the trusted side's `/usr`, the executor's own imports left
+`__pycache__` behind for it. A read-only rootfs that has never run Python has none, so each file
+primitive recompiled `json`, `pathlib` and the rest: 1.4 s for the seven calls instead of 0.36 s,
+with bash unaffected. The guest stage runs `compileall` over the stdlib.
 
 ## Open
 
