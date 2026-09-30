@@ -5,12 +5,12 @@
 // model involved. Run inside the container: `probes/pi/run.sh tools`.
 
 import {
-  createBashTool,
-  createEditTool,
-  createFindTool,
-  createLsTool,
-  createReadTool,
-  createWriteTool,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createLsToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -43,13 +43,13 @@ await bash.exec(
 
 // Pi's own tools; ours only in where the work lands.
 const tools: ToolLike[] = [
-  confined(WORKSPACE, createReadTool(WORKSPACE, { operations: files.read })),
-  confined(WORKSPACE, createWriteTool(WORKSPACE, { operations: files.write })),
-  confined(WORKSPACE, createEditTool(WORKSPACE, { operations: files.edit })),
+  confined(WORKSPACE, createReadToolDefinition(WORKSPACE, { operations: files.read })),
+  confined(WORKSPACE, createWriteToolDefinition(WORKSPACE, { operations: files.write })),
+  confined(WORKSPACE, createEditToolDefinition(WORKSPACE, { operations: files.edit })),
   confined(WORKSPACE, createSeamGrepToolDefinition(WORKSPACE, SOCKET, stats)),
-  confined(WORKSPACE, createFindTool(WORKSPACE, { operations: files.find })),
-  confined(WORKSPACE, createLsTool(WORKSPACE, { operations: files.ls })),
-  createBashTool(WORKSPACE, { operations: bash }),
+  confined(WORKSPACE, createFindToolDefinition(WORKSPACE, { operations: files.find })),
+  confined(WORKSPACE, createLsToolDefinition(WORKSPACE, { operations: files.ls })),
+  createBashToolDefinition(WORKSPACE, { operations: bash }),
 ] as unknown as ToolLike[];
 
 console.log(`\nworkspace: ${WORKSPACE}`);

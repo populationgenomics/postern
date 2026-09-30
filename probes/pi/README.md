@@ -93,6 +93,14 @@ already fine: it uses `operations.glob` when one is provided and only falls back
 The guest grep uses Python's `re` rather than ripgrep's regex engine and does not read
 `.gitignore`. It skips `.git`, `node_modules`, symlinks and binary files.
 
+**New: the tools themis registered reached the model with less guidance than Pi's own.**
+`createReadTool` and friends wrap the definition into an `AgentTool`, and the wrapper keeps the
+name, description and schema but drops `promptSnippet`, `promptGuidelines` and the renderers. The
+extension now registers the `…ToolDefinition` factories. That brings back the edit renderer's
+pre-call preview, which reads the target file locally with whatever path the model named, so
+`index.ts` renders the edit call as though its arguments were still streaming, which skips the
+preview. The diff shown after the call comes from the result, computed in the guest.
+
 ## Open
 
 - **File primitives through the `Workspace` accessor** instead of a guest per call. The accessor is

@@ -17,12 +17,12 @@
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import {
-  createBashTool,
-  createEditTool,
-  createFindTool,
-  createLsTool,
-  createReadTool,
-  createWriteTool,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createLsToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { createSeamBashOperations } from './bash-ops.ts';
 import { confined } from './confine.ts';
@@ -36,6 +36,21 @@ function required(name: string): string {
   return value;
 }
 
+type EditDefinition = ReturnType<typeof createEditToolDefinition>;
+
+/**
+ * The edit tool, without the preview its renderer computes before the call runs.
+ *
+ * That preview (`computeEditsDiff`) reads the target file *locally*, ignoring the operations, and
+ * with any path the model named. Rendering the call as though its arguments were still streaming
+ * skips it; the diff Pi shows once the call returns is the result's, computed in the guest.
+ */
+function withoutLocalPreview(edit: EditDefinition): EditDefinition {
+  const renderCall = edit.renderCall;
+  if (!renderCall) return edit;
+  return { ...edit, renderCall: (args, theme, context) => renderCall(args, theme, { ...context, argsComplete: false }) };
+}
+
 export default function activate(pi: ExtensionAPI): void {
   const socket = required('PI_POSTERN_SOCKET');
   const workspace = required('PI_POSTERN_WORKSPACE');
@@ -46,13 +61,17 @@ export default function activate(pi: ExtensionAPI): void {
   // Pi's default operations and runs on the host, beside the model credential — so the list is the
   // whole boundary. Registered one by one rather than over a list: each factory's parameter schema is
   // its own type, and a list of them unifies to something `registerTool` will not take.
-  pi.registerTool(confined(workspace, createReadTool(workspace, { operations: files.read })));
-  pi.registerTool(confined(workspace, createWriteTool(workspace, { operations: files.write })));
-  pi.registerTool(confined(workspace, createEditTool(workspace, { operations: files.edit })));
+  //
+  // The `…ToolDefinition` factories, not `createReadTool` and friends: those wrap the definition
+  // into an `AgentTool`, which drops `promptSnippet`, `promptGuidelines` and the renderers, so a
+  // tool registered from one reaches the model with less guidance than Pi's built-in of the same name.
+  pi.registerTool(confined(workspace, createReadToolDefinition(workspace, { operations: files.read })));
+  pi.registerTool(confined(workspace, createWriteToolDefinition(workspace, { operations: files.write })));
+  pi.registerTool(confined(workspace, withoutLocalPreview(createEditToolDefinition(workspace, { operations: files.edit }))));
   pi.registerTool(confined(workspace, createSeamGrepToolDefinition(workspace, socket)));
-  pi.registerTool(confined(workspace, createFindTool(workspace, { operations: files.find })));
-  pi.registerTool(confined(workspace, createLsTool(workspace, { operations: files.ls })));
-  pi.registerTool(createBashTool(workspace, { operations: bash }));
+  pi.registerTool(confined(workspace, createFindToolDefinition(workspace, { operations: files.find })));
+  pi.registerTool(confined(workspace, createLsToolDefinition(workspace, { operations: files.ls })));
+  pi.registerTool(createBashToolDefinition(workspace, { operations: bash }));
 
   // `!command` in the TUI is the user's own shell, and it goes to the same place the agent's does.
   pi.on('user_bash', async () => ({ operations: bash }));
