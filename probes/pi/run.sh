@@ -3,7 +3,7 @@
 #
 #   probes/pi/run.sh              # seam timings against the real guest (default)
 #   probes/pi/run.sh tools        # Pi's seven tools through the seam
-#   ANTHROPIC_API_KEY=… probes/pi/run.sh pi --provider anthropic --model claude-sonnet-5-5
+#   ANTHROPIC_API_KEY=… probes/pi/run.sh pi --provider anthropic --model claude-sonnet-5
 #
 # The two --security-opts are the ones tests/docker/run.sh needs, for the same reason: they let
 # bubblewrap build its namespaces inside the container. They loosen the container's confinement of

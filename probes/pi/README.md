@@ -36,7 +36,7 @@ the ones `tests/docker/run.sh` uses, for the same reason.
 ```bash
 probes/pi/run.sh              # seam timings against the real guest (no model)
 probes/pi/run.sh tools        # Pi's seven tools through the seam (no model)
-ANTHROPIC_API_KEY=… probes/pi/run.sh pi --provider anthropic --model claude-sonnet-5-5
+ANTHROPIC_API_KEY=… probes/pi/run.sh pi --provider anthropic --model claude-sonnet-5
 ```
 
 Type-check the extension against Pi's published types locally with
