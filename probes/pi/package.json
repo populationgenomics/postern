@@ -1,0 +1,19 @@
+{
+  "name": "postern-pi-probe",
+  "private": true,
+  "type": "module",
+  "description": "PROBE, throwaway. Pi's loop outside a postern guest, its tools inside.",
+  "main": "index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "seam": "node seam.ts",
+    "tools": "node tools.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
+  }
+}
