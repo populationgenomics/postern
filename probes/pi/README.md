@@ -77,10 +77,14 @@ is the number `pi-loop-outside` could not measure. A file primitive costs about 
 one is a fresh `run_python` and so pays for a Python interpreter start. The six file tools issued 16
 of them.
 
-**Streaming and abort are still absent, now confirmed against the guest.** Five lines 200 ms apart
-arrive as **1 frame** after 1038 ms. `sleep 5` cancelled at 300 ms returns after **5016 ms**. This is
-the postern-side work both themis docs name, and it applies whichever harness sits above postern:
-a streaming `run` over the existing stdout pipe, plus a kill on cancel.
+**Streaming and abort work, against the real guest.** At first they did not: five lines 200 ms
+apart arrived as **1 frame** after 1038 ms, and `sleep 5` cancelled at 300 ms returned after
+**5016 ms**, because `Sandbox.run` buffered and could not be interrupted. The executor now uses
+postern's `astart_bash`: each chunk is a frame as the guest writes it, and a cancel is a graceful
+`terminate()` (SIGTERM to the guest's init through a pidfd, forwarded to the command's process
+group, and a kill after a 2 s grace). Now the five lines arrive as **5 frames** as they are
+written, and the cancelled `sleep 5` returns after **310 ms** with status 143: it died of the
+SIGTERM, not of a kill. The model's `timeout` stops a command the same way.
 
 **Confinement holds, including against a planted symlink.** `../escaped.txt`, `/etc/hosts` and a
 workspace symlink to `/etc/hostname` are all refused. Pi itself passes all three through without
@@ -136,6 +140,5 @@ with bash unaffected. The guest stage runs `compileall` over the stdlib.
 - **File primitives through the `Workspace` accessor** instead of a guest per call. The accessor is
   reference-closed by construction, so it would satisfy the confinement requirement host-side
   without a 28 ms interpreter start. It lacks `mkdir` and `glob` today.
-- **Streaming and abort in `Sandbox.run`**, as above.
 - **A model-driven run** (`run.sh pi`), timed, as the end-to-end latency number themis is still
   missing.

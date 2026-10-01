@@ -10,8 +10,8 @@ successor to `proto/pi-loop-outside`'s comparison executor. What it kept from ea
 - **No host backend.** `pi-loop-outside` fell back to a host subprocess where bubblewrap was absent;
   `pi-vm` dropped that, because a fallback is model-chosen commands running unsandboxed beside the
   credential. This refuses to start unless `Sandbox.verify()` passes.
-- **A timeout ceiling.** Pi's bash tool takes `timeout` from the model and `Sandbox.run_bash` cannot be
-  interrupted, so an unclamped value is a command nothing can stop.
+- **A timeout ceiling.** Pi's bash tool takes `timeout` from the model; a command can be stopped
+  now, but an unclamped value still lets the model hold the session as long as it likes.
 - **Confinement.** Pi resolves a tool's path and hands it over without a workdir check, so
   `read ../../etc/shadow` arrives here as an absolute path outside the workspace, and is refused.
 
@@ -56,6 +56,7 @@ signal to PID 1 reaches the command's whole process group.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import json
 import logging
@@ -70,10 +71,12 @@ import postern
 
 Emit = Callable[[dict[str, object]], Awaitable[None]]
 
-# `Sandbox.run_bash` has no cancellation, so a command runs to completion regardless; this bounds it. The
-# ceiling, not just the default: the model picks the number, and an unclamped one is unstoppable.
+# The ceiling, not just the default: the model picks the number, and a command can now be stopped,
+# but one the model asked to run for an hour still holds the session for an hour.
 _DEFAULT_TIMEOUT_S = 120.0
 _MAX_TIMEOUT_S = 120.0
+# How long a cancelled or timed-out command gets to clean up after SIGTERM before it is killed.
+_STOP_GRACE_S = 2.0
 _FILE_OP_TIMEOUT_S = 60.0
 # Where postern binds the workspace inside the guest.
 _GUEST_WORKSPACE = pathlib.PurePosixPath('/workspace')
@@ -177,31 +180,50 @@ else:
 async def _run_command(
     sandbox: postern.Sandbox, command: str, cwd: str, timeout: float, emit: Emit, cancelled: asyncio.Event
 ) -> int | None:
-    """Run `command` in the guest, reporting the two places `Sandbox.run_bash` falls short of Pi's contract.
+    """Run `command` in the guest, streaming its output, and stop it on a cancel or the timeout.
 
-    Pi's `BashOperations.exec` promises incremental output through `onData` and a kill on abort.
-    `Sandbox.run_bash` buffers and cannot be interrupted, so output arrives in one frame at the end and a
-    cancel is acknowledged rather than honoured. Both are reported as notes instead of papered over.
+    Pi's `BashOperations.exec` promises incremental output through `onData` and a kill on abort, and
+    `Sandbox.astart_bash` gives both: each chunk is a frame as the guest writes it, and a cancel is a
+    graceful `terminate()` (SIGTERM through the init to the command's process group, a kill after
+    the grace). stdout and stderr go to Pi as one stream, as its local bash tool gives them.
     """
-
-    async def acknowledge_cancel() -> None:
-        await cancelled.wait()
-        await emit({'t': 'note', 'd': 'Sandbox.run_bash cannot be aborted; the command runs to completion'})
-
     # `bash -c`, not `bash -l`: the guest has no /etc, so a login shell has no profile to read.
     script = f'cd {shlex.quote(cwd)} && {command}'
-    watching = asyncio.create_task(acknowledge_cancel())
-    try:
-        result = await asyncio.to_thread(sandbox.run_bash, script, timeout=timeout)
-    finally:
-        watching.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watching
+    decoders = {
+        'stdout': codecs.getincrementaldecoder('utf-8')('replace'),
+        'stderr': codecs.getincrementaldecoder('utf-8')('replace'),
+    }
+    async with await sandbox.astart_bash(script) as process:
+        reason: list[str] = []
 
-    for stream in (result.stdout, result.stderr):
-        if stream:
-            await emit({'t': 'out', 'd': stream})
-    return result.returncode
+        def stop(why: str) -> None:
+            if not reason:
+                reason.append(why)
+                process.terminate(grace=_STOP_GRACE_S)
+
+        async def stop_on_cancel() -> None:
+            await cancelled.wait()
+            stop('cancelled')
+
+        watching = asyncio.create_task(stop_on_cancel())
+        deadline = asyncio.get_running_loop().call_later(timeout, stop, f'timed out after {timeout:g}s')
+        try:
+            async for stream, chunk in process.output():
+                if text := decoders[stream].decode(chunk):
+                    await emit({'t': 'out', 'd': text})
+            status = await process.wait()
+        finally:
+            deadline.cancel()
+            watching.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watching
+        for decoder in decoders.values():
+            if tail := decoder.decode(b'', final=True):
+                await emit({'t': 'out', 'd': tail})
+        if reason:
+            await emit({'t': 'note', 'd': f'{reason[0]}: the command was stopped'})
+    # A run killed with the sandbox (negative: bwrap's signal) has no exit code to give Pi.
+    return status if status >= 0 else None
 
 
 async def _file_op(sandbox: postern.Sandbox, request: dict[str, object]) -> object:
@@ -238,7 +260,7 @@ async def _handle(
     if not line:
         return
     request = json.loads(line)
-    await emit({'t': 'hello', 'backend': 'postern-guest', 'streams': False, 'aborts': False})
+    await emit({'t': 'hello', 'backend': 'postern-guest', 'streams': True, 'aborts': True})
     started = time.monotonic()
 
     if 'op' in request:
