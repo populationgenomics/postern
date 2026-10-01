@@ -623,7 +623,12 @@ class Sandbox:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
         if self._profile.init is not None:
             self._check_init_version(timeout=timeout)
-        result = self.run_python('pass', timeout=timeout)
+            # The init itself, so the check needs nothing from the rootfs: under the
+            # C init a rootfs need not carry Python, and run_python('pass') would
+            # fail on that rather than on isolation.
+            result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
+        else:
+            result = self.run_python('pass', timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
 

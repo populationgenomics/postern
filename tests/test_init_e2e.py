@@ -130,3 +130,9 @@ def test_c_init_needs_no_interpreter_for_run_or_run_bash(c_init):
 
 def test_verify_accepts_the_init_it_was_built_with(c_init):
     Sandbox(SandboxProfile(init=c_init)).verify()
+
+
+def test_verify_needs_no_interpreter_under_the_c_init(c_init):
+    # A rootfs without Python is the point of the C init, so the boot check must
+    # not launch run_python to prove isolation.
+    Sandbox(SandboxProfile(init=c_init, python='/nonexistent/python3')).verify()
