@@ -74,7 +74,15 @@ export function createSeamBashOperations(
                 options.signal?.removeEventListener('abort', requestCancel);
                 onCall?.({ frames, backend, notes, backendMs: message.backend_ms as unknown as number });
                 socket.end();
-                resolve({ exitCode: (message.code as unknown as number | null) ?? null });
+                // Pi's bash tool learns why a command stopped from how exec settles, not from its
+                // exit code: 'aborted' and 'timeout:<seconds>' are what its own local operations
+                // throw, and what it turns into "Command aborted" / "Command timed out after N
+                // seconds" for the model. Resolving with the exit code would read as an ordinary
+                // failure ("Command exited with code 143").
+                const stopped = message.stopped as unknown as string | null;
+                if (stopped === 'timeout') reject(new Error(`timeout:${options.timeout}`));
+                else if (stopped === 'cancelled' || options.signal?.aborted) reject(new Error('aborted'));
+                else resolve({ exitCode: (message.code as unknown as number | null) ?? null });
                 break;
               }
             }

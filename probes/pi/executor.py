@@ -30,7 +30,7 @@ Protocol, newline-delimited JSON, one request per connection:
     out  {"t": "hello", "backend": str, "streams": bool, "aborts": bool}
     out  {"t": "out", "d": str}                            (zero or more)
     out  {"t": "note", "d": str}                           (zero or more)
-    out  {"t": "exit", "code": int | None, "backend_ms": float}
+    out  {"t": "exit", "code": int | None, "stopped": "cancelled" | "timeout" | None, "backend_ms": float}
 
     in   {"op": "readFile" | "writeFile" | ..., "path": str, ...}
     out  {"t": "hello", ...}
@@ -179,8 +179,12 @@ else:
 
 async def _run_command(
     sandbox: postern.Sandbox, command: str, cwd: str, timeout: float, emit: Emit, cancelled: asyncio.Event
-) -> int | None:
+) -> tuple[int | None, str | None]:
     """Run `command` in the guest, streaming its output, and stop it on a cancel or the timeout.
+
+    Returns its exit status (None if it died with the sandbox) and why it was stopped, if it was:
+    `'cancelled'` or `'timeout'`. Pi's bash tool reports those itself ("Command aborted", "Command
+    timed out after N seconds"), so they travel in the exit frame rather than as output.
 
     Pi's `BashOperations.exec` promises incremental output through `onData` and a kill on abort, and
     `Sandbox.astart_bash` gives both: each chunk is a frame as the guest writes it, and a cancel is a
@@ -206,7 +210,7 @@ async def _run_command(
             stop('cancelled')
 
         watching = asyncio.create_task(stop_on_cancel())
-        deadline = asyncio.get_running_loop().call_later(timeout, stop, f'timed out after {timeout:g}s')
+        deadline = asyncio.get_running_loop().call_later(timeout, stop, 'timeout')
         try:
             async for stream, chunk in process.output():
                 if text := decoders[stream].decode(chunk):
@@ -220,10 +224,8 @@ async def _run_command(
         for decoder in decoders.values():
             if tail := decoder.decode(b'', final=True):
                 await emit({'t': 'out', 'd': tail})
-        if reason:
-            await emit({'t': 'note', 'd': f'{reason[0]}: the command was stopped'})
     # A run killed with the sandbox (negative: bwrap's signal) has no exit code to give Pi.
-    return status if status >= 0 else None
+    return (status if status >= 0 else None), (reason[0] if reason else None)
 
 
 async def _file_op(sandbox: postern.Sandbox, request: dict[str, object]) -> object:
@@ -283,16 +285,16 @@ async def _handle(
     try:
         cwd = _to_guest(str(request.get('cwd') or '.'))
         timeout = min(float(request.get('timeout') or _DEFAULT_TIMEOUT_S), _MAX_TIMEOUT_S)
-        code = await _run_command(sandbox, str(request['command']), cwd, timeout, emit, cancelled)
+        code, stopped = await _run_command(sandbox, str(request['command']), cwd, timeout, emit, cancelled)
     except Exception as exc:  # a guest failure is the model's to see, not the executor's to die on
         _logger.exception('guest command failed')
         await emit({'t': 'note', 'd': f'{type(exc).__name__}: {exc}'})
-        code = None
+        code, stopped = None, None
     finally:
         watching.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watching
-    await emit({'t': 'exit', 'code': code, 'backend_ms': (time.monotonic() - started) * 1000})
+    await emit({'t': 'exit', 'code': code, 'stopped': stopped, 'backend_ms': (time.monotonic() - started) * 1000})
 
 
 async def serve(sandbox: postern.Sandbox, socket_path: pathlib.Path) -> asyncio.Server:

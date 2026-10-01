@@ -26,12 +26,18 @@ const ops = createSeamBashOperations(SOCKET, (call) => {
 const run = async (label: string, command: string, signal?: AbortSignal): Promise<Case> => {
   let output = '';
   const started = performance.now();
-  const { exitCode } = await ops.exec(command, WORKSPACE, {
-    onData: (data) => {
-      output += data.toString('utf8');
-    },
-    signal,
-  });
+  let exitCode: number | null = null;
+  try {
+    ({ exitCode } = await ops.exec(command, WORKSPACE, {
+      onData: (data) => {
+        output += data.toString('utf8');
+      },
+      signal,
+    }));
+  } catch (error) {
+    // An aborted command rejects with 'aborted', as Pi's own operations do.
+    if ((error as Error).message !== 'aborted') throw error;
+  }
   return { label, wallMs: performance.now() - started, call: last!, exitCode, output };
 };
 

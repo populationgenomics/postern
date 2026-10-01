@@ -105,5 +105,37 @@ console.log(`  grep . (via planted) ${await call('grep', { pattern: '.', glob: '
 
 console.log(`\nseven tool calls in ${elapsed.toFixed(0)} ms; ` +
   `${stats.calls} file primitives served, ${stats.backendMs.toFixed(1)} ms of that in the guest`);
+// Pi's bash tool, called the way its loop calls it: an onUpdate callback for partial output, an
+// AbortSignal for the user's interrupt, and the model's own `timeout`. What the model is told comes
+// from how our operations settle, so this is where a contract mismatch would show.
+console.log("\nPi's bash tool, as its loop drives it:");
+const bashTool = tools.find((t) => t.name === 'bash')!;
+const drive = async (params: unknown, abortAfterMs?: number) => {
+  const controller = new AbortController();
+  if (abortAfterMs !== undefined) setTimeout(() => controller.abort(), abortAfterMs);
+  const updates: number[] = [];
+  const started = performance.now();
+  let text: string;
+  try {
+    const result = (await bashTool.execute('drive', params, controller.signal, () => {
+      updates.push(performance.now() - started);
+    })) as { content?: { text?: string }[] };
+    text = result.content?.[0]?.text ?? '';
+  } catch (error) {
+    text = (error as Error).message;
+  }
+  const said = text.trim().split('\n').filter(Boolean).slice(-2).join(' | ');
+  return { ms: performance.now() - started, updates, said };
+};
+const streamed = await drive({ command: 'for i in 1 2 3 4 5; do echo $i; sleep 0.2; done' });
+// The first onUpdate is Pi clearing the pane before anything runs; the rest carry output.
+const partial = streamed.updates.slice(1);
+console.log(`  streaming  ${partial.length} partial update(s) during a ${streamed.ms.toFixed(0)} ms command, ` +
+  `first at ${partial[0]?.toFixed(0) ?? '-'} ms`);
+const aborted = await drive({ command: 'trap "echo cleaning-up; exit 3" TERM; echo started; sleep 5 & wait' }, 300);
+console.log(`  abort      returned in ${aborted.ms.toFixed(0)} ms: ${aborted.said}`);
+const timedOut = await drive({ command: 'echo started; sleep 5', timeout: 1 });
+console.log(`  timeout=1  returned in ${timedOut.ms.toFixed(0)} ms: ${timedOut.said}`);
+
 console.log('\nnot provided here, and not provided by Pi at all:');
 console.log('  web_search, web_fetch — would be first-party tools over an HttpHatch\n');
