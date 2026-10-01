@@ -22,6 +22,12 @@ RUN mkdir -p /stubs && python -m grpc_tools.protoc -I. --python_out=/stubs --grp
 FROM python:3.12-slim AS guest
 RUN pip install --no-cache-dir grpcio protobuf pandas
 COPY --from=stubs /stubs /usr/local/lib/python3.12/site-packages/
+# Precompile everything the guest can import. The rootfs is read-only to the
+# guest, so Python cannot cache bytecode at runtime: any module without a .pyc
+# here is recompiled on every run. The official image ships the stdlib without
+# bytecode, and while pip compiles what it installs, `uv pip install` does not
+# by default — without this, `import pandas` alone costs ~4x per run.
+RUN python -m compileall -q /usr/local/lib/python3.12
 
 # --- 3. The worker: bubblewrap + postern + your servicer, plus the guest rootfs
 #        copied in for postern to bind read-only at runtime. ---
