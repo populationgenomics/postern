@@ -81,6 +81,14 @@ gate the host opens.
   (`POSTERN_ARGV`, `POSTERN_CODE`, `POSTERN_RECODE`, `POSTERN_NPROC`,
   `POSTERN_AS`).
 
+- **Init** (`_init.c`) — the static C program a profile can name
+  (`SandboxProfile(init=...)`) to be PID 1 in the shim's place: same duties, no
+  interpreter, signals forwarded to the whole process group. Its contract is its
+  argv (`--nproc`, `--as`, `-- argv...`). Ships as source; the deployer builds it
+  with `python -m postern.build_init` in a throwaway image stage, stamped with the
+  postern version `verify()` checks it against. Under it, `run_python`'s shim is a
+  plain child, not an init.
+
 - **Stubs** — importable modules injected at `/run/postern/stubs` (on the
   guest's `PYTHONPATH`). Lets one shared rootfs carry the heavy base while the
   per-service gRPC stubs are bound in selectively, kept in lockstep with the
