@@ -57,9 +57,9 @@ and the arguments and results are typed and language-neutral.
   root (a full host escape);
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
   **`--die-with-parent`**, **`--clearenv`**;
-- **`--as-pid-1`** — the in-guest shim *is* PID 1 of the guest's PID namespace. A
-  resident bwrap there would share the guest uid, putting its `/proc/1` (cmdline,
-  maps, read/write mem, env) within reach from inside. What the shim does with that
+- **`--as-pid-1`** — postern's guest init *is* PID 1 of the guest's PID namespace.
+  A resident bwrap there would share the guest uid, putting its `/proc/1` (cmdline,
+  maps, read/write mem, env) within reach from inside. What the init does with that
   role: see [PID 1 and the resource backstops](#pid-1-and-the-resource-backstops)
   below;
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
@@ -81,44 +81,45 @@ RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
 ### PID 1 and the resource backstops
 
 Everything above is a bwrap flag, so every entrypoint gets it. The rlimits and the
-init role are not flags — they come from the shim (`_guest.py`), which postern binds
-in and makes the entrypoint for **every** run.
+init role are not flags: they come from the guest's **init**, which postern binds in
+and makes the entrypoint for **every** run.
 
-As PID 1 the shim is a real init: it marks *itself* `PR_SET_DUMPABLE=0` so a co-uid
-process the guest spawns cannot read the init, forks the work, reaps orphaned
-descendants that reparent to it, and propagates the work's exit status. The forked
-child applies **`RLIMIT_NPROC`** (`SandboxProfile(rlimit_nproc=1024)`) as a
-fork-bomb backstop and, when set, **`RLIMIT_AS`** (`SandboxProfile(rlimit_as=...)`,
-off by default; a cgroup `memory.max` at the deploy layer is the real memory
-isolation), then `exec`s the work. Setting the limits before the `exec` is what
-carries them to a program that would not set them itself.
+**Use the C init.** `SandboxProfile(init=...)` names a small static C program
+(`_init.c`, ~190 lines) that you build once, at image-build time, from the source
+postern ships. It needs nothing from the guest's rootfs, and with it the only
+things that need a Python interpreter in the sandbox are `run_python` and the stream
+hatch's `git_url` connector, so a rootfs for `run`/`run_bash` need not carry one.
+Without `init=`, postern falls back to the Python shim (`_guest.py`) as the init,
+which does the same job at the cost of an interpreter in every rootfs and an
+interpreter start on every run: about 16 ms per `run_bash('true')` against 2.9 ms
+under the C init, which is what a bare launch costs.
+
+Either way, the init is a real PID 1. It marks *itself* `PR_SET_DUMPABLE=0` so a
+co-uid process the guest spawns cannot read it, forks the work, reaps orphaned
+descendants that reparent to it, forwards termination signals (the C init to the
+work's whole *process group*, the shim to the work alone), and propagates the
+work's exit status, as 128+N for death by signal N. The forked child applies
+**`RLIMIT_NPROC`** (`SandboxProfile(rlimit_nproc=1024)`) as a fork-bomb backstop
+and, when set, **`RLIMIT_AS`** (`SandboxProfile(rlimit_as=...)`, off by default; a
+cgroup `memory.max` at the deploy layer is the real memory isolation), then `exec`s
+the work. Setting the limits before the `exec` is what carries them to a program
+that would not set them itself.
 
 What the child execs is the only difference between the entrypoints:
 
-- **`Sandbox.run_python`** re-execs `profile.python` on the shim, which runs the
-  code in that fresh interpreter rather than in the supervisor's own process.
-  `RLIMIT_AS` is applied after the interpreter is up, because a bare CPython's
-  *virtual* size at startup can exceed a cap that its resident use never
-  approaches, and capping before the `exec` would abort the startup.
 - **`Sandbox.run`** execs the caller's argv, and **`Sandbox.run_bash`** execs
   `shell -c script` (`bash` by default). Neither has to tolerate being PID 1 or
-  manage its own limits. A program the shim cannot exec is a `returncode` of 127,
-  not an exception. The cost is that the supervisor is Python: `profile.python`
-  must exist in the sandbox even for a compiled program, so a curated `rootfs`
-  must carry an interpreter — unless the profile names the C init below.
+  manage its own limits. A program the init cannot exec is a `returncode` of 127,
+  not an exception.
+- **`Sandbox.run_python`** execs `profile.python` on the shim, which runs the code
+  in that fresh interpreter. `RLIMIT_AS` is applied after the interpreter is up,
+  because a bare CPython's *virtual* size at startup can exceed a cap that its
+  resident use never approaches, and capping before the `exec` would abort the
+  startup. Under the C init this is one interpreter start; under the fallback shim
+  it is two (the supervising shim, then the re-exec).
 
-**The C init.** `SandboxProfile(init=...)` replaces the shim as PID 1 with a small
-static C program (`_init.c`) that does the same job: it reaps, forwards every
-catchable signal to the command's *process group* (the shim signals the command
-alone), passes the exit status through, is non-dumpable, and sets both limits in
-the child before the `exec`. `run` and `run_bash` then need no interpreter, and
-cost what a bare launch does rather than an interpreter start: about 2.9 ms per
-`run_bash('true')` against 16 ms under the shim. `run_python` runs the shim as the
-init's child, so it pays for one interpreter start instead of two, and the shim
-still applies `RLIMIT_AS` after startup.
-
-It ships as source in the package, not as a binary. Build it in a throwaway image
-stage, so no compiler reaches the rootfs or the worker:
+**Building the C init.** It ships as source in the package, not as a binary. Build
+it in a throwaway image stage, so no compiler reaches the rootfs or the worker:
 
 ```dockerfile
 FROM python:3.12-slim AS init
@@ -128,9 +129,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
 COPY --from=init /postern-init /opt/postern-init
 ```
 
+```python
+profile = SandboxProfile(rootfs='/opt/guest-root', init='/opt/postern-init')
+```
+
 Install the same postern version in both stages: the binary is stamped with the
 version it was built from, and `verify()` refuses a mismatch. It is static, so it
 needs nothing from the rootfs; postern binds it in at `/run/postern/init`.
+`examples/Dockerfile` does all of this.
 
 **Fail-closed boot check.** Every control is enforced on the launch path: the
 strict `--unshare-*` flags make bwrap abort if it can't create the namespaces,
@@ -156,8 +162,9 @@ mounted read-only — never `pip install`ed at run time.
   dir, or ship a single squashfs/erofs image file mounted read-only via FUSE
   (`squashfuse`, unprivileged, Cloud-Run-compatible) and point `rootfs` at the
   mountpoint. `bwrap --ro-overlay` can stack OCI layer dirs without flattening.
-  Under the default Python shim, every entrypoint needs `profile.python` in the
-  rootfs; with `SandboxProfile(init=...)` only `run_python` does.
+  With the C init (`SandboxProfile(init=...)`) the rootfs needs `profile.python`
+  only for `run_python` and `git_url`; under the fallback Python shim every
+  entrypoint needs it.
 
 ## Requirements
 
@@ -204,7 +211,8 @@ sandbox.run(['git', '-c', 'protocol.ext.allow=always', 'clone',
 Pass `profile=` to `git_url`: the in-guest interpreter comes from
 `profile.python`, the same place `run_python` gets it, so the URL cannot disagree
 with the sandbox it runs in. Without it the default is a bare `python3` off the
-guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`.
+guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`. The connector
+is Python, so this needs an interpreter in the rootfs even under the C init.
 
 **The socket is the capability.** The same access could be brokered through an
 HTTP forward proxy with a handler policing each request; a bound stream socket
@@ -296,8 +304,8 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the shim supervisor with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the shim's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
-- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `init=` names a static C init built by `python -m postern.build_init` to be PID 1 in place of the shim ([above](#pid-1-and-the-resource-backstops)); `verify()` checks it was built from this postern version. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by the guest shim, so every entrypoint gets them.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None, init=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `init=` names the static C init built by `python -m postern.build_init`, the recommended PID 1 ([above](#pid-1-and-the-resource-backstops)); `None` falls back to the Python shim, and `verify()` checks the init was built from this postern version. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by the guest init, so every entrypoint gets them.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>`, so `run()` works and not only `run_python()`. Named, so several coexist: one socket per resource. Stdlib-only. `with hatch.accepting(): ...`, and `close()` is terminal as `GrpcHatch`'s is.
   - `handler(stream) -> Process | None`: return `Process(argv, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, or `None` to refuse. The hatch spawns it, so the descriptor is in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race.

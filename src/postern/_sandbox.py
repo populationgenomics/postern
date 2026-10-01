@@ -228,14 +228,14 @@ class SandboxProfile:
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
             reuses ``guest_gid``.
         init: Host path to the static guest init that
-            ``python -m postern.build_init`` builds. When set it is PID 1 of
-            every run in place of the Python shim, so :meth:`Sandbox.run` and
-            :meth:`Sandbox.run_bash` need no interpreter in the sandbox;
-            :meth:`Sandbox.run_python` still execs ``python`` on the shim, as the
-            init's child. It is bound in read-only; being static, it needs
-            nothing from ``rootfs``. :meth:`Sandbox.verify` refuses one built
-            from a different postern version. ``None`` keeps the Python shim as
-            the init.
+            ``python -m postern.build_init`` builds: the recommended PID 1 of
+            every run. Under it :meth:`Sandbox.run` and :meth:`Sandbox.run_bash`
+            need no interpreter in the sandbox; :meth:`Sandbox.run_python` execs
+            ``python`` on the shim as the init's child. It is bound in read-only;
+            being static, it needs nothing from ``rootfs``. :meth:`Sandbox.verify`
+            refuses one built from a different postern version. ``None`` falls
+            back to the Python shim as the init, which needs ``python`` for every
+            entrypoint and costs an interpreter start on every run.
     """
 
     workspace: pathlib.Path | None = None

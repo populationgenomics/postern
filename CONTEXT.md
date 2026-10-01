@@ -19,7 +19,7 @@ gate the host opens.
   hardened profile: empty network namespace (no egress), surgical read-only
   filesystem, `--cap-drop ALL`, `--new-session` and a seccomp denylist. Runs a
   guest via `run` (an argv), `run_bash` (a shell script) or `run_python` (Python
-  code), all three under the shim. The security-critical module.
+  code), all three under the guest init. The security-critical module.
 
 - **SandboxProfile** — the description of a sealed wall: workspace, rootfs,
   interpreter, extra read-only binds, stubs, env, and the seccomp/rlimit knobs.
@@ -74,20 +74,22 @@ gate the host opens.
   image-build time (never a runtime container engine). `None` binds the host's
   own system dirs — convenient for dev, exposes the host userland read-only.
 
-- **Shim** (`_guest.py`) — the in-sandbox entrypoint for every run, and PID 1 of
-  the guest's namespace. Runs *inside* the wall, so it is stdlib-only: it forks,
-  the child applies `RLIMIT_NPROC` and `RLIMIT_AS` and then `exec`s the work, and
-  the shim reaps the namespace. The host↔shim handshake rides five env vars
-  (`POSTERN_ARGV`, `POSTERN_CODE`, `POSTERN_RECODE`, `POSTERN_NPROC`,
-  `POSTERN_AS`).
+- **Init** — PID 1 of the guest's namespace, and the entrypoint for every run: it
+  forks, the child applies `RLIMIT_NPROC` and `RLIMIT_AS` and then `exec`s the
+  work, and the init reaps the namespace, forwards signals and propagates the
+  work's exit status. The recommended init is the **C init** (`_init.c`), a static
+  program the profile names (`SandboxProfile(init=...)`): no interpreter needed,
+  signals forwarded to the whole process group, contract in its argv (`--nproc`,
+  `--as`, `-- argv...`). It ships as source; the deployer builds it with
+  `python -m postern.build_init` in a throwaway image stage, stamped with the
+  postern version `verify()` checks it against. Without one, the **Shim** is the
+  init.
 
-- **Init** (`_init.c`) — the static C program a profile can name
-  (`SandboxProfile(init=...)`) to be PID 1 in the shim's place: same duties, no
-  interpreter, signals forwarded to the whole process group. Its contract is its
-  argv (`--nproc`, `--as`, `-- argv...`). Ships as source; the deployer builds it
-  with `python -m postern.build_init` in a throwaway image stage, stamped with the
-  postern version `verify()` checks it against. Under it, `run_python`'s shim is a
-  plain child, not an init.
+- **Shim** (`_guest.py`) — the stdlib-only Python that runs `run_python`'s code
+  in the guest, and the fallback init when the profile names no C init. Under the C
+  init it is a plain child; as the fallback init it forks a re-exec of itself for
+  `run_python`. The host↔shim handshake rides five env vars (`POSTERN_ARGV`,
+  `POSTERN_CODE`, `POSTERN_RECODE`, `POSTERN_NPROC`, `POSTERN_AS`).
 
 - **Stubs** — importable modules injected at `/run/postern/stubs` (on the
   guest's `PYTHONPATH`). Lets one shared rootfs carry the heavy base while the
