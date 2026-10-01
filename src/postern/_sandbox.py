@@ -41,6 +41,7 @@ if typing.TYPE_CHECKING:
 _GUEST_DIR = '/run/postern'
 _GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # the unnamed hatch (GrpcHatch) → POSTERN_HATCH
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
+_GUEST_INIT = f'{_GUEST_DIR}/init'
 _GUEST_STUBS = f'{_GUEST_DIR}/stubs'
 _GUEST_WORKSPACE = '/workspace'
 _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
@@ -226,6 +227,15 @@ class SandboxProfile:
             rootfs — reachable by ``host_uid``. Ignored when already non-root.
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
             reuses ``guest_gid``.
+        init: Host path to the static guest init that
+            ``python -m postern.build_init`` builds. When set it is PID 1 of
+            every run in place of the Python shim, so :meth:`Sandbox.run` and
+            :meth:`Sandbox.run_bash` need no interpreter in the sandbox;
+            :meth:`Sandbox.run_python` still execs ``python`` on the shim, as the
+            init's child. It is bound in read-only; being static, it needs
+            nothing from ``rootfs``. :meth:`Sandbox.verify` refuses one built
+            from a different postern version. ``None`` keeps the Python shim as
+            the init.
     """
 
     workspace: pathlib.Path | None = None
@@ -241,6 +251,7 @@ class SandboxProfile:
     guest_gid: int | None = 65534
     host_uid: int | None = None
     host_gid: int | None = None
+    init: str | os.PathLike[str] | None = None
 
     @classmethod
     def with_venv(cls, venv: str | pathlib.Path, **kwargs: typing.Any) -> SandboxProfile:  # noqa: ANN401 — passthrough
@@ -519,23 +530,35 @@ class Sandbox:
             The launch's result.
         """
         binds, env = self._hatch_wiring()
-        binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
         # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
         # raise KeyError with no hatch configured; seed it empty instead.
-        env = {
-            'POSTERN_ARGV': json.dumps(work_argv),
-            'POSTERN_CODE': code,
-            'POSTERN_RECODE': '1' if recode else '',
-            'POSTERN_NPROC': str(self._profile.rlimit_nproc),
-            'POSTERN_AS': str(self._profile.rlimit_as or 0),
-            'POSTERN_HATCH': '',
-            **env,
-        }
-        shim = [self._profile.python, '-u', _GUEST_SHIM]
+        env = {'POSTERN_HATCH': '', **env}
+        nproc, as_bytes = str(self._profile.rlimit_nproc), str(self._profile.rlimit_as or 0)
+        if self._profile.init is not None:
+            # The C init is PID 1 and execs work_argv itself. The shim is only bound
+            # when work_argv runs it (run_python), and then it is a plain child that
+            # applies RLIMIT_AS once its interpreter is up — so the init must not.
+            binds += ['--ro-bind', os.fspath(self._profile.init), _GUEST_INIT]
+            if recode:
+                binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+                env = {'POSTERN_CODE': code, 'POSTERN_NPROC': nproc, 'POSTERN_AS': as_bytes, **env}
+            limits = ['--nproc', nproc, '--as', '0' if recode else as_bytes]
+            entrypoint = [_GUEST_INIT, *limits, '--', *work_argv]
+        else:
+            binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+            env = {
+                'POSTERN_ARGV': json.dumps(work_argv),
+                'POSTERN_CODE': code,
+                'POSTERN_RECODE': '1' if recode else '',
+                'POSTERN_NPROC': nproc,
+                'POSTERN_AS': as_bytes,
+                **env,
+            }
+            entrypoint = [self._profile.python, '-u', _GUEST_SHIM]
         with contextlib.ExitStack() as stack:
             for hatch in self._hatches:
                 stack.enter_context(hatch.accepting())
-            return self._launch(shim, timeout=timeout, setenv=env, extra_binds=binds)
+            return self._launch(entrypoint, timeout=timeout, setenv=env, extra_binds=binds)
 
     def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
@@ -598,9 +621,37 @@ class Sandbox:
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
+        if self._profile.init is not None:
+            self._check_init_version(timeout=timeout)
         result = self.run_python('pass', timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+
+    def _check_init_version(self, *, timeout: float) -> None:
+        """Refuse an init built from a different postern than this one.
+
+        The init and this module share a contract (its flags, and the shim's
+        environment under it), and nothing else ties a binary built in one image
+        stage to the postern installed in another. It is static and host-built, so
+        it runs here as well as in the guest.
+
+        Raises:
+            IsolationError: If the init cannot be run or reports another version.
+        """
+        from postern import __version__  # noqa: PLC0415 — the package imports this module
+
+        init = os.fspath(typing.cast('str | os.PathLike[str]', self._profile.init))
+        try:
+            reported = subprocess.run(
+                [init, '--version'], capture_output=True, text=True, timeout=timeout, check=True
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise IsolationError(f'guest init {init} cannot run: {exc}') from exc
+        if reported != __version__:
+            raise IsolationError(
+                f'guest init {init} was built from postern {reported}, not {__version__}; '
+                'rebuild it with `python -m postern.build_init`'
+            )
 
     def close(self) -> None:
         """Remove the workspace if this Sandbox created it (a no-op for a caller-owned path)."""
