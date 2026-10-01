@@ -14,11 +14,14 @@ SOCKET=/run/pi-probe/exec.sock
 # with a path locally (stat, realpath, an edit preview) lands here and finds nothing.
 WORKSPACE=/workspace
 HOST_WORKSPACE=/var/lib/pi-probe/workspace
+# What bwrap runs as: a uid and gid that own nothing in the image, so the guest owns only what it
+# creates (see executor.py). Copying files in? Do it as this uid, or the guest cannot change them.
+SANDBOX_IDENTITY=65532:65532
 mkdir -p "$(dirname "$SOCKET")" "$WORKSPACE" "$HOST_WORKSPACE"
 chmod 0555 "$WORKSPACE"
 
 # The executor gets none of this environment, so it never holds the model credential Pi does.
-env -i PATH="$PATH" PYTHONUNBUFFERED=1 python /opt/pi-probe/executor.py "$SOCKET" "$HOST_WORKSPACE" /opt/guest-root &
+env -i PATH="$PATH" PYTHONUNBUFFERED=1 python /opt/pi-probe/executor.py "$SOCKET" "$HOST_WORKSPACE" /opt/guest-root "$SANDBOX_IDENTITY" &
 executor=$!
 until [[ -S $SOCKET ]]; do
   # verify() failing is the executor exiting here: refuse rather than run tools anywhere else.

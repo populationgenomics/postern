@@ -37,10 +37,16 @@ Protocol, newline-delimited JSON, one request per connection:
     out  {"t": "result", "value": <json>, "backend_ms": float}
     out  {"t": "error", "message": str}
 
-Run: `python executor.py <socket-path> <host-workspace> <guest-rootfs>`; `entrypoint.sh` does this
-for you. The host workspace is where the guest's `/workspace` lives on the host, and nothing else
-here uses it. The guest rootfs is required, not defaulted: postern's default binds the host's own
-system dirs, which would put the trusted side's userland (node, Pi, postern) in the guest.
+Run: `python executor.py <socket-path> <host-workspace> <guest-rootfs> <uid:gid>`; `entrypoint.sh`
+does this for you. The host workspace is where the guest's `/workspace` lives on the host, and
+nothing else here uses it. The guest rootfs is required, not defaulted: postern's default binds the
+host's own system dirs, which would put the trusted side's userland (node, Pi, postern) in the guest.
+
+`uid:gid` is what bwrap runs as (`SandboxProfile.host_uid`/`host_gid`), as themis's sandbox worker
+does with `THEMIS_SANDBOX_HOST_UID`. Run as root, bwrap maps the guest onto its own real uid, so the
+guest's *kernel* uid would be 0 and own every root-owned file by DAC. Run as a uid that owns nothing,
+the guest owns only what it creates. Every bind source must be reachable by that uid: the rootfs
+and the shim are world-readable already, and postern makes the workspace sticky world-writable.
 """
 
 from __future__ import annotations
@@ -285,14 +291,17 @@ async def serve(sandbox: postern.Sandbox, socket_path: pathlib.Path) -> asyncio.
     return server
 
 
-async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathlib.Path) -> None:
+async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathlib.Path, identity: str) -> None:
     """Verify a guest over `workspace` and `rootfs`, then serve on `socket_path` until killed."""
+    uid, gid = (int(part) for part in identity.split(':'))
     workspace.mkdir(parents=True, exist_ok=True)
     profile = postern.SandboxProfile(
         rootfs=rootfs,
         workspace=workspace,
         # postern binds the rootfs's system dirs but not its /etc; git's identity lives there.
         ro_binds=[(str(rootfs / _GUEST_GITCONFIG.lstrip('/')), _GUEST_GITCONFIG)],
+        host_uid=uid,
+        host_gid=gid,
     )
     sandbox = postern.Sandbox(profile)
     sandbox.verify()  # raises IsolationError: there is no host path to fall back to
@@ -305,4 +314,4 @@ async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathl
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='executor: %(message)s')
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])))
+        asyncio.run(main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]))

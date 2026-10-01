@@ -34,6 +34,17 @@ worker image (`themis/services/sandbox_worker/Dockerfile`). Without it postern b
 side's own system dirs, and the guest can see node, Pi and its extension, and the postern package.
 `tools` checks what the guest has: `python3 git rg !node !pi !postern`.
 
+bwrap runs as uid:gid `65532:65532` (`SandboxProfile.host_uid`), as themis's worker does when
+`THEMIS_SANDBOX_HOST_UID` is set. Run as root, bwrap gives the guest kernel uid 0: it can change a
+root-owned file in the workspace, and every file it creates is root's on the host. As 65532 it
+owns only what it creates. To copy files in for the guest to work on, write them as that uid:
+
+```bash
+id=$(docker ps -q --filter ancestor=postern-pi-probe)
+git -C ~/src/postern archive HEAD |
+  docker exec -i -u 65532:65532 "$id" sh -c 'mkdir -p /var/lib/pi-probe/workspace/postern && tar -x -C $_'
+```
+
 ## Running it
 
 Needs Docker. On macOS it runs natively on arm64 in Docker Desktop. The two `--security-opt`s are
