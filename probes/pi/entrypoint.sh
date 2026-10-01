@@ -21,7 +21,7 @@ mkdir -p "$(dirname "$SOCKET")" "$WORKSPACE" "$HOST_WORKSPACE"
 chmod 0555 "$WORKSPACE"
 
 # The executor gets none of this environment, so it never holds the model credential Pi does.
-env -i PATH="$PATH" PYTHONUNBUFFERED=1 python /opt/pi-probe/executor.py "$SOCKET" "$HOST_WORKSPACE" /opt/guest-root "$SANDBOX_IDENTITY" &
+env -i PATH="$PATH" PYTHONUNBUFFERED=1 python /opt/pi-probe/executor.py "$SOCKET" "$HOST_WORKSPACE" /opt/guest-root "$SANDBOX_IDENTITY" /opt/postern-init &
 executor=$!
 until [[ -S $SOCKET ]]; do
   # verify() failing is the executor exiting here: refuse rather than run tools anywhere else.

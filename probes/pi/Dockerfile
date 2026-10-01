@@ -31,6 +31,17 @@ RUN apt-get update \
 # The official image strips the stdlib's bytecode, and the rootfs is read-only to the guest, so
 # without this every file primitive recompiles json, pathlib and friends: about 4x per call.
 
+# --- the guest's PID 1: postern's C init, built from this checkout in a throwaway stage, so the
+#     compiler reaches neither the guest rootfs nor the runtime. The same checkout is installed
+#     below, so the version verify() checks the binary against matches by construction. ---
+FROM ${PYTHON_IMAGE} AS init
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml README.md LICENSE /tmp/postern/
+COPY src /tmp/postern/src
+RUN pip install --no-cache-dir /tmp/postern && python -m postern.build_init /postern-init
+
 # --- bubblewrap, postern from this checkout, and a node to run Pi with. ---
 FROM ${PYTHON_IMAGE}
 RUN apt-get update \
@@ -55,5 +66,7 @@ ENV PI_OFFLINE=1
 RUN mkdir -p /var/lib/pi
 # Copying '/' preserves the usrmerge symlink layout postern's binds expect.
 COPY --from=guest / /opt/guest-root
+# Static, so it needs nothing from the rootfs; postern binds it in as the guest's PID 1.
+COPY --from=init /postern-init /opt/postern-init
 ENTRYPOINT ["/opt/pi-probe/entrypoint.sh"]
 CMD ["seam"]

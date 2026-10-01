@@ -34,6 +34,13 @@ worker image (`themis/services/sandbox_worker/Dockerfile`). Without it postern b
 side's own system dirs, and the guest can see node, Pi and its extension, and the postern package.
 `tools` checks what the guest has: `python3 git rg !node !pi !postern`.
 
+PID 1 of every guest is postern's static C init (`SandboxProfile(init=...)`), built from this
+checkout in a throwaway stage so gcc reaches neither the rootfs nor the runtime. `bash` goes
+through `Sandbox.run_bash`. On this branch's base (postern PR #11, which puts an init in front of
+every run), the Python shim as that init cost each trivial command 18.4 ms against 3.5 ms before;
+the C init brings it back to 4.4 ms. File primitives still run Python, as the init's child, and
+the seven `tools` calls take 0.40 s against 0.70 s under the shim.
+
 bwrap runs as uid:gid `65532:65532` (`SandboxProfile.host_uid`), as themis's worker does when
 `THEMIS_SANDBOX_HOST_UID` is set. Run as root, bwrap gives the guest kernel uid 0: it can change a
 root-owned file in the workspace, and every file it creates is root's on the host. As 65532 it

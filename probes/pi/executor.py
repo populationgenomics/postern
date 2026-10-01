@@ -10,7 +10,7 @@ successor to `proto/pi-loop-outside`'s comparison executor. What it kept from ea
 - **No host backend.** `pi-loop-outside` fell back to a host subprocess where bubblewrap was absent;
   `pi-vm` dropped that, because a fallback is model-chosen commands running unsandboxed beside the
   credential. This refuses to start unless `Sandbox.verify()` passes.
-- **A timeout ceiling.** Pi's bash tool takes `timeout` from the model and `Sandbox.run` cannot be
+- **A timeout ceiling.** Pi's bash tool takes `timeout` from the model and `Sandbox.run_bash` cannot be
   interrupted, so an unclamped value is a command nothing can stop.
 - **Confinement.** Pi resolves a tool's path and hands it over without a workdir check, so
   `read ../../etc/shadow` arrives here as an absolute path outside the workspace, and is refused.
@@ -37,8 +37,8 @@ Protocol, newline-delimited JSON, one request per connection:
     out  {"t": "result", "value": <json>, "backend_ms": float}
     out  {"t": "error", "message": str}
 
-Run: `python executor.py <socket-path> <host-workspace> <guest-rootfs> <uid:gid>`; `entrypoint.sh`
-does this for you. The host workspace is where the guest's `/workspace` lives on the host, and
+Run: `python executor.py <socket-path> <host-workspace> <guest-rootfs> <uid:gid> <init>`;
+`entrypoint.sh` does this for you. The host workspace is where the guest's `/workspace` lives on the host, and
 nothing else here uses it. The guest rootfs is required, not defaulted: postern's default binds the
 host's own system dirs, which would put the trusted side's userland (node, Pi, postern) in the guest.
 
@@ -47,6 +47,10 @@ does with `THEMIS_SANDBOX_HOST_UID`. Run as root, bwrap maps the guest onto its 
 guest's *kernel* uid would be 0 and own every root-owned file by DAC. Run as a uid that owns nothing,
 the guest owns only what it creates. Every bind source must be reachable by that uid: the rootfs
 and the shim are world-readable already, and postern makes the workspace sticky world-writable.
+
+`init` is postern's static C init (`python -m postern.build_init`), PID 1 of every run in place of
+the Python shim. A `bash` call costs what a bare launch does, not an interpreter start, and a
+signal to PID 1 reaches the command's whole process group.
 """
 
 from __future__ import annotations
@@ -66,7 +70,7 @@ import postern
 
 Emit = Callable[[dict[str, object]], Awaitable[None]]
 
-# `Sandbox.run` has no cancellation, so a command runs to completion regardless; this bounds it. The
+# `Sandbox.run_bash` has no cancellation, so a command runs to completion regardless; this bounds it. The
 # ceiling, not just the default: the model picks the number, and an unclamped one is unstoppable.
 _DEFAULT_TIMEOUT_S = 120.0
 _MAX_TIMEOUT_S = 120.0
@@ -173,22 +177,22 @@ else:
 async def _run_command(
     sandbox: postern.Sandbox, command: str, cwd: str, timeout: float, emit: Emit, cancelled: asyncio.Event
 ) -> int | None:
-    """Run `command` in the guest, reporting the two places `Sandbox.run` falls short of Pi's contract.
+    """Run `command` in the guest, reporting the two places `Sandbox.run_bash` falls short of Pi's contract.
 
     Pi's `BashOperations.exec` promises incremental output through `onData` and a kill on abort.
-    `Sandbox.run` buffers and cannot be interrupted, so output arrives in one frame at the end and a
+    `Sandbox.run_bash` buffers and cannot be interrupted, so output arrives in one frame at the end and a
     cancel is acknowledged rather than honoured. Both are reported as notes instead of papered over.
     """
 
     async def acknowledge_cancel() -> None:
         await cancelled.wait()
-        await emit({'t': 'note', 'd': 'Sandbox.run cannot be aborted; the command runs to completion'})
+        await emit({'t': 'note', 'd': 'Sandbox.run_bash cannot be aborted; the command runs to completion'})
 
-    # Not `bash -l`: the guest has no /etc, so a login shell has no profile to read.
-    argv = ['bash', '-c', f'cd {shlex.quote(cwd)} && {command}']
+    # `bash -c`, not `bash -l`: the guest has no /etc, so a login shell has no profile to read.
+    script = f'cd {shlex.quote(cwd)} && {command}'
     watching = asyncio.create_task(acknowledge_cancel())
     try:
-        result = await asyncio.to_thread(sandbox.run, argv, timeout=timeout)
+        result = await asyncio.to_thread(sandbox.run_bash, script, timeout=timeout)
     finally:
         watching.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -291,7 +295,9 @@ async def serve(sandbox: postern.Sandbox, socket_path: pathlib.Path) -> asyncio.
     return server
 
 
-async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathlib.Path, identity: str) -> None:
+async def main(
+    socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathlib.Path, identity: str, init: pathlib.Path
+) -> None:
     """Verify a guest over `workspace` and `rootfs`, then serve on `socket_path` until killed."""
     uid, gid = (int(part) for part in identity.split(':'))
     workspace.mkdir(parents=True, exist_ok=True)
@@ -302,9 +308,10 @@ async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathl
         ro_binds=[(str(rootfs / _GUEST_GITCONFIG.lstrip('/')), _GUEST_GITCONFIG)],
         host_uid=uid,
         host_gid=gid,
+        init=init,
     )
     sandbox = postern.Sandbox(profile)
-    sandbox.verify()  # raises IsolationError: there is no host path to fall back to
+    sandbox.verify()  # raises IsolationError, including for an init built from another postern
     _logger.info('isolation verified')
     server = await serve(sandbox, socket_path)
     async with server:
@@ -314,4 +321,5 @@ async def main(socket_path: pathlib.Path, workspace: pathlib.Path, rootfs: pathl
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='executor: %(message)s')
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]))
+        paths = [pathlib.Path(arg) for arg in sys.argv[1:4]]
+        asyncio.run(main(*paths, sys.argv[4], pathlib.Path(sys.argv[5])))
