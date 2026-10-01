@@ -33,7 +33,8 @@ import tempfile
 import typing
 from collections.abc import Callable, Sequence
 
-from postern import _seccomp, _workspace
+from postern import _process, _seccomp, _workspace
+from postern._process import Process
 
 if typing.TYPE_CHECKING:
     # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
@@ -474,15 +475,21 @@ class Sandbox:
         """
         return _workspace.Workspace(self._workspace)
 
-    def _launch(
+    def _start(
         self,
         argv: list[str],
         *,
-        timeout: float,
+        resources: contextlib.ExitStack,
         setenv: dict[str, str] | None = None,
         extra_binds: list[str] | None = None,
-    ) -> ProcResult:
+    ) -> Process:
+        """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
+
+        ``resources`` (the hatches' serving contexts) passes to the Process, which
+        closes it when the run is closed; on a failed launch it is closed here.
+        """
         if not available():
+            resources.close()
             raise RuntimeError('bubblewrap (bwrap) not found on PATH; postern requires Linux + bubblewrap')
         # A non-root guest cannot write a host-owned workspace dir. 1777 rather than
         # 0777 (matching the tmpfs branch): without the sticky bit the guest could
@@ -493,35 +500,51 @@ class Sandbox:
                 self._workspace.chmod(0o1777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
         fd = seccomp.fileno() if seccomp is not None else None
+        # bwrap reports the init's host pid here, which is how cancel() reaches it.
+        info_read, info_write = os.pipe()
         try:
             cmd = build_base_argv(dataclasses.replace(self._profile, workspace=self._workspace), fd)
+            cmd += ['--info-fd', str(info_write)]
             for key, val in (setenv or {}).items():
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=bwrap_env(),
-                pass_fds=(fd,) if fd is not None else (),
-                **bwrap_credentials(self._profile, os.geteuid()),
+            # Bytes, decoded by Process. Cast because the credentials splat is Any,
+            # which lets the type checker pick Popen's text-mode overload.
+            popen = typing.cast(
+                'subprocess.Popen[bytes]',
+                subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    # Scrub bwrap's own environment: it is PID 1 in the guest's
+                    # namespace at the guest uid, so an inherited secret would be
+                    # readable from inside via /proc/1/environ (see bwrap_env).
+                    env=bwrap_env(),
+                    pass_fds=(info_write,) if fd is None else (fd, info_write),
+                    # Run bwrap at a non-root real uid when we are root, so the
+                    # guest's kernel uid (which bwrap maps --uid onto) is non-root and
+                    # owns none of root's files (see bwrap_credentials).
+                    **bwrap_credentials(self._profile, os.geteuid()),
+                ),
             )
-            try:
-                out, err = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
-                return ProcResult(124, out or '', (err or '') + '\n[postern] timed out')
-            return ProcResult(proc.returncode, out or '', err or '')
+        except BaseException:
+            os.close(info_read)
+            resources.close()
+            raise
         finally:
+            os.close(info_write)
             if seccomp is not None:
                 seccomp.close()
+        try:
+            pidfd = _process.open_pidfd(_process.read_init_pid(info_read), popen)
+        finally:
+            os.close(info_read)
+        return Process(popen, pidfd=pidfd, resources=resources)
 
-    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False, timeout: float) -> ProcResult:
-        """Launch ``work_argv`` under the guest's init, with every hatch bound and served.
+    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False) -> Process:
+        """Start ``work_argv`` under the guest's init, with every hatch bound and served.
 
         The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.
         The init is bwrap's ``--as-pid-1`` entrypoint: the C init when the profile
@@ -534,10 +557,9 @@ class Sandbox:
                 arbitrary program, which reads its own input.
             recode: Whether ``work_argv`` re-execs the shim to run ``code``. It makes
                 the shim defer ``RLIMIT_AS`` until the fresh interpreter has started.
-            timeout: Seconds before the launch is killed.
 
         Returns:
-            The launch's result.
+            The running process, which owns the hatches' serving contexts.
         """
         binds, env = self._hatch_wiring()
         # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
@@ -565,10 +587,14 @@ class Sandbox:
                 **env,
             }
             entrypoint = [self._profile.python, '-u', _GUEST_SHIM]
-        with contextlib.ExitStack() as stack:
+        stack = contextlib.ExitStack()
+        try:
             for hatch in self._hatches:
                 stack.enter_context(hatch.accepting())
-            return self._launch(entrypoint, timeout=timeout, setenv=env, extra_binds=binds)
+        except BaseException:
+            stack.close()
+            raise
+        return self._start(entrypoint, resources=stack, setenv=env, extra_binds=binds)
 
     def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
@@ -585,7 +611,7 @@ class Sandbox:
         ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so ``argv`` reaches it with no
         in-guest relay.
         """
-        return self._supervised(list(argv), timeout=timeout)
+        return self.start(argv).communicate(timeout)
 
     def run_bash(self, script: str, *, shell: str = 'bash', timeout: float = 60) -> ProcResult:
         """Run ``script`` inside the sandbox as ``shell -c script``.
@@ -600,7 +626,7 @@ class Sandbox:
         Returns:
             The launch's result.
         """
-        return self._supervised([shell, '-c', script], timeout=timeout)
+        return self.start_bash(script, shell=shell).communicate(timeout)
 
     def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
@@ -614,7 +640,24 @@ class Sandbox:
         ``POSTERN_HATCH_<NAME>``; the client library that dials it comes from the
         guest's bound environment.
         """
-        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True, timeout=timeout)
+        return self.start_python(code).communicate(timeout)
+
+    def start(self, argv: list[str]) -> Process:
+        """Start ``argv`` in the sandbox, as :meth:`run` does, and return at once.
+
+        The :class:`Process` streams the output as it arrives
+        (:meth:`Process.iter_output`) and can be stopped (:meth:`Process.cancel`).
+        Use it as a context manager: the run's hatches serve until it is closed.
+        """
+        return self._supervised(list(argv))
+
+    def start_bash(self, script: str, *, shell: str = 'bash') -> Process:
+        """Start ``shell -c script`` in the sandbox, as :meth:`run_bash` does, and return at once."""
+        return self._supervised([shell, '-c', script])
+
+    def start_python(self, code: str) -> Process:
+        """Start ``code`` in the sandbox, as :meth:`run_python` does, and return at once."""
+        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True)
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.
