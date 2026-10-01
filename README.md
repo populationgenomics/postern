@@ -149,6 +149,56 @@ broken platform (no user namespace, gVisor, uncovered arch) raises
 `IsolationError` there rather than on the first request. Call it at worker startup
 and refuse to serve if it raises, as `examples/worker.py` does.
 
+### Streaming and stopping a run
+
+`run`, `run_bash` and `run_python` block until the run ends. `start`, `start_bash`
+and `start_python` return a `Process` at once, which streams the output as the
+guest writes it and can be stopped:
+
+```python
+with sandbox.start_bash('make test') as process:
+    for stream, chunk in process.output():   # stream is 'stdout' or 'stderr'
+        show(stream, chunk)
+        if user_pressed_stop():
+            process.terminate(grace=5)       # SIGTERM now, SIGKILL after 5 s
+status = process.returncode
+```
+
+The same run for asyncio comes from `astart`, `astart_bash` and `astart_python`:
+
+```python
+async with await sandbox.astart_bash('make test') as process:
+    async for stream, chunk in process.output():
+        await show(stream, chunk)
+    status = await process.wait()
+```
+
+- **One way to read output.** `output()` yields `(stream, bytes)` chunks from both
+  pipes in the order they arrive; a chunk can end mid-line or mid-character. There
+  are deliberately no separate stdout and stderr readers: draining one while the
+  other's pipe fills stalls the guest. For a single stream, write `2>&1`.
+  `communicate(timeout)` collects whatever `output()` has not into a `ProcResult`,
+  which is all `run*` does.
+- **Stopping is graceful.** bwrap does not forward signals, so `terminate()`
+  signals the guest's init directly, through a pidfd on the host pid bwrap reports
+  on `--info-fd` (so a recycled pid is never signalled). The init forwards the
+  SIGTERM to the command (the C init to its whole process group), which can trap it
+  and clean up; if it is still running after `grace`, bwrap is killed and the
+  namespace with it. `terminate()` returns at once and is safe from another thread,
+  so keep reading to see what the command says on its way out. `kill()` skips the
+  grace.
+- **Leaving early stops it too.** Leaving the `with` block while the run is still
+  going (on an exception, a `break`, or an asyncio task cancellation) terminates it
+  with a 1 s grace, discarding its remaining output. Close the `Process` (the
+  `with` block does) to release the run's hatches, which serve until then.
+- **When the loop ends.** `output()` ends when both pipes close, which is normally
+  when the run ends: the init's exit takes everything else in the namespace with
+  it, so a backgrounded straggler cannot hold the loop open. A command that closes
+  its own output ends the loop early; `wait()` gives the status either way.
+- **No threads for asyncio.** `AsyncProcess` reads the non-blocking pipes with loop
+  readers and waits for the exit on a pidfd on bwrap. One reader per process:
+  `terminate()` and `kill()` are the calls meant to come from elsewhere.
+
 ## The environment (getting pandas etc. in)
 
 The sandbox has no egress, so packages are provisioned **ahead of time** and
@@ -306,7 +356,8 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.start(argv)`, `.start_bash(script, *, shell='bash')`, `.start_python(code)` → `Process`, and `await .astart(...)`, `.astart_bash(...)`, `.astart_python(...)` → `AsyncProcess` ([streaming and stopping](#streaming-and-stopping-a-run)); `.verify()` (fail-closed boot check, raises `IsolationError`). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `Process` — `.output()` → iterator of `(stream, bytes)`; `.terminate(*, grace=5.0)`, `.kill()`, `.wait(timeout=None)`, `.communicate(timeout=None)` → `ProcResult`, `.close()`; `.pid`, `.returncode`, `.terminated`; a context manager. `AsyncProcess` is the same run for asyncio: `async for` over `.output()`, `await .wait()`, `await .communicate(timeout=None)`, `await .aclose()`, `async with`.
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None, init=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `init=` names the static C init built by `python -m postern.build_init`, the recommended PID 1 ([above](#pid-1-and-the-resource-backstops)); `None` falls back to the Python shim, and `verify()` checks the init was built from this postern version. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by the guest init, so every entrypoint gets them.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>`, so `run()` works and not only `run_python()`. Named, so several coexist: one socket per resource. Stdlib-only. `with hatch.accepting(): ...`, and `close()` is terminal as `GrpcHatch`'s is.

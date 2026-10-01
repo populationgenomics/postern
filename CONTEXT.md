@@ -85,6 +85,13 @@ gate the host opens.
   postern version `verify()` checks it against. Without one, the **Shim** is the
   init.
 
+- **Process** — a run in progress, from `Sandbox.start*` (`AsyncProcess` from
+  `astart*`, for asyncio). Its output is one merged stream of
+  `(stream, bytes)`, never separate readers (draining one would stall the guest
+  on the other); it stops gracefully (`terminate`: SIGTERM to the init through a
+  pidfd, a kill after the grace), including when its `with` block is left early.
+  It owns the run's hatches until closed. `run*` is `start*` plus `communicate`.
+
 - **Shim** (`_guest.py`) — the stdlib-only Python that runs `run_python`'s code
   in the guest, and the fallback init when the profile names no C init. Under the C
   init it is a plain child; as the fallback init it forks a re-exec of itself for
