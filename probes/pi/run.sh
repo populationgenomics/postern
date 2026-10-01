@@ -14,7 +14,8 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 image=postern-pi-probe
 docker build -q -f "$root/probes/pi/Dockerfile" -t "$image" "$root" >/dev/null
 
-tty=()
+# -i always, so a driver piping Pi's RPC mode reaches it; -t only with a terminal to give it.
+tty=(-i)
 [[ -t 0 && -t 1 ]] && tty=(-it)
 # Provider keys pass through only if set; Pi reads whichever its --provider needs.
 keys=()

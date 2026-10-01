@@ -61,6 +61,7 @@ the ones `tests/docker/run.sh` uses, for the same reason.
 probes/pi/run.sh              # seam timings against the real guest (no model)
 probes/pi/run.sh tools        # Pi's seven tools through the seam (no model)
 ANTHROPIC_API_KEY=… probes/pi/run.sh pi --provider anthropic --model claude-sonnet-5
+ANTHROPIC_API_KEY=… python3 probes/pi/drive_rpc.py   # a real session over RPC, aborted mid-command
 ```
 
 Type-check the extension against Pi's published types locally with
@@ -135,10 +136,23 @@ bytecode. While the guest shared the trusted side's `/usr`, the executor's own i
 primitive recompiled `json`, `pathlib` and the rest: 1.4 s for the seven calls instead of 0.36 s,
 with bash unaffected. The guest stage runs `compileall` over the stdlib.
 
+**With a real model (claude-sonnet-5), it all holds.** In print mode (`pi -p`) a seven-step task
+used every tool through the sandbox in 21 s: write, edit, grep, find, ls, a streaming `bash` loop,
+a `bash` call the model gave `timeout: 2` (reported back as timed out after 2 s), a refused read of
+`/etc/passwd`, and an identity check (uid 65534; python3 and git present, node absent). Through
+RPC mode (`drive_rpc.py`), the TUI's Esc path: the model's long `bash` loop streamed updates as it
+ticked, an `abort` after three of them ended the tool call **4–6 ms** later with `Command aborted`,
+and the model, asked to count the loop's ticks twice three seconds apart, got the same number both
+times and concluded on its own that the loop had been terminated, not left running.
+
+The executor also cancels a command when its caller's connection closes, not only on a cancel
+line: if Pi goes away mid-command, nothing is waiting for the result, and it should not run on to
+its timeout.
+
 ## Open
 
 - **File primitives through the `Workspace` accessor** instead of a guest per call. The accessor is
   reference-closed by construction, so it would satisfy the confinement requirement host-side
   without a 28 ms interpreter start. It lacks `mkdir` and `glob` today.
-- **A model-driven run** (`run.sh pi`), timed, as the end-to-end latency number themis is still
-  missing.
+- **End-to-end latency against Managed Agents**: the model-driven runs above are timed on this
+  side only, with nothing to compare them to.

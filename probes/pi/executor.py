@@ -278,8 +278,10 @@ async def _handle(
     cancelled = asyncio.Event()
 
     async def watch_for_cancel() -> None:
-        while await reader.readline():
-            cancelled.set()
+        # A cancel line, or the connection closing: either way nobody is waiting for this
+        # command any more, so it should not run on to its timeout.
+        await reader.readline()
+        cancelled.set()
 
     watching = asyncio.create_task(watch_for_cancel())
     try:
