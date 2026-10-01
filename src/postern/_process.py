@@ -2,15 +2,19 @@
 
 `Sandbox.start`, `Sandbox.start_bash` and `Sandbox.start_python` return a
 `Process`; `run`, `run_bash` and `run_python` are those plus
-:meth:`Process.communicate`, so there is one launch path.
+:meth:`Process.communicate`, so there is one launch path. The ``astart*`` variants
+return an `AsyncProcess`, the same run for asyncio.
 
-**Streaming.** :meth:`Process.iter_output` yields ``(stream, bytes)`` chunks as the
-guest writes them. Nothing on the way buffers: the guest init never touches the
-command's stdio, so its writes land in the pipes this reads.
+**Streaming.** :meth:`Process.output` yields ``(stream, bytes)`` chunks as the guest
+writes them, ``stream`` being ``'stdout'`` or ``'stderr'``. Nothing on the way
+buffers: the guest init never touches the command's stdio, so its writes land in
+the pipes this reads. It is the *only* way to read output, deliberately: separate
+stdout and stderr readers invite draining one while the other's pipe fills and
+stalls the guest. A caller who wants one stream can write ``2>&1``.
 
-**Cancellation.** bwrap does not forward signals: SIGTERM to bwrap kills bwrap,
-and ``--die-with-parent`` then SIGKILLs the guest with no chance to clean up. So
-:meth:`Process.cancel` signals the guest's *init* directly. bwrap reports the
+**Stopping.** bwrap does not forward signals: SIGTERM to bwrap kills bwrap, and
+``--die-with-parent`` then SIGKILLs the guest with no chance to clean up. So
+:meth:`Process.terminate` signals the guest's *init* directly. bwrap reports the
 init's host pid on ``--info-fd``, and a pidfd is opened on it at start, so the
 signal can only ever reach that process even after its pid is recycled. The init
 forwards SIGTERM to the command (the C init to its whole process group); if the
@@ -20,6 +24,7 @@ tears the namespace down.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -31,7 +36,7 @@ import time
 import typing
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterator, Iterator
 
     from typing_extensions import Self
 
@@ -42,6 +47,10 @@ if typing.TYPE_CHECKING:
 # closes the pipe, so this bounds only a bwrap that hangs.
 _INFO_TIMEOUT_S = 30.0
 _READ_SIZE = 65536
+# How long closing a still-running process allows it to stop on SIGTERM before it
+# is killed: closing should be prompt, but an interrupted caller is no reason to
+# deny the command its cleanup.
+_CLOSE_GRACE_S = 1.0
 
 # Which of the guest's pipes a chunk of output came from.
 Stream = typing.Literal['stdout', 'stderr']
@@ -104,7 +113,8 @@ class Process:
     """A guest run in progress. Use as a context manager, or call :meth:`close`.
 
     It owns the run's hatches: they keep serving until the process is closed, which
-    :meth:`communicate` does for you.
+    :meth:`communicate` does for you. One thread reads it (:meth:`output`,
+    :meth:`communicate`); :meth:`terminate` and :meth:`kill` are safe from any.
     """
 
     def __init__(self, popen: subprocess.Popen[bytes], *, pidfd: int | None, resources: contextlib.ExitStack) -> None:
@@ -113,7 +123,8 @@ class Process:
         self._resources = resources
         self._lock = threading.Lock()
         self._escalation: threading.Timer | None = None
-        self._cancelled = False
+        self._terminated = False
+        self._closed = False
         self._open: dict[int, Stream] = {}
         pipes: tuple[tuple[Stream, typing.IO[bytes] | None], ...] = (('stdout', popen.stdout), ('stderr', popen.stderr))
         for name, pipe in pipes:
@@ -122,23 +133,32 @@ class Process:
                 self._open[pipe.fileno()] = name
 
     @property
+    def pid(self) -> int:
+        """The host pid of the run's bwrap process."""
+        return self._popen.pid
+
+    @property
     def returncode(self) -> int | None:
         """The exit status once the run has ended, else None. Negative N means bwrap died of signal N."""
         return self._popen.poll()
 
     @property
-    def cancelled(self) -> bool:
-        """Whether :meth:`cancel` was called."""
-        return self._cancelled
+    def terminated(self) -> bool:
+        """Whether :meth:`terminate` or :meth:`kill` was called."""
+        return self._terminated
 
-    def iter_output(self) -> Iterator[tuple[Stream, bytes]]:
+    def output(self) -> Iterator[tuple[Stream, bytes]]:
         """Yield ``(stream, chunk)`` as the guest writes, until both pipes close.
 
-        ``stream`` is ``'stdout'`` or ``'stderr'``: which of the guest's pipes the
-        bytes came from, so a caller can keep them apart or interleave them in the
-        order they arrived.
+        ``stream`` is ``'stdout'`` or ``'stderr'``, the pipe the bytes came from;
+        chunks of one stream keep their order, and the two interleave in the order
+        they were read. A chunk is whatever one read returned, so it can end
+        mid-line or mid-character.
 
-        Output consumed here is not returned again by :meth:`communicate`.
+        The loop ends when both pipes close, which is normally when the run ends:
+        the init's exit takes everything else in the namespace with it. A command
+        that closes its own output ends the loop early, so :meth:`wait` for its
+        status. Output read here is not returned again by :meth:`communicate`.
         """
         yield from self._pump(deadline=None)
 
@@ -155,32 +175,40 @@ class Process:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise subprocess.TimeoutExpired(self._popen.args, 0)
-                for key, _ in selector.select(remaining):
-                    fd = typing.cast('int', key.fd)
-                    try:
-                        chunk = os.read(fd, _READ_SIZE)
-                    except BlockingIOError:
-                        continue
-                    if chunk:
-                        yield self._open[fd], chunk
-                    else:
-                        selector.unregister(fd)
-                        del self._open[fd]
+                if selector.select(remaining):
+                    for fd in list(self._open):
+                        if fd not in self._open:
+                            continue
+                        yield from self._read(fd, selector)
 
-    def cancel(self, *, grace: float = 5.0) -> None:
+    def _read(self, fd: int, selector: selectors.BaseSelector | None = None) -> Iterator[tuple[Stream, bytes]]:
+        """One non-blocking read of ``fd``: its chunk, or nothing, closing it at EOF."""
+        try:
+            chunk = os.read(fd, _READ_SIZE)
+        except BlockingIOError:
+            return
+        if chunk:
+            yield self._open[fd], chunk
+            return
+        if selector is not None:
+            selector.unregister(fd)
+        del self._open[fd]
+
+    def terminate(self, *, grace: float = 5.0) -> None:
         """Ask the run to stop: SIGTERM now, and SIGKILL if it outlives ``grace`` seconds.
 
-        Returns at once; keep reading output (or call :meth:`communicate`) to see
-        what the command said on its way out. A no-op once the run has ended.
+        Returns at once; keep reading :meth:`output` (or call :meth:`communicate`)
+        to see what the command says on its way out. A no-op once the run has ended
+        or been stopped.
 
         Args:
             grace: Seconds to allow after SIGTERM before the sandbox is killed. 0
                 kills it at once.
         """
         with self._lock:
-            if self._popen.poll() is not None or self._cancelled:
+            if self._popen.poll() is not None or self._terminated:
                 return
-            self._cancelled = True
+            self._terminated = True
             if self._pidfd is None or grace <= 0:
                 self._kill()
                 return
@@ -191,6 +219,12 @@ class Process:
             self._escalation = threading.Timer(grace, self._kill)
             self._escalation.daemon = True
             self._escalation.start()
+
+    def kill(self) -> None:
+        """Kill the run now, without letting the command clean up."""
+        with self._lock:
+            self._terminated = True
+            self._kill()
 
     def _kill(self) -> None:
         # The init dies with bwrap (--die-with-parent), and the kernel then kills
@@ -214,8 +248,6 @@ class Process:
         ``[postern] timed out`` appended to stderr, as :meth:`Sandbox.run` reports
         it. Output is decoded as UTF-8, with undecodable bytes replaced.
         """
-        from postern._sandbox import ProcResult  # noqa: PLC0415 — _sandbox imports this module
-
         out, err = bytearray(), bytearray()
         deadline = None if timeout is None else time.monotonic() + timeout
         timed_out = False
@@ -225,21 +257,38 @@ class Process:
             self._popen.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
-            self._kill()
+            self.kill()
             for name, chunk in self._pump(deadline=None):
                 (out if name == 'stdout' else err).extend(chunk)
             self._popen.wait()
         finally:
             self.close()
-        stdout, stderr = out.decode('utf-8', 'replace'), err.decode('utf-8', 'replace')
-        if timed_out:
-            return ProcResult(124, stdout, stderr + '\n[postern] timed out')
-        return ProcResult(typing.cast('int', self._popen.returncode), stdout, stderr)
+        return _result(self._popen.returncode, out, err, timed_out=timed_out)
 
     def close(self) -> None:
-        """Kill the run if it is still going, and release its pipes, pidfd and hatches."""
-        self._kill()
-        self._popen.wait()
+        """Stop the run if it is still going, and release its pipes, pidfd and hatches.
+
+        A run still going is stopped gracefully: SIGTERM, and a kill if it outlives
+        a short grace. Its remaining output is discarded meanwhile, so a command
+        printing on its way out cannot stall on a full pipe.
+        """
+        if self._closed:
+            return
+        try:
+            if self._popen.poll() is None:
+                self.terminate(grace=_CLOSE_GRACE_S)
+                try:
+                    for _ in self._pump(deadline=time.monotonic() + _CLOSE_GRACE_S + 1):
+                        pass
+                    self._popen.wait(_CLOSE_GRACE_S + 1)
+                except subprocess.TimeoutExpired:
+                    self.kill()
+            self._popen.wait()
+        finally:
+            self._release()
+
+    def _release(self) -> None:
+        self._closed = True
         if self._escalation is not None:
             self._escalation.cancel()
         for pipe in (self._popen.stdout, self._popen.stderr):
@@ -256,3 +305,141 @@ class Process:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+class AsyncProcess:
+    """The same run as a :class:`Process`, for asyncio: awaited rather than blocked on.
+
+    Use with ``async with``. Output comes from :meth:`output`, an async iterator of
+    ``(stream, bytes)``; the run's end from :meth:`wait`, which watches a pidfd on
+    bwrap rather than tying up a thread. Cancelling the task that is using it stops
+    the run gracefully as the ``async with`` block unwinds.
+    """
+
+    def __init__(self, process: Process) -> None:
+        self._process = process
+        pidfd_open = getattr(os, 'pidfd_open', None)
+        self._exit_fd: int | None = None
+        if pidfd_open is not None:
+            with contextlib.suppress(OSError):
+                # bwrap is our own unreaped child, so its pid cannot be recycled yet.
+                self._exit_fd = pidfd_open(process.pid)
+
+    @property
+    def pid(self) -> int:
+        """The host pid of the run's bwrap process."""
+        return self._process.pid
+
+    @property
+    def returncode(self) -> int | None:
+        """The exit status once the run has ended, else None. Negative N means bwrap died of signal N."""
+        return self._process.returncode
+
+    @property
+    def terminated(self) -> bool:
+        """Whether :meth:`terminate` or :meth:`kill` was called."""
+        return self._process.terminated
+
+    def terminate(self, *, grace: float = 5.0) -> None:
+        """As :meth:`Process.terminate`: SIGTERM now, SIGKILL after ``grace``. Does not block."""
+        self._process.terminate(grace=grace)
+
+    def kill(self) -> None:
+        """Kill the run now, without letting the command clean up."""
+        self._process.kill()
+
+    async def output(self) -> AsyncIterator[tuple[Stream, bytes]]:
+        """Yield ``(stream, chunk)`` as the guest writes, until both pipes close. See :meth:`Process.output`."""
+        loop = asyncio.get_running_loop()
+        process = self._process
+        while process._open:  # noqa: SLF001 — the two faces of one run
+            fds = list(process._open)  # noqa: SLF001
+            ready = loop.create_future()
+            for fd in fds:
+                loop.add_reader(fd, _settle, ready)
+            try:
+                await ready
+            finally:
+                for fd in fds:
+                    loop.remove_reader(fd)
+            for fd in fds:
+                if fd in process._open:  # noqa: SLF001
+                    for item in process._read(fd):  # noqa: SLF001
+                        yield item
+
+    async def wait(self) -> int:
+        """Wait for the run to end and return its status."""
+        if self._process.returncode is None:
+            if self._exit_fd is None:
+                return await asyncio.to_thread(self._process.wait)
+            loop = asyncio.get_running_loop()
+            exited = loop.create_future()
+            loop.add_reader(self._exit_fd, _settle, exited)
+            try:
+                if self._process.returncode is None:
+                    await exited
+            finally:
+                loop.remove_reader(self._exit_fd)
+        return self._process.wait()
+
+    async def communicate(self, timeout: float | None = None) -> ProcResult:
+        """Read the rest of the output, wait for the run to end, and close it. See :meth:`Process.communicate`."""
+        out, err = bytearray(), bytearray()
+
+        async def collect() -> None:
+            async for name, chunk in self.output():
+                (out if name == 'stdout' else err).extend(chunk)
+            await self.wait()
+
+        timed_out = False
+        try:
+            await asyncio.wait_for(collect(), timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            self.kill()
+            await collect()
+        finally:
+            await self.aclose()
+        return _result(self._process.returncode, out, err, timed_out=timed_out)
+
+    async def aclose(self) -> None:
+        """Stop the run if it is still going, and release it. See :meth:`Process.close`."""
+        try:
+            if self._process.returncode is None:
+                self.terminate(grace=_CLOSE_GRACE_S)
+
+                async def drain() -> None:
+                    async for _ in self.output():
+                        pass
+                    await self.wait()
+
+                try:
+                    await asyncio.wait_for(drain(), _CLOSE_GRACE_S + 1)
+                except asyncio.TimeoutError:
+                    self.kill()
+                    await self.wait()
+        finally:
+            if self._exit_fd is not None:
+                os.close(self._exit_fd)
+                self._exit_fd = None
+            self._process.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.aclose()
+
+
+def _settle(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+def _result(returncode: int | None, out: bytes | bytearray, err: bytes | bytearray, *, timed_out: bool) -> ProcResult:
+    from postern._sandbox import ProcResult  # noqa: PLC0415 — _sandbox imports this module
+
+    stdout, stderr = bytes(out).decode('utf-8', 'replace'), bytes(err).decode('utf-8', 'replace')
+    if timed_out:
+        return ProcResult(124, stdout, stderr + '\n[postern] timed out')
+    return ProcResult(typing.cast('int', returncode), stdout, stderr)

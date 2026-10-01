@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import importlib.metadata
 
-from postern._process import Process
+from postern._process import AsyncProcess, Process
 from postern._sandbox import IsolationError, ProcResult, Sandbox, SandboxProfile, available
 from postern._workspace import (
     Workspace,
@@ -43,6 +43,7 @@ except importlib.metadata.PackageNotFoundError:
     __version__ = '0.0.0+unknown'
 
 __all__ = [
+    'AsyncProcess',
     'IsolationError',
     'ProcResult',
     'Process',

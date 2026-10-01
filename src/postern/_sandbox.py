@@ -21,6 +21,7 @@ reports whether the runtime can launch here.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import json
@@ -34,7 +35,7 @@ import typing
 from collections.abc import Callable, Sequence
 
 from postern import _process, _seccomp, _workspace
-from postern._process import Process
+from postern._process import AsyncProcess, Process
 
 if typing.TYPE_CHECKING:
     # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
@@ -646,7 +647,7 @@ class Sandbox:
         """Start ``argv`` in the sandbox, as :meth:`run` does, and return at once.
 
         The :class:`Process` streams the output as it arrives
-        (:meth:`Process.iter_output`) and can be stopped (:meth:`Process.cancel`).
+        (:meth:`Process.output`) and can be stopped (:meth:`Process.terminate`).
         Use it as a context manager: the run's hatches serve until it is closed.
         """
         return self._supervised(list(argv))
@@ -658,6 +659,18 @@ class Sandbox:
     def start_python(self, code: str) -> Process:
         """Start ``code`` in the sandbox, as :meth:`run_python` does, and return at once."""
         return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True)
+
+    async def astart(self, argv: list[str]) -> AsyncProcess:
+        """Start ``argv`` as :meth:`start` does, for asyncio. Use with ``async with``."""
+        return AsyncProcess(await asyncio.to_thread(self.start, argv))
+
+    async def astart_bash(self, script: str, *, shell: str = 'bash') -> AsyncProcess:
+        """Start ``shell -c script`` as :meth:`start_bash` does, for asyncio."""
+        return AsyncProcess(await asyncio.to_thread(self.start_bash, script, shell=shell))
+
+    async def astart_python(self, code: str) -> AsyncProcess:
+        """Start ``code`` as :meth:`start_python` does, for asyncio."""
+        return AsyncProcess(await asyncio.to_thread(self.start_python, code))
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.

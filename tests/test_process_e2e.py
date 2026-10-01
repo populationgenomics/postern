@@ -1,9 +1,11 @@
-"""`Sandbox.start*` and `Process`: output as it arrives, and cancellation.
+"""`Sandbox.start*` and `Process`: output as it arrives, and stopping a run.
 
-Require Linux + bubblewrap. Cancellation runs under both guest inits, since each
+Require Linux + bubblewrap. Stopping runs under both guest inits, since each
 must turn a SIGTERM from the host into one the command sees.
 """
 
+import asyncio
+import contextlib
 import pathlib
 import shutil
 import threading
@@ -32,7 +34,7 @@ def sandbox(request: pytest.FixtureRequest) -> Sandbox:
 
 def _drain(process: Process) -> tuple[list[tuple[float, str, bytes]], float]:
     started = time.monotonic()
-    chunks = [(time.monotonic() - started, stream, data) for stream, data in process.iter_output()]
+    chunks = [(time.monotonic() - started, stream, data) for stream, data in process.output()]
     return chunks, time.monotonic() - started
 
 
@@ -48,67 +50,69 @@ def test_output_arrives_while_the_command_runs(sandbox):
 def test_streams_are_labelled(sandbox):
     with sandbox.start_bash('echo out; echo err >&2') as process:
         by_stream: dict[str, bytes] = {}
-        for stream, data in process.iter_output():
+        for stream, data in process.output():
             by_stream[stream] = by_stream.get(stream, b'') + data
     assert by_stream == {'stdout': b'out\n', 'stderr': b'err\n'}
 
 
 def test_communicate_after_partial_streaming_returns_the_rest(sandbox):
     with sandbox.start_bash('echo first; sleep 0.3; echo second') as process:
-        stream, data = next(process.iter_output())
+        stream, data = next(process.output())
         assert (stream, data) == ('stdout', b'first\n')
         result = process.communicate(timeout=10)
     assert result.ok
     assert result.stdout == 'second\n'
 
 
-def test_cancel_lets_the_command_clean_up(sandbox):
+def test_terminate_lets_the_command_clean_up(sandbox):
     script = 'trap "echo cleaning-up; exit 3" TERM; echo ready; sleep 30 & wait'
     with sandbox.start_bash(script) as process:
-        assert next(process.iter_output()) == ('stdout', b'ready\n')
+        assert next(process.output()) == ('stdout', b'ready\n')
         started = time.monotonic()
-        process.cancel(grace=5)
+        process.terminate(grace=5)
         result = process.communicate(timeout=10)
     assert time.monotonic() - started < 2
-    assert process.cancelled
+    assert process.terminated
     assert result.returncode == 3
     assert result.stdout == 'cleaning-up\n'
 
 
-def test_cancel_escalates_when_the_command_ignores_sigterm(sandbox):
+def test_terminate_escalates_when_the_command_ignores_sigterm(sandbox):
     script = 'trap "" TERM; echo ready; sleep 30'
     with sandbox.start_bash(script) as process:
-        assert next(process.iter_output()) == ('stdout', b'ready\n')
+        assert next(process.output()) == ('stdout', b'ready\n')
         started = time.monotonic()
-        process.cancel(grace=0.5)
+        process.terminate(grace=0.5)
         result = process.communicate(timeout=10)
     assert 0.4 < time.monotonic() - started < 3
     assert result.returncode < 0  # bwrap killed; the namespace went with it
 
 
-def test_cancel_with_no_grace_is_immediate(sandbox):
+def test_terminate_with_no_grace_is_immediate(sandbox):
     with sandbox.start_bash('echo ready; sleep 30') as process:
-        assert next(process.iter_output()) == ('stdout', b'ready\n')
+        assert next(process.output()) == ('stdout', b'ready\n')
         started = time.monotonic()
-        process.cancel(grace=0)
+        process.terminate(grace=0)
         process.communicate(timeout=10)
     assert time.monotonic() - started < 1
 
 
-def test_cancel_from_another_thread_while_streaming(sandbox):
+def test_terminate_from_another_thread_while_streaming(sandbox):
     # The shape a harness takes: one thread reads, another decides to stop it.
     with sandbox.start_bash('trap "echo bye; exit 0" TERM; while :; do echo tick; sleep 0.1; done') as process:
-        threading.Timer(0.5, process.cancel).start()
-        output = b''.join(data for _, data in process.iter_output())
+        threading.Timer(0.5, process.terminate).start()
+        output = b''.join(data for _, data in process.output())
         assert process.wait() == 0
     assert output.count(b'tick') >= 2
-    assert output.endswith(b'bye\n')
+    # The trap ran. Under the C init the running `sleep` got the TERM too, so bash
+    # may also report it as Terminated: the whole group heard the signal.
+    assert b'bye\n' in output
 
 
-def test_cancel_after_exit_is_a_no_op(sandbox):
+def test_terminate_after_exit_is_a_no_op(sandbox):
     with sandbox.start_bash('exit 5') as process:
         assert process.wait() == 5
-        process.cancel()
+        process.terminate()
         assert process.communicate().returncode == 5
 
 
@@ -123,8 +127,96 @@ def test_c_init_cancel_reaches_the_whole_process_group(c_init):
     # process group, so they stop too and the trap can report it.
     script = 'trap "echo stopped; exit 0" TERM; echo ready; sleep 30 | cat & wait'
     with Sandbox(SandboxProfile(init=c_init)).start_bash(script) as process:
-        assert next(process.iter_output()) == ('stdout', b'ready\n')
-        process.cancel(grace=5)
+        assert next(process.output()) == ('stdout', b'ready\n')
+        process.terminate(grace=5)
         result = process.communicate(timeout=10)
     assert result.returncode == 0
     assert result.stdout == 'stopped\n'
+
+
+def test_an_exception_in_the_block_stops_the_run_gracefully(sandbox):
+    # Leaving the block with the run still going (here, on an exception) gives the
+    # command its SIGTERM and a short grace, not an immediate kill.
+    script = 'trap "echo cleaned > /workspace/marker; exit 0" TERM; echo ready; sleep 30 & wait'
+    started = {}
+
+    def give_up() -> None:
+        with sandbox.start_bash(script) as process:
+            started['process'] = process
+            assert next(process.output()) == ('stdout', b'ready\n')
+            raise RuntimeError('caller gave up')
+
+    with pytest.raises(RuntimeError, match='caller gave up'):
+        give_up()
+    assert started['process'].returncode == 0
+    assert (sandbox.workspace / 'marker').read_text() == 'cleaned\n'
+
+
+def test_async_output_arrives_while_the_command_runs(sandbox):
+    async def main():
+        started = time.monotonic()
+        arrivals = []
+        async with await sandbox.astart_bash('for i in 1 2 3; do echo $i; sleep 0.3; done') as process:
+            async for stream, data in process.output():
+                arrivals.append((time.monotonic() - started, stream, data))
+            return arrivals, await process.wait(), time.monotonic() - started
+
+    arrivals, status, elapsed = asyncio.run(main())
+    assert status == 0
+    assert b''.join(data for _, _, data in arrivals) == b'1\n2\n3\n'
+    assert arrivals[0][0] < 0.5 < elapsed
+
+
+def test_async_communicate_and_timeout(sandbox):
+    async def main():
+        async with await sandbox.astart_bash('echo out; echo err >&2; exit 4') as process:
+            done = await process.communicate(timeout=10)
+        async with await sandbox.astart_bash('echo before; sleep 30') as process:
+            slow = await process.communicate(timeout=0.5)
+        return done, slow
+
+    done, slow = asyncio.run(main())
+    assert (done.returncode, done.stdout, done.stderr) == (4, 'out\n', 'err\n')
+    assert slow.returncode == 124
+    assert slow.stdout == 'before\n'
+    assert slow.stderr.endswith('[postern] timed out')
+
+
+def test_async_terminate_lets_the_command_clean_up(sandbox):
+    async def main():
+        script = 'trap "echo cleaning-up; exit 3" TERM; echo ready; sleep 30 & wait'
+        async with await sandbox.astart_bash(script) as process:
+            output = process.output()
+            assert await anext(output) == ('stdout', b'ready\n')
+            process.terminate(grace=5)
+            rest = b''.join([data async for _, data in output])
+            return rest, await process.wait()
+
+    rest, status = asyncio.run(main())
+    assert (rest, status) == (b'cleaning-up\n', 3)
+
+
+def test_cancelling_the_task_stops_the_run_gracefully(sandbox):
+    # asyncio cancellation of the task using the process becomes a graceful stop
+    # of the guest, as the async with block unwinds.
+    async def main():
+        script = 'trap "echo cleaned > /workspace/marker; exit 0" TERM; echo ready; sleep 30 & wait'
+        ready = asyncio.Event()
+        holder = {}
+
+        async def use():
+            async with await sandbox.astart_bash(script) as process:
+                holder['process'] = process
+                async for _ in process.output():
+                    ready.set()
+
+        task = asyncio.create_task(use())
+        await ready.wait()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return holder['process']
+
+    process = asyncio.run(main())
+    assert process.returncode == 0
+    assert (sandbox.workspace / 'marker').read_text() == 'cleaned\n'
