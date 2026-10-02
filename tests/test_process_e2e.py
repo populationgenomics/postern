@@ -122,6 +122,29 @@ def test_closing_a_running_process_stops_it(sandbox):
     assert process.returncode is not None
 
 
+@pytest.mark.parametrize('how', ['kill', 'close', 'terminate0', 'timeout0'])
+def test_stop_right_after_start_kills_guest(sandbox, how):
+    process = sandbox.start_bash('sleep 2; echo survived > /workspace/marker; echo done')
+    started = time.monotonic()
+    if how == 'kill':
+        process.kill()
+        result = process.communicate(10)
+    elif how == 'close':
+        process.close()
+        result = None
+    elif how == 'terminate0':
+        process.terminate(grace=0)
+        result = process.communicate(10)
+    else:
+        result = process.communicate(0)
+    elapsed = time.monotonic() - started
+    max_elapsed = 1.5 if how == 'close' else 0.5
+    assert elapsed < max_elapsed
+    if result is not None:
+        assert 'done' not in result.stdout
+    assert not (sandbox.workspace / 'marker').exists()
+
+
 def test_c_init_cancel_reaches_the_whole_process_group(c_init):
     # A pipeline's members are not the command itself; the C init signals its
     # process group, so they stop too and the trap can report it.
