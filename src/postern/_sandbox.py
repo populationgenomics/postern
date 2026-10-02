@@ -765,10 +765,24 @@ class Sandbox:
         """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
 
         ``resources`` (the hatches' serving contexts) passes to the Process, which
-        closes it when the run is closed; on a failed launch it is closed here.
+        closes it when the run is closed; on any failure it is closed here.
         """
-        if not available():
+        try:
+            launch = self._launch(argv, setenv=setenv, extra_binds=extra_binds)
+        except BaseException:
             resources.close()
+            raise
+        try:
+            return _process.Process(launch, resources=resources)
+        except BaseException:
+            launch.discard()
+            resources.close()
+            raise
+
+    def _launch(
+        self, argv: list[str], *, setenv: dict[str, str] | None, extra_binds: list[str] | None
+    ) -> _process.Launch:
+        if not available():
             raise RuntimeError('bubblewrap (bwrap) not found on PATH; postern requires Linux + bubblewrap')
         # A non-root guest cannot write a host-owned workspace dir. 1777 rather than
         # 0777 (matching the tmpfs branch): without the sticky bit the guest could
@@ -785,22 +799,13 @@ class Sandbox:
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            launch = _launcher.launch(
+            return _launcher.launch(
                 functools.partial(_spawn, cmd, pass_fds=() if fd is None else (fd,), profile=self._profile),
                 _process.Launch.discard,
             )
-        except BaseException:
-            resources.close()
-            raise
         finally:
             if seccomp is not None:
                 seccomp.close()
-        try:
-            return _process.Process(launch, resources=resources)
-        except BaseException:
-            launch.discard()
-            resources.close()
-            raise
 
     def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False) -> _process.Process:
         """Start ``work_argv`` under the guest's init, with every hatch bound and served.

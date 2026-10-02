@@ -4,6 +4,8 @@ Require Linux + bubblewrap. Stopping runs under both guest inits, since each
 must turn a SIGTERM from the host into one the command sees.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import os
@@ -13,10 +15,11 @@ import shutil
 import signal
 import threading
 import time
+import typing
 
 import pytest
 
-from postern import IsolationError, Process, Sandbox, SandboxProfile, _process, _sandbox, available
+from postern import IsolationError, Process, Sandbox, SandboxProfile, _process, _sandbox, _seccomp, available
 from postern.build_init import build
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
@@ -320,6 +323,40 @@ def test_an_interrupted_start_leaves_no_guest(sandbox, monkeypatch):
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
     _assert_no_survivor(sandbox)
+
+
+class _RecordingHatch:
+    """A hatch that only records whether it is serving.
+
+    A class rather than a generator context manager: a generator is closed when it
+    is garbage-collected, which would end a leaked serving context by accident.
+    """
+
+    guest_name = 'recording'
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.socket_path = str(path)
+        self.serving = False
+
+    def accepting(self) -> _RecordingHatch:
+        return self
+
+    def __enter__(self) -> None:
+        self.serving = True
+
+    def __exit__(self, *_exc: object) -> None:
+        self.serving = False
+
+
+def test_a_start_failing_before_bwrap_stops_serving_the_hatches(tmp_path, monkeypatch):
+    def broken_install() -> typing.NoReturn:
+        raise RuntimeError('seccomp filter is missing')
+
+    hatch = _RecordingHatch(tmp_path / 'recording.sock')
+    monkeypatch.setattr(_seccomp, 'load_filter', broken_install)
+    with pytest.raises(RuntimeError, match='seccomp filter is missing'):
+        Sandbox(hatch=hatch).start(['true'])
+    assert not hatch.serving
 
 
 def test_no_pidfds_fails_closed_before_launching(sandbox, monkeypatch):
