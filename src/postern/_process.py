@@ -51,6 +51,8 @@ _READ_SIZE = 65536
 # is killed: closing should be prompt, but an interrupted caller is no reason to
 # deny the command its cleanup.
 _CLOSE_GRACE_S = 1.0
+# How long to drain remaining pipe output after kill() on timeout before abandoning.
+_POST_KILL_DRAIN_S = 1.0
 
 # Which of the guest's pipes a chunk of output came from.
 Stream = typing.Literal['stdout', 'stderr']
@@ -283,9 +285,13 @@ class Process:
         except subprocess.TimeoutExpired:
             timed_out = True
             self.kill()
-            for name, chunk in self._pump(deadline=None):
-                (out if name == 'stdout' else err).extend(chunk)
-            self._popen.wait()
+            drain_deadline = time.monotonic() + _POST_KILL_DRAIN_S
+            try:
+                for name, chunk in self._pump(deadline=drain_deadline):
+                    (out if name == 'stdout' else err).extend(chunk)
+                self._popen.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
         finally:
             self.close()
         return _result(self._popen.returncode, out, err, timed_out=timed_out)
@@ -427,7 +433,8 @@ class AsyncProcess:
         except asyncio.TimeoutError:
             timed_out = True
             self.kill()
-            await collect()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(collect(), _POST_KILL_DRAIN_S)
         finally:
             await self.aclose()
         return _result(self._process.returncode, out, err, timed_out=timed_out)
@@ -452,7 +459,9 @@ class AsyncProcess:
             if self._exit_fd is not None:
                 os.close(self._exit_fd)
                 self._exit_fd = None
-            self._process.close()
+            if self._process.returncode is None:
+                self._process.kill()
+            await asyncio.shield(asyncio.to_thread(self._process.close))
 
     async def __aenter__(self) -> typing_extensions.Self:
         return self

@@ -287,3 +287,42 @@ def test_start_cleans_up_on_init_pid_failure(sandbox, monkeypatch):
         sandbox._start(['/bin/true'], resources=resources)
 
     assert cleaned_up
+
+
+def test_post_kill_drain_bounds_timeout(sandbox):
+    start_t = time.monotonic()
+    result = sandbox.start_bash('while true; do echo flood; done').communicate(timeout=0.3)
+    elapsed = time.monotonic() - start_t
+    assert result.returncode == 124
+    assert elapsed < 2.5
+
+
+def test_async_aclose_does_not_block_event_loop_when_cancelled(sandbox):
+    async def main():
+        proc = await sandbox.astart_bash('trap "" TERM; sleep 30')
+
+        loop_ticks = 0
+        heartbeat_running = True
+
+        async def heartbeat():
+            nonlocal loop_ticks
+            while heartbeat_running:
+                loop_ticks += 1
+                await asyncio.sleep(0.01)
+
+        hb_task = asyncio.create_task(heartbeat())
+
+        aclose_task = asyncio.create_task(proc.aclose())
+        await asyncio.sleep(0.05)
+        aclose_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await aclose_task
+
+        before_ticks = loop_ticks
+        await asyncio.sleep(0.05)
+        after_ticks = loop_ticks
+        heartbeat_running = False
+        await hb_task
+        assert after_ticks > before_ticks
+
+    asyncio.run(main())
