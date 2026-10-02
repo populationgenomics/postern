@@ -525,33 +525,40 @@ def _read_init_pid(info_fd: int) -> int | None:
     raise IsolationError(f'bwrap did not report the guest init within {_INFO_TIMEOUT_S}s')
 
 
-def _parent_pid(pid: int) -> int:
-    """``pid``'s parent, from ``/proc``.
+def _status_field(pid: int | str, field: str) -> int:
+    """An integer field (``Pid``, ``PPid``) of ``/proc/<pid>/status``.
 
     Raises:
-        FileNotFoundError: If ``pid`` does not exist.
-        IsolationError: If its status has no parent pid.
+        FileNotFoundError: If ``pid`` does not exist in this ``/proc``.
+        IsolationError: If the status has no such field.
     """
     for line in pathlib.Path(f'/proc/{pid}/status').read_text().splitlines():
-        if line.startswith('PPid:'):
-            return int(line.split()[1])
-    raise IsolationError(f'/proc/{pid}/status has no PPid line')
+        name, _, value = line.partition(':')
+        if name == field:
+            return int(value.split()[0])
+    raise IsolationError(f'/proc/{pid}/status has no {field} line')
 
 
 def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
     """A pidfd on the guest init bwrap reports on ``info_fd``, or None if no init is running.
 
-    The pid is checked to still name bwrap's child once the pidfd is open: bwrap
-    reaps the init before it exits itself, so by the time the pid is read it may
-    have been recycled. The check reads ``/proc`` and then confirms through the
-    pidfd that the process is alive; alive, the pid cannot have changed hands in
-    between, so the ``/proc`` entry was its.
+    The pid is checked to name bwrap's child once the pidfd is open: bwrap reaps
+    the init before it exits itself, so by the time the pid is read it may have
+    been recycled. The check reads ``/proc`` and then confirms through the pidfd
+    that the process is alive; alive, the pid cannot have changed hands in
+    between, so the ``/proc`` entry was its. Only the pidfd decides that the init
+    has exited: a process alive but not shown as bwrap's child is one this cannot
+    vouch for, and fails closed.
 
     Returns:
         The pidfd, or None if bwrap started no init or it has already exited.
 
     Raises:
-        IsolationError: If bwrap's report is unusable or the pidfd cannot be opened.
+        IsolationError: If bwrap's report is unusable, the pidfd cannot be opened,
+            or ``/proc`` does not show the live process as bwrap's child. The
+            process is SIGKILLed first: it is the init in all but a pid
+            recycled in the moments since bwrap reported it, while it was still
+            being set up.
     """
     pid = _read_init_pid(info_fd)
     if pid is None:
@@ -563,26 +570,36 @@ def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
     except OSError as exc:
         raise IsolationError(f'cannot open a pidfd on the guest init: {exc}') from exc
     try:
-        parent = _parent_pid(pid)
-        _process.pidfd_signal(pidfd, 0)
-    except (FileNotFoundError, ProcessLookupError):
-        os.close(pidfd)
-        return None
+        try:
+            parent: int | None = _status_field(pid, 'PPid')
+        except FileNotFoundError:
+            parent = None  # hidden from this /proc (hidepid), or the init has exited
+        try:
+            _process.pidfd_signal(pidfd, 0)
+        except ProcessLookupError:
+            os.close(pidfd)
+            return None
+        if parent != bwrap_pid:
+            with contextlib.suppress(ProcessLookupError):
+                _process.pidfd_signal(pidfd, signal.SIGKILL)
+            shown = 'no such process' if parent is None else f'parent {parent}'
+            raise IsolationError(
+                f'cannot confirm that pid {pid} is the guest init: /proc shows {shown}, not bwrap ({bwrap_pid})'
+            )
     except BaseException:
         os.close(pidfd)
         raise
-    if parent != bwrap_pid:
-        os.close(pidfd)
-        return None
     return pidfd
 
 
-def _require_pidfds() -> None:
-    """Raise unless pidfds work here: stopping a run depends on them.
+def _require_init_control() -> None:
+    """Raise unless a guest init can be held and identified here: stopping a run depends on it.
 
     Raises:
-        IsolationError: Off Linux, before 5.3, or under a seccomp profile that
-            blocks ``pidfd_open`` or ``pidfd_send_signal``.
+        IsolationError: If pidfds do not work (off Linux, before 5.3, or under a
+            seccomp profile blocking ``pidfd_open`` or ``pidfd_send_signal``), or
+            ``/proc`` belongs to another pid namespace than this process's, so the
+            init's pid could not be checked against it.
     """
     try:
         pidfd = _process.pidfd_open(os.getpid())
@@ -592,6 +609,15 @@ def _require_pidfds() -> None:
             os.close(pidfd)
     except OSError as exc:
         raise IsolationError(f'pidfds are unavailable, so a run could not be reliably stopped: {exc}') from exc
+    try:
+        shown: int | None = _status_field('self', 'Pid')
+    except FileNotFoundError:
+        shown = None  # no /proc, or one in which this process does not appear
+    if shown != os.getpid():
+        raise IsolationError(
+            f"/proc does not belong to this process's pid namespace (its self is {shown}, not {os.getpid()}), "
+            'so the guest init could not be identified'
+        )
 
 
 def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
@@ -607,7 +633,7 @@ def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile
         IsolationError: If the init cannot be held by a pidfd, and so could not be
             reliably stopped.
     """
-    _require_pidfds()
+    _require_init_control()
     info_read, info_write = os.pipe()
     try:
         try:

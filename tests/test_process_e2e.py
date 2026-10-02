@@ -13,6 +13,7 @@ import pathlib
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import typing
@@ -379,6 +380,45 @@ def test_no_pidfds_fails_closed_before_launching(sandbox, monkeypatch):
     with pytest.raises(IsolationError, match='pidfds are unavailable'):
         sandbox.start_bash(_SURVIVOR)
     _assert_no_survivor(sandbox)
+
+
+def test_an_init_proc_cannot_vouch_for_fails_closed(sandbox, monkeypatch):
+    # hidepid, say: the init is alive, but /proc does not show it as bwrap's child.
+    real = _sandbox._status_field
+
+    def hide_others(pid: int | str, field: str) -> int:
+        if pid != 'self':
+            raise FileNotFoundError(pid)
+        return real(pid, field)
+
+    monkeypatch.setattr(_sandbox, '_status_field', hide_others)
+    with pytest.raises(IsolationError, match='cannot confirm that pid'):
+        sandbox.start_bash(_SURVIVOR)
+    _assert_no_survivor(sandbox)
+
+
+@pytest.mark.skipif(shutil.which('unshare') is None, reason='requires unshare(1)')
+def test_a_proc_from_another_pid_namespace_fails_closed(tmp_path):
+    # The worker in a pid namespace of its own, still seeing its parent's /proc.
+    marker = tmp_path / 'marker'
+    script = (
+        'import sys\n'
+        'from postern import IsolationError, Sandbox\n'
+        'try:\n'
+        f'    Sandbox().start_bash("sleep 0.5; echo survived > {marker}")\n'
+        'except IsolationError as exc:\n'
+        '    sys.exit(f"refused: {exc}")\n'
+    )
+    worker = subprocess.run(
+        ['unshare', '--user', '--map-root-user', '--pid', '--fork', sys.executable, '-c', script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert worker.returncode == 1, worker.stderr
+    assert "refused: /proc does not belong to this process's pid namespace" in worker.stderr
+    time.sleep(1.0)
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
