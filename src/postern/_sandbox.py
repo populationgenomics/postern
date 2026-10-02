@@ -31,10 +31,12 @@ import os
 import pathlib
 import queue
 import re
+import selectors
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import typing
 
 from postern import _process, _seccomp, _workspace
@@ -390,62 +392,269 @@ def _stub_binds(
 
 _T = typing.TypeVar('_T')
 
+# How long a launch waits for bwrap to report the init's pid. bwrap writes it once
+# it has cloned the guest, within milliseconds; one that fails first closes the
+# pipe, so this bounds only a bwrap that hangs.
+_INFO_TIMEOUT_S = 30.0
+
+
+class _Job(typing.Generic[_T]):
+    """One call run on the launcher thread, and the hand-off of its result.
+
+    The result goes to the caller, or to ``discard`` if the caller stopped waiting
+    first, so something the call started is never left without an owner.
+    """
+
+    def __init__(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> None:
+        self._fn = fn
+        self._discard = discard
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._abandoned = False
+        self._value: _T | None = None
+        self._error: BaseException | None = None
+
+    def run(self) -> None:
+        """Run on the launcher thread. Never raises: an error goes to the caller."""
+        try:
+            value = self._fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the caller
+            self._error = exc
+            self._done.set()
+            return
+        with self._lock:
+            abandoned = self._abandoned
+            self._value = value
+            self._done.set()
+        if abandoned:
+            self._discard(value)
+
+    def result(self) -> _T:
+        """Wait for the call, and return its result or raise its error.
+
+        Interrupted while waiting (a ``KeyboardInterrupt``), the result is discarded
+        here if it has arrived, or by :meth:`run` when it does.
+        """
+        try:
+            self._done.wait()
+        except BaseException:
+            with self._lock:
+                self._abandoned = True
+                arrived = self._done.is_set() and self._error is None
+            if arrived:
+                self._discard(typing.cast('_T', self._value))
+            raise
+        if self._error is not None:
+            raise self._error
+        return typing.cast('_T', self._value)
+
 
 class _Launcher:
-    """Run callables on a persistent launcher thread.
+    """Runs every launch on one long-lived thread.
 
-    Under Linux, ``prctl(PR_SET_PDEATHSIG, SIGKILL)`` (configured by bwrap's
-    ``--die-with-parent``) is thread-scoped: the signal fires when the thread that
-    called ``clone`` exits. Running every ``Popen`` on one long-lived daemon thread
-    ensures bwrap's parent thread does not prematurely exit when caller threads
-    or worker pool threads finish.
+    bwrap's ``--die-with-parent`` is ``PR_SET_PDEATHSIG``, which fires when the
+    *thread* that forked bwrap exits, not the process. Launched from a caller or
+    pool thread, a guest would die when that thread finished.
+
+    A launch runs to completion here even if its caller is interrupted while
+    waiting — a ``KeyboardInterrupt`` reaches only the main thread — so it is never
+    left half-done, and :class:`_Job` hands an abandoned result to its ``discard``.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._queue: queue.SimpleQueue[collections.abc.Callable[[], None]] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
-        self._queue: (
-            queue.Queue[tuple[collections.abc.Callable[[], typing.Any], threading.Event, list[typing.Any]]] | None
-        ) = None
 
-    def _worker(
-        self,
-        q: queue.Queue[tuple[collections.abc.Callable[[], typing.Any], threading.Event, list[typing.Any]]],
-    ) -> None:
-        while True:
-            fn, done, box = q.get()
-            try:
-                box.append(fn())
-            except BaseException as exc:  # noqa: BLE001 — re-raised in caller
-                box.append(exc)
-            finally:
-                done.set()
+    def launch(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> _T:
+        """Run ``fn`` on the launcher thread and return its result, or raise its error.
 
-    def launch(self, fn: collections.abc.Callable[[], _T]) -> _T:
+        Args:
+            fn: The launch.
+            discard: Releases ``fn``'s result if the caller is interrupted before
+                receiving it.
+        """
+        job = _Job(fn, discard)
         with self._lock:
-            if self._thread is None or not self._thread.is_alive() or self._queue is None:
-                self._queue = queue.Queue()
-                self._thread = threading.Thread(
-                    target=self._worker,
-                    args=(self._queue,),
-                    name='postern-launcher',
-                    daemon=True,
-                )
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._serve, name='postern-launcher', daemon=True)
                 self._thread.start()
-            q = self._queue
+        self._queue.put(job.run)
+        return job.result()
 
-        done = threading.Event()
-        box: list[typing.Any] = []
-        q.put((fn, done, box))
-        done.wait()
-        res = box[0]
-        if isinstance(res, BaseException):
-            raise res
-        return typing.cast('_T', res)
+    def _serve(self) -> None:
+        while True:
+            self._queue.get()()
 
 
+# Process-wide, not per Sandbox: the thread must outlive every guest it launched,
+# and the only lifetime that does so is the worker process's.
 _launcher = _Launcher()
-_launch = _launcher.launch
+
+
+def _read_init_pid(info_fd: int) -> int | None:
+    """The guest init's host pid, from bwrap's ``--info-fd`` JSON, or None.
+
+    Reads only until the JSON object is complete rather than to EOF: whether bwrap
+    closes the descriptor after writing is not something to depend on.
+
+    Returns:
+        The pid, or None if bwrap closed the pipe without reporting one, which it
+        does only when it fails before starting the guest.
+
+    Raises:
+        IsolationError: If the report is malformed or does not arrive in time.
+    """
+    deadline = time.monotonic() + _INFO_TIMEOUT_S
+    buffer = b''
+    with selectors.DefaultSelector() as selector:
+        selector.register(info_fd, selectors.EVENT_READ)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not selector.select(remaining):
+                continue
+            chunk = os.read(info_fd, 4096)
+            if not chunk:
+                if buffer:
+                    raise IsolationError(f'bwrap --info-fd report is truncated: {buffer!r}')
+                return None
+            buffer += chunk
+            try:
+                report = json.loads(buffer)
+            except ValueError:
+                continue  # not complete yet
+            pid = report.get('child-pid') if isinstance(report, dict) else None
+            if not isinstance(pid, int):
+                raise IsolationError(f'bwrap --info-fd report has no child-pid: {buffer!r}')
+            return pid
+    raise IsolationError(f'bwrap did not report the guest init within {_INFO_TIMEOUT_S}s')
+
+
+def _parent_pid(pid: int) -> int:
+    """``pid``'s parent, from ``/proc``.
+
+    Raises:
+        FileNotFoundError: If ``pid`` does not exist.
+        IsolationError: If its status has no parent pid.
+    """
+    for line in pathlib.Path(f'/proc/{pid}/status').read_text().splitlines():
+        if line.startswith('PPid:'):
+            return int(line.split()[1])
+    raise IsolationError(f'/proc/{pid}/status has no PPid line')
+
+
+def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
+    """A pidfd on the guest init bwrap reports on ``info_fd``, or None if no init is running.
+
+    The pid is checked to still name bwrap's child once the pidfd is open: bwrap
+    reaps the init before it exits itself, so by the time the pid is read it may
+    have been recycled. The check reads ``/proc`` and then confirms through the
+    pidfd that the process is alive; alive, the pid cannot have changed hands in
+    between, so the ``/proc`` entry was its.
+
+    Returns:
+        The pidfd, or None if bwrap started no init or it has already exited.
+
+    Raises:
+        IsolationError: If bwrap's report is unusable or the pidfd cannot be opened.
+    """
+    pid = _read_init_pid(info_fd)
+    if pid is None:
+        return None
+    try:
+        pidfd = _process.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        raise IsolationError(f'cannot open a pidfd on the guest init: {exc}') from exc
+    try:
+        parent = _parent_pid(pid)
+        _process.pidfd_signal(pidfd, 0)
+    except (FileNotFoundError, ProcessLookupError):
+        os.close(pidfd)
+        return None
+    except BaseException:
+        os.close(pidfd)
+        raise
+    if parent != bwrap_pid:
+        os.close(pidfd)
+        return None
+    return pidfd
+
+
+def _require_pidfds() -> None:
+    """Raise unless pidfds work here: stopping a run depends on them.
+
+    Raises:
+        IsolationError: Off Linux, before 5.3, or under a seccomp profile that
+            blocks ``pidfd_open`` or ``pidfd_send_signal``.
+    """
+    try:
+        pidfd = _process.pidfd_open(os.getpid())
+        try:
+            _process.pidfd_signal(pidfd, 0)
+        finally:
+            os.close(pidfd)
+    except OSError as exc:
+        raise IsolationError(f'pidfds are unavailable, so a run could not be reliably stopped: {exc}') from exc
+
+
+def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
+    """Start bwrap and take hold of the guest's init. Runs on the launcher thread.
+
+    ``cmd`` is the bwrap command line, with ``cmd[0]`` bwrap itself; ``--info-fd``
+    is added here. On any failure, whatever was started is killed before this
+    raises — except an init that could not be held, which only killing bwrap can
+    reach: one already past ``--die-with-parent`` dies with it, one not yet past it
+    does not. Only descriptor exhaustion gets that far, with pidfds known to work.
+
+    Raises:
+        IsolationError: If the init cannot be held by a pidfd, and so could not be
+            reliably stopped.
+    """
+    _require_pidfds()
+    info_read, info_write = os.pipe()
+    try:
+        try:
+            # Bytes, decoded by Process. Cast because the credentials splat is Any,
+            # which lets the type checker pick Popen's text-mode overload.
+            popen = typing.cast(
+                'subprocess.Popen[bytes]',
+                subprocess.Popen(
+                    [cmd[0], '--info-fd', str(info_write), *cmd[1:]],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    # Scrub bwrap's own environment: it is PID 1 in the guest's
+                    # namespace at the guest uid, so an inherited secret would be
+                    # readable from inside via /proc/1/environ (see bwrap_env).
+                    env=bwrap_env(),
+                    pass_fds=(*pass_fds, info_write),
+                    # Run bwrap at a non-root real uid when we are root, so the
+                    # guest's kernel uid (which bwrap maps --uid onto) is non-root and
+                    # owns none of root's files (see bwrap_credentials).
+                    **bwrap_credentials(profile, os.geteuid()),
+                ),
+            )
+        finally:
+            os.close(info_write)
+        try:
+            # Nothing has polled bwrap, so it is unreaped and its pid still names it.
+            bwrap_pidfd = _process.pidfd_open(popen.pid)
+        except BaseException:
+            # Without a pidfd on bwrap the init cannot be held either; killing bwrap
+            # is the most there is to do. Popen's exit reaps it and closes the pipes.
+            with popen:
+                popen.kill()
+            raise
+        launch = _process.Launch(popen, bwrap_pidfd)
+        try:
+            launch.init_pidfd = _hold_init(info_read, popen.pid)
+        except BaseException:
+            launch.discard()
+            raise
+        return launch
+    finally:
+        os.close(info_read)
 
 
 class Sandbox:
@@ -570,56 +779,26 @@ class Sandbox:
                 self._workspace.chmod(0o1777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
         fd = seccomp.fileno() if seccomp is not None else None
-        # bwrap reports the init's host pid here, which is how cancel() reaches it.
-        info_read, info_write = os.pipe()
         try:
             cmd = build_base_argv(dataclasses.replace(self._profile, workspace=self._workspace), fd)
-            cmd += ['--info-fd', str(info_write)]
             for key, val in (setenv or {}).items():
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            # Bytes, decoded by Process. Cast because the credentials splat is Any,
-            # which lets the type checker pick Popen's text-mode overload.
-            popen = _launch(
-                lambda: typing.cast(
-                    'subprocess.Popen[bytes]',
-                    subprocess.Popen(
-                        cmd,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        # Scrub bwrap's own environment: it is PID 1 in the guest's
-                        # namespace at the guest uid, so an inherited secret would be
-                        # readable from inside via /proc/1/environ (see bwrap_env).
-                        env=bwrap_env(),
-                        pass_fds=(info_write,) if fd is None else (fd, info_write),
-                        # Run bwrap at a non-root real uid when we are root, so the
-                        # guest's kernel uid (which bwrap maps --uid onto) is non-root and
-                        # owns none of root's files (see bwrap_credentials).
-                        **bwrap_credentials(self._profile, os.geteuid()),
-                    ),
-                )
+            launch = _launcher.launch(
+                functools.partial(_spawn, cmd, pass_fds=() if fd is None else (fd,), profile=self._profile),
+                _process.Launch.discard,
             )
         except BaseException:
-            os.close(info_read)
             resources.close()
             raise
         finally:
-            os.close(info_write)
             if seccomp is not None:
                 seccomp.close()
         try:
-            try:
-                pidfd = _process.open_pidfd(_process.read_init_pid(info_read), popen)
-            finally:
-                os.close(info_read)
-            return _process.Process(popen, pidfd=pidfd, resources=resources)
+            return _process.Process(launch, resources=resources)
         except BaseException:
-            with contextlib.suppress(ProcessLookupError):
-                popen.kill()
-            with contextlib.suppress(Exception):
-                popen.wait()
+            launch.discard()
             resources.close()
             raise
 

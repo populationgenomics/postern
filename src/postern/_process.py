@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+import errno
 import os
 import selectors
 import signal
@@ -42,10 +42,6 @@ if typing.TYPE_CHECKING:
 
     import postern._sandbox
 
-# How long start() waits for bwrap to report the init's pid. bwrap writes it after
-# building the namespaces, which takes milliseconds; a launch that fails before then
-# closes the pipe, so this bounds only a bwrap that hangs.
-_INFO_TIMEOUT_S = 30.0
 _READ_SIZE = 65536
 # How long closing a still-running process allows it to stop on SIGTERM before it
 # is killed: closing should be prompt, but an interrupted caller is no reason to
@@ -58,57 +54,86 @@ _POST_KILL_DRAIN_S = 1.0
 Stream = typing.Literal['stdout', 'stderr']
 
 
-def read_init_pid(info_fd: int, *, timeout: float = _INFO_TIMEOUT_S) -> int | None:
-    """The guest init's host pid, from bwrap's ``--info-fd`` JSON, or None.
+def pidfd_open(pid: int) -> int:
+    """Open a pidfd on ``pid``.
 
-    Reads only until the JSON object is complete rather than to EOF: whether bwrap
-    closes the descriptor after writing is not something to depend on.
-
-    Args:
-        info_fd: The read end of the pipe bwrap's ``--info-fd`` writes to.
-        timeout: Seconds to wait for the report.
-
-    Returns:
-        The pid, or None if bwrap exited (or hung) before reporting one.
+    Raises:
+        OSError: If the pidfd cannot be opened: ``ProcessLookupError`` if ``pid``
+            does not exist, ``ENOSYS`` off Linux or before 5.3, ``EPERM`` under a
+            seccomp profile that blocks the call.
     """
-    deadline = time.monotonic() + timeout
-    buffer = b''
-    with selectors.DefaultSelector() as selector:
-        selector.register(info_fd, selectors.EVENT_READ)
-        while (remaining := deadline - time.monotonic()) > 0:
-            if not selector.select(remaining):
-                continue
-            chunk = os.read(info_fd, 4096)
-            if not chunk:
-                return None
-            buffer += chunk
-            try:
-                report = json.loads(buffer)
-            except ValueError:
-                continue  # not complete yet
-            pid = report.get('child-pid') if isinstance(report, dict) else None
-            return pid if isinstance(pid, int) else None
-    return None
+    # Looked up rather than called as os.pidfd_open: it exists only on Linux, and
+    # the type checker sees the host's platform.
+    open_ = typing.cast('typing.Callable[[int], int] | None', getattr(os, 'pidfd_open', None))
+    if open_ is None:
+        raise OSError(errno.ENOSYS, 'pidfd_open is unavailable on this platform')
+    return open_(pid)
 
 
-def open_pidfd(pid: int | None, popen: subprocess.Popen[bytes]) -> int | None:
-    """A pidfd on the init, so a later signal cannot reach a recycled pid.
+def pidfd_signal(pidfd: int, sig: int) -> None:
+    """Send ``sig`` to the process ``pidfd`` names; 0 only checks that it is alive.
 
-    Opened while bwrap is still running: bwrap reaps the init only once it exits
-    and then exits itself, so a live bwrap means the pid still names the init. One
-    opened after bwrap has gone is discarded rather than trusted.
+    Raises:
+        OSError: ``ProcessLookupError`` if the process has exited, ``ENOSYS`` if
+            pidfds are unavailable.
     """
-    pidfd_open = getattr(os, 'pidfd_open', None)
-    if pid is None or pidfd_open is None:
-        return None
-    try:
-        pidfd = pidfd_open(pid)
-    except OSError:
-        return None  # already gone
-    if popen.poll() is not None:
-        os.close(pidfd)
-        return None
-    return pidfd
+    send = typing.cast('typing.Callable[[int, int], None] | None', getattr(signal, 'pidfd_send_signal', None))
+    if send is None:
+        raise OSError(errno.ENOSYS, 'pidfd_send_signal is unavailable on this platform')
+    send(pidfd, sig)
+
+
+class Launch:
+    """A started bwrap, with pidfds on it and on the guest's init: what stopping a run needs.
+
+    A pidfd names one process for its lifetime, so a signal through either can
+    never reach a recycled pid, however late it is sent. ``init_pidfd`` is None
+    only when no init is running: bwrap failed before starting one, or it has
+    already exited, and its exit took the guest's namespace with it.
+    """
+
+    def __init__(self, popen: subprocess.Popen[bytes], bwrap_pidfd: int) -> None:
+        self.popen = popen
+        self.bwrap_pidfd = bwrap_pidfd
+        self.init_pidfd: int | None = None
+        self._closed = False
+
+    def signal_init(self, sig: int) -> None:
+        """Send ``sig`` to the guest's init, if it is still running."""
+        if self.init_pidfd is not None:
+            with contextlib.suppress(ProcessLookupError):
+                pidfd_signal(self.init_pidfd, sig)
+
+    def kill(self) -> None:
+        """SIGKILL the init, then bwrap.
+
+        The init first: killing it is what ends the guest, since the kernel kills
+        everything in its PID namespace with it. bwrap alone is not enough: its
+        child arms ``--die-with-parent`` only just before it execs the init, so a
+        bwrap killed before then leaves the init running with no parent to die with.
+        """
+        self.signal_init(signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            pidfd_signal(self.bwrap_pidfd, signal.SIGKILL)
+
+    def close(self) -> None:
+        """Close both pidfds. Does not stop the run; nothing may signal it afterwards."""
+        if self._closed:
+            return
+        self._closed = True
+        if self.init_pidfd is not None:
+            os.close(self.init_pidfd)
+            self.init_pidfd = None
+        os.close(self.bwrap_pidfd)
+
+    def discard(self) -> None:
+        """Kill the run, reap bwrap and release everything: for a launch no :class:`Process` will own."""
+        self.kill()
+        self.popen.wait()
+        for pipe in (self.popen.stdout, self.popen.stderr):
+            if pipe is not None:
+                pipe.close()
+        self.close()
 
 
 class Process:
@@ -119,19 +144,14 @@ class Process:
     :meth:`communicate`); :meth:`terminate` and :meth:`kill` are safe from any.
     """
 
-    def __init__(self, popen: subprocess.Popen[bytes], *, pidfd: int | None, resources: contextlib.ExitStack) -> None:
-        self._popen = popen
-        self._pidfd = pidfd
+    def __init__(self, launch: Launch, *, resources: contextlib.ExitStack) -> None:
+        self._launch = launch
+        self._popen = popen = launch.popen
         self._resources = resources
         self._lock = threading.RLock()
         self._escalation: threading.Timer | None = None
         self._terminated = False
         self._closed = False
-        pidfd_open = getattr(os, 'pidfd_open', None)
-        self._bwrap_pidfd: int | None = None
-        if pidfd_open is not None:
-            with contextlib.suppress(OSError):
-                self._bwrap_pidfd = pidfd_open(popen.pid)
         self._open: dict[int, Stream] = {}
         pipes: tuple[tuple[Stream, typing.IO[bytes] | None], ...] = (('stdout', popen.stdout), ('stderr', popen.stderr))
         for name, pipe in pipes:
@@ -218,17 +238,10 @@ class Process:
             if self._closed or self._popen.poll() is not None or self._terminated:
                 return
             self._terminated = True
-            if self._pidfd is None or grace <= 0:
+            if self._launch.init_pidfd is None or grace <= 0:
                 self._kill()
                 return
-            # Linux-only, as pidfds are; without one we never get here.
-            send = typing.cast(
-                'typing.Callable[[int, int], None] | None',
-                getattr(signal, 'pidfd_send_signal', None),
-            )
-            if send is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    send(self._pidfd, signal.SIGTERM)
+            self._launch.signal_init(signal.SIGTERM)
             self._escalation = threading.Timer(grace, self._kill)
             self._escalation.daemon = True
             self._escalation.start()
@@ -241,24 +254,8 @@ class Process:
 
     def _kill(self) -> None:
         with self._lock:
-            if self._closed:
-                return
-            send = typing.cast(
-                'typing.Callable[[int, int], None] | None',
-                getattr(signal, 'pidfd_send_signal', None),
-            )
-            # SIGKILL the init via its pidfd first. bwrap's --die-with-parent only kills
-            # the guest if PR_SET_PDEATHSIG was set before bwrap died. Signalling the init
-            # from an ancestor namespace guarantees the init and the entire namespace die.
-            if self._pidfd is not None and send is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    send(self._pidfd, signal.SIGKILL)
-            if self._bwrap_pidfd is not None and send is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    send(self._bwrap_pidfd, signal.SIGKILL)
-            elif self._popen.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    self._popen.kill()
+            if not self._closed:
+                self._launch.kill()
 
     def wait(self, timeout: float | None = None) -> int:
         """Wait for the run to end and return its status.
@@ -349,22 +346,10 @@ class Process:
                 if pipe is not None:
                     pipe.close()
             self._open.clear()
-            send = typing.cast(
-                'typing.Callable[[int, int], None] | None',
-                getattr(signal, 'pidfd_send_signal', None),
-            )
-            if self._pidfd is not None:
-                if send is not None:
-                    with contextlib.suppress(OSError):
-                        send(self._pidfd, signal.SIGKILL)
-                os.close(self._pidfd)
-                self._pidfd = None
-            if self._bwrap_pidfd is not None:
-                if send is not None:
-                    with contextlib.suppress(OSError):
-                        send(self._bwrap_pidfd, signal.SIGKILL)
-                os.close(self._bwrap_pidfd)
-                self._bwrap_pidfd = None
+            # Normally a no-op, the run having ended. Not if bwrap died on its own
+            # with the init still running, or close() itself was interrupted.
+            self._launch.kill()
+            self._launch.close()
             self._resources.close()
 
     def __enter__(self) -> typing_extensions.Self:
@@ -385,12 +370,8 @@ class AsyncProcess:
 
     def __init__(self, process: Process) -> None:
         self._process = process
-        pidfd_open = getattr(os, 'pidfd_open', None)
-        self._exit_fd: int | None = None
-        if pidfd_open is not None:
-            with contextlib.suppress(OSError):
-                # bwrap is our own unreaped child, so its pid cannot be recycled yet.
-                self._exit_fd = pidfd_open(process.pid)
+        # Its own descriptor, as the Process closes its pidfd on bwrap when it closes.
+        self._exit_fd: int | None = os.dup(process._launch.bwrap_pidfd)  # noqa: SLF001 — the two faces of one run
 
     @property
     def pid(self) -> int:
@@ -438,7 +419,7 @@ class AsyncProcess:
         """Wait for the run to end and return its status."""
         if self._process.returncode is None:
             if self._exit_fd is None:
-                return await asyncio.to_thread(self._process.wait)
+                raise ValueError('wait() on a closed AsyncProcess')
             loop = asyncio.get_running_loop()
             exited = loop.create_future()
             loop.add_reader(self._exit_fd, _settle, exited)

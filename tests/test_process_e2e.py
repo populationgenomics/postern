@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from postern import Process, Sandbox, SandboxProfile, available
+from postern import IsolationError, Process, Sandbox, SandboxProfile, _process, _sandbox, available
 from postern.build_init import build
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
@@ -272,24 +272,92 @@ def test_cancelling_astart_cleans_up_process(sandbox):
     assert not (sandbox.workspace / 'marker').exists()
 
 
-def test_start_cleans_up_on_init_pid_failure(sandbox, monkeypatch):
+# Long enough to be sure the guest is not just slow, short enough to keep the suite quick.
+_SURVIVOR = 'sleep 0.5; echo survived > /workspace/marker'
+
+
+def _assert_no_survivor(sandbox: Sandbox) -> None:
+    time.sleep(1.0)
+    assert not (sandbox.workspace / 'marker').exists()
+
+
+def test_a_failed_start_leaves_no_guest(sandbox, monkeypatch):
+    # The failure lands once the launch is complete: the guest is running by then.
     resources = contextlib.ExitStack()
-    cleaned_up = False
+    closed = threading.Event()
+    resources.callback(closed.set)
 
-    def cleanup():
-        nonlocal cleaned_up
-        cleaned_up = True
-
-    resources.callback(cleanup)
-
-    def bad_read(*_args, **_kwargs):
+    def fail(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError('boom')
 
-    monkeypatch.setattr('postern._process.read_init_pid', bad_read)
+    monkeypatch.setattr(_process.Process, '__init__', fail)
     with pytest.raises(RuntimeError, match='boom'):
-        sandbox._start(['/bin/true'], resources=resources)
+        sandbox._start(['bash', '-c', _SURVIVOR], resources=resources)
+    assert closed.is_set()
+    _assert_no_survivor(sandbox)
 
-    assert cleaned_up
+
+def test_an_interrupted_start_leaves_no_guest(sandbox, monkeypatch):
+    # Ctrl-C while the caller waits on the launcher thread: the launch finishes
+    # there, and the result nobody received is discarded.
+    real = _sandbox._hold_init
+
+    def slow_hold(*args, **kwargs):
+        pidfd = real(*args, **kwargs)
+        time.sleep(0.3)
+        return pidfd
+
+    def interrupt(*_args: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_sandbox, '_hold_init', slow_hold)
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.1)
+        with pytest.raises(KeyboardInterrupt):
+            sandbox.start_bash(_SURVIVOR)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    _assert_no_survivor(sandbox)
+
+
+def test_no_pidfds_fails_closed_before_launching(sandbox, monkeypatch):
+    def refuse(_pid: int) -> int:
+        raise PermissionError(1, 'blocked by seccomp')
+
+    monkeypatch.setattr(_process, 'pidfd_open', refuse)
+    with pytest.raises(IsolationError, match='pidfds are unavailable'):
+        sandbox.start_bash(_SURVIVOR)
+    _assert_no_survivor(sandbox)
+
+
+@pytest.mark.parametrize(
+    'report',
+    [b'{"child-pid": "1"}', b'[1]', b'{"child-pid"'],
+    ids=['not-an-int', 'not-an-object', 'truncated'],
+)
+def test_an_unusable_init_report_fails_closed(report):
+    read, write = os.pipe()
+    try:
+        os.write(write, report)
+        os.close(write)
+        write = -1
+        with pytest.raises(IsolationError, match='--info-fd report'):
+            _sandbox._read_init_pid(read)
+    finally:
+        os.close(read)
+        if write >= 0:
+            os.close(write)
+
+
+def test_no_init_report_means_no_init():
+    read, write = os.pipe()
+    os.close(write)
+    try:
+        assert _sandbox._read_init_pid(read) is None
+    finally:
+        os.close(read)
 
 
 def test_post_kill_drain_bounds_timeout(sandbox):
@@ -368,8 +436,8 @@ def test_async_communicate_max_output_caps_buffer(sandbox):
 
 def test_release_kills_init_when_bwrap_already_dead(sandbox):
     proc = sandbox.start_bash('sleep 30')
-    assert proc._pidfd is not None
-    init_pidfd = os.dup(proc._pidfd)
+    assert proc._launch.init_pidfd is not None
+    init_pidfd = os.dup(proc._launch.init_pidfd)
     poller = select.poll()
     poller.register(init_pidfd, select.POLLIN)
     try:
@@ -383,10 +451,8 @@ def test_release_kills_init_when_bwrap_already_dead(sandbox):
         proc.close()
         assert poller.poll(1000) != []
     finally:
-        send = getattr(signal, 'pidfd_send_signal', None)
-        if send is not None:
-            with contextlib.suppress(OSError):
-                send(init_pidfd, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            _process.pidfd_signal(init_pidfd, signal.SIGKILL)
         os.close(init_pidfd)
 
 
