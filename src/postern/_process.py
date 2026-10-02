@@ -18,8 +18,8 @@ stalls the guest. A caller who wants one stream can write ``2>&1``.
 init's host pid on ``--info-fd``, and a pidfd is opened on it at start, so the
 signal can only ever reach that process even after its pid is recycled. The init
 forwards SIGTERM to the command (the C init to its whole process group); if the
-command is still running when ``grace`` expires, bwrap is killed and the kernel
-tears the namespace down.
+command is still running when ``grace`` expires, the init is SIGKILLed through
+the same pidfd, and the kernel kills everything in its PID namespace with it.
 """
 
 from __future__ import annotations
@@ -231,7 +231,7 @@ class Process:
         or been stopped.
 
         Args:
-            grace: Seconds to allow after SIGTERM before the sandbox is killed. 0
+            grace: Seconds to allow after SIGTERM before the run is killed. 0
                 kills it at once.
         """
         with self._lock:
@@ -315,7 +315,7 @@ class Process:
         return _result(self._popen.returncode, out, err, timed_out=timed_out, truncated=truncated)
 
     def close(self) -> None:
-        """Stop the run if it is still going, and release its pipes, pidfd and hatches.
+        """Stop the run if it is still going, and release its pipes, pidfds and hatches.
 
         A run still going is stopped gracefully: SIGTERM, and a kill if it outlives
         a short grace. Its remaining output is discarded meanwhile, so a command

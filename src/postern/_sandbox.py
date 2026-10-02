@@ -164,10 +164,12 @@ def available() -> bool:
 
 
 class IsolationError(RuntimeError):
-    """A boot-time isolation self-test found a load-bearing control unenforced.
+    """A load-bearing control cannot be enforced here.
 
     Raised by :meth:`Sandbox.verify`, so a worker can refuse to serve rather than
-    run untrusted code with weaker isolation than intended.
+    run untrusted code with weaker isolation than intended, and by a launch that
+    could not hold the guest's init by pidfd, without which a stop could not be
+    sure of reaching it.
     """
 
 
