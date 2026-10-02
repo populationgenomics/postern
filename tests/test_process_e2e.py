@@ -6,8 +6,11 @@ must turn a SIGTERM from the host into one the command sees.
 
 import asyncio
 import contextlib
+import os
 import pathlib
+import select
 import shutil
+import signal
 import threading
 import time
 
@@ -361,3 +364,47 @@ def test_async_communicate_max_output_caps_buffer(sandbox):
     assert result.truncated
     assert not result.timed_out
     assert '[postern] output truncated' in result.stderr
+
+
+def test_release_kills_init_when_bwrap_already_dead(sandbox):
+    proc = sandbox.start_bash('sleep 30')
+    assert proc._pidfd is not None
+    init_pidfd = os.dup(proc._pidfd)
+    poller = select.poll()
+    poller.register(init_pidfd, select.POLLIN)
+    try:
+        # bwrap dying out-of-band does not kill the guest init immediately
+        os.kill(proc._popen.pid, signal.SIGKILL)
+        proc._popen.wait()
+        assert proc._popen.poll() is not None
+        assert poller.poll(0) == []
+
+        # proc.close() must kill the guest init via its pidfd in _release()
+        proc.close()
+        assert poller.poll(1000) != []
+    finally:
+        send = getattr(signal, 'pidfd_send_signal', None)
+        if send is not None:
+            with contextlib.suppress(OSError):
+                send(init_pidfd, signal.SIGKILL)
+        os.close(init_pidfd)
+
+
+def test_launch_thread_keeps_bwrap_alive_when_spawner_thread_exits(sandbox):
+    proc_box = []
+
+    def worker():
+        p = sandbox.start_bash('sleep 0.3; echo ok > /workspace/marker')
+        proc_box.append(p)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+
+    proc = proc_box[0]
+    try:
+        result = proc.communicate(timeout=2.0)
+        assert result.returncode == 0
+        assert (sandbox.workspace / 'marker').read_text() == 'ok\n'
+    finally:
+        proc.close()

@@ -349,10 +349,20 @@ class Process:
                 if pipe is not None:
                     pipe.close()
             self._open.clear()
+            send = typing.cast(
+                'typing.Callable[[int, int], None] | None',
+                getattr(signal, 'pidfd_send_signal', None),
+            )
             if self._pidfd is not None:
+                if send is not None:
+                    with contextlib.suppress(OSError):
+                        send(self._pidfd, signal.SIGKILL)
                 os.close(self._pidfd)
                 self._pidfd = None
             if self._bwrap_pidfd is not None:
+                if send is not None:
+                    with contextlib.suppress(OSError):
+                        send(self._bwrap_pidfd, signal.SIGKILL)
                 os.close(self._bwrap_pidfd)
                 self._bwrap_pidfd = None
             self._resources.close()

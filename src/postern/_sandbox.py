@@ -29,10 +29,12 @@ import functools
 import json
 import os
 import pathlib
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import typing
 
 from postern import _process, _seccomp, _workspace
@@ -386,6 +388,66 @@ def _stub_binds(
     return binds
 
 
+_T = typing.TypeVar('_T')
+
+
+class _Launcher:
+    """Run callables on a persistent launcher thread.
+
+    Under Linux, ``prctl(PR_SET_PDEATHSIG, SIGKILL)`` (configured by bwrap's
+    ``--die-with-parent``) is thread-scoped: the signal fires when the thread that
+    called ``clone`` exits. Running every ``Popen`` on one long-lived daemon thread
+    ensures bwrap's parent thread does not prematurely exit when caller threads
+    or worker pool threads finish.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._queue: (
+            queue.Queue[tuple[collections.abc.Callable[[], typing.Any], threading.Event, list[typing.Any]]] | None
+        ) = None
+
+    def _worker(
+        self,
+        q: queue.Queue[tuple[collections.abc.Callable[[], typing.Any], threading.Event, list[typing.Any]]],
+    ) -> None:
+        while True:
+            fn, done, box = q.get()
+            try:
+                box.append(fn())
+            except BaseException as exc:  # noqa: BLE001 — re-raised in caller
+                box.append(exc)
+            finally:
+                done.set()
+
+    def launch(self, fn: collections.abc.Callable[[], _T]) -> _T:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive() or self._queue is None:
+                self._queue = queue.Queue()
+                self._thread = threading.Thread(
+                    target=self._worker,
+                    args=(self._queue,),
+                    name='postern-launcher',
+                    daemon=True,
+                )
+                self._thread.start()
+            q = self._queue
+
+        done = threading.Event()
+        box: list[typing.Any] = []
+        q.put((fn, done, box))
+        done.wait()
+        res = box[0]
+        if isinstance(res, BaseException):
+            raise res
+        return typing.cast('_T', res)
+
+
+_launcher = _Launcher()
+_launch = _launcher.launch
+
+
 class Sandbox:
     """A hardened bubblewrap sandbox with optional :class:`Hatch` channels.
 
@@ -519,23 +581,25 @@ class Sandbox:
             cmd += ['--', *argv]
             # Bytes, decoded by Process. Cast because the credentials splat is Any,
             # which lets the type checker pick Popen's text-mode overload.
-            popen = typing.cast(
-                'subprocess.Popen[bytes]',
-                subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    # Scrub bwrap's own environment: it is PID 1 in the guest's
-                    # namespace at the guest uid, so an inherited secret would be
-                    # readable from inside via /proc/1/environ (see bwrap_env).
-                    env=bwrap_env(),
-                    pass_fds=(info_write,) if fd is None else (fd, info_write),
-                    # Run bwrap at a non-root real uid when we are root, so the
-                    # guest's kernel uid (which bwrap maps --uid onto) is non-root and
-                    # owns none of root's files (see bwrap_credentials).
-                    **bwrap_credentials(self._profile, os.geteuid()),
-                ),
+            popen = _launch(
+                lambda: typing.cast(
+                    'subprocess.Popen[bytes]',
+                    subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        # Scrub bwrap's own environment: it is PID 1 in the guest's
+                        # namespace at the guest uid, so an inherited secret would be
+                        # readable from inside via /proc/1/environ (see bwrap_env).
+                        env=bwrap_env(),
+                        pass_fds=(info_write,) if fd is None else (fd, info_write),
+                        # Run bwrap at a non-root real uid when we are root, so the
+                        # guest's kernel uid (which bwrap maps --uid onto) is non-root and
+                        # owns none of root's files (see bwrap_credentials).
+                        **bwrap_credentials(self._profile, os.geteuid()),
+                    ),
+                )
             )
         except BaseException:
             os.close(info_read)
@@ -697,7 +761,7 @@ class Sandbox:
                 with contextlib.suppress(Exception):
                     proc = f.result()
                     proc.kill()
-                    proc.close()
+                    loop.run_in_executor(None, proc.close)
 
             future.add_done_callback(_cleanup)
             raise
