@@ -112,6 +112,7 @@ def _exec_work() -> NoReturn:
     supervisor, waiting on siblings it does not own.
     """
     try:
+        _restore_signals()
         _apply_rlimits(address_space=not os.environ.get('POSTERN_RECODE'))
         argv = json.loads(os.environ.get('POSTERN_ARGV') or '[]')
     except BaseException:
@@ -126,21 +127,44 @@ def _exec_work() -> NoReturn:
         os._exit(127)
 
 
+# The signals PID 1 forwards to the work.
+_FORWARDED = (signal.SIGTERM, signal.SIGINT)
+# CPython ignores these at startup, and an ignored disposition survives exec, so a
+# program run under this shim would not die of a broken pipe or an RLIMIT_FSIZE
+# breach. subprocess undoes it with restore_signals; a bare execvp must too.
+_IGNORED_BY_PYTHON = tuple(getattr(signal, name) for name in ('SIGPIPE', 'SIGXFSZ') if hasattr(signal, name))
+# The mask in force before the forwarded signals were blocked for the fork.
+_original_mask: set[signal.Signals] = set()
+
+
+def _restore_signals() -> None:
+    """In the child: undo what the init set up, so the work starts with a clean signal state."""
+    for sig in _IGNORED_BY_PYTHON:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, _original_mask)
+
+
 def _supervise() -> int:
     """Run as PID 1: fork the work, reap the namespace, return the work's status."""
+    # PID 1 gets no default signal action, so a SIGTERM/SIGINT arriving while this
+    # init has no handler is dropped rather than reaching the work. Block them across
+    # the fork: a blocked signal is held pending, not dropped, and the handler below
+    # receives it once installed. The child restores the mask before it execs.
+    global _original_mask  # noqa: PLW0603 — set once, read by the forked child
+    _original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARDED)
     child = os.fork()
     if child == 0:
         _exec_work()
 
-    # PID 1 gets no default signal action, so an unhandled SIGTERM/SIGINT would be
-    # dropped rather than reaching the work. Suppress ProcessLookupError: a signal
-    # arriving after the child is reaped must not raise out of the handler.
+    # Suppress ProcessLookupError: a signal arriving after the child is reaped must
+    # not raise out of the handler.
     def _forward(sig: int, _frame: object, target: int = child) -> None:
         with contextlib.suppress(ProcessLookupError):
             os.kill(target, sig)
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    for sig in _FORWARDED:
         signal.signal(sig, _forward)
+    signal.pthread_sigmask(signal.SIG_SETMASK, _original_mask)
     # Reap orphaned descendants reparented here along the way. Anything still
     # alive when PID 1 exits is SIGKILLed by the kernel.
     while True:

@@ -88,6 +88,26 @@ def test_rlimit_as_caps_bash_but_not_python_startup(profile):
     assert result.stdout.strip() == '499500'
 
 
+def test_the_work_dies_of_a_broken_pipe(profile):
+    # CPython ignores SIGPIPE at startup; the shim must not pass that on, so a
+    # writer to a closed pipe dies of it (141) under either init, rather than
+    # getting EPIPE and possibly spinning until the timeout.
+    result = Sandbox(profile()).run_bash('yes | head -1 >/dev/null; echo "${PIPESTATUS[0]}"')
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == '141'
+
+
+def test_the_work_starts_with_no_signals_ignored_or_blocked(profile):
+    result = Sandbox(profile()).run_bash('grep -E "^Sig(Ign|Blk):" /proc/self/status')
+    assert result.ok, result.stderr
+    fields = dict(line.split(':\t') for line in result.stdout.strip().splitlines())
+    assert int(fields['SigBlk'], 16) == 0
+    # bash ignores a few job-control signals itself, but neither PIPE (13) nor XFSZ (25).
+    ignored = int(fields['SigIgn'], 16)
+    assert not ignored & (1 << (13 - 1))
+    assert not ignored & (1 << (25 - 1))
+
+
 def test_pid1_is_the_init_and_is_non_dumpable(profile):
     script = 'echo $$; cat /proc/1/environ >/dev/null 2>&1 && echo READABLE || echo blocked'
     result = Sandbox(profile()).run_bash(script)
