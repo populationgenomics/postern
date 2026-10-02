@@ -43,6 +43,8 @@ import typing
 from postern import _process, _seccomp, _workspace
 
 if typing.TYPE_CHECKING:
+    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
+    # the floor is 3.10, so the backport must stay behind this guard.
     import typing_extensions
 
 _GUEST_DIR = '/run/postern'
@@ -171,21 +173,6 @@ class IsolationError(RuntimeError):
     could not hold the guest's init by pidfd, without which a stop could not be
     sure of reaching it.
     """
-
-
-@dataclasses.dataclass
-class ProcResult:
-    """The outcome of one guest run."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-    timed_out: bool = False
-    truncated: bool = False
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0 and not self.timed_out
 
 
 @dataclasses.dataclass
@@ -666,6 +653,17 @@ def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile
         os.close(info_read)
 
 
+def _discard_started(future: asyncio.Future[_process.Process]) -> None:
+    """Stop and close a run whose start finished after the task awaiting it was cancelled."""
+    if future.cancelled() or future.exception() is not None:
+        return  # a start that failed has already released what it started
+    process = future.result()
+    process.kill()
+    # On a thread of its own rather than the loop's executor: a loop shutting down
+    # refuses new work, which would leave the hatches serving.
+    threading.Thread(target=process.close, name='postern-discard').start()
+
+
 class Sandbox:
     """A hardened bubblewrap sandbox with optional :class:`Hatch` channels.
 
@@ -869,7 +867,7 @@ class Sandbox:
             raise
         return self._start(entrypoint, resources=stack, setenv=env, extra_binds=binds)
 
-    def run(self, argv: list[str], *, timeout: float = 60, max_output: int | None = None) -> ProcResult:
+    def run(self, argv: list[str], *, timeout: float = 60, max_output: int | None = None) -> _process.ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
 
         The entrypoint for a program that is not Python. It runs under the same
@@ -888,7 +886,7 @@ class Sandbox:
 
     def run_bash(
         self, script: str, *, shell: str = 'bash', timeout: float = 60, max_output: int | None = None
-    ) -> ProcResult:
+    ) -> _process.ProcResult:
         """Run ``script`` inside the sandbox as ``shell -c script``.
 
         Args:
@@ -905,7 +903,7 @@ class Sandbox:
         """
         return self.start_bash(script, shell=shell).communicate(timeout, max_output=max_output)
 
-    def run_python(self, code: str, *, timeout: float = 60, max_output: int | None = None) -> ProcResult:
+    def run_python(self, code: str, *, timeout: float = 60, max_output: int | None = None) -> _process.ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
         The shim's child re-execs ``profile.python`` to run ``code``, so the code
@@ -947,18 +945,14 @@ class Sandbox:
         try:
             process = await asyncio.shield(future)
         except asyncio.CancelledError:
-
-            def _cleanup(f: asyncio.Future[_process.Process]) -> None:
-                if f.cancelled() or f.exception() is not None:
-                    return
-                with contextlib.suppress(Exception):
-                    proc = f.result()
-                    proc.kill()
-                    loop.run_in_executor(None, proc.close)
-
-            future.add_done_callback(_cleanup)
+            future.add_done_callback(_discard_started)
             raise
-        return _process.AsyncProcess(process)
+        try:
+            return _process.AsyncProcess(process)
+        except BaseException:
+            process.kill()
+            process.close()
+            raise
 
     async def astart(self, argv: list[str]) -> _process.AsyncProcess:
         """Start ``argv`` as :meth:`start` does, for asyncio. Use with ``async with``."""

@@ -25,7 +25,9 @@ the same pidfd, and the kernel kills everything in its PID namespace with it.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import contextlib
+import dataclasses
 import errno
 import os
 import selectors
@@ -36,11 +38,9 @@ import time
 import typing
 
 if typing.TYPE_CHECKING:
-    import collections.abc
-
+    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
+    # the floor is 3.10, so the backport must stay behind this guard.
     import typing_extensions
-
-    import postern._sandbox
 
 _READ_SIZE = 65536
 # How long closing a still-running process allows it to stop on SIGTERM before it
@@ -52,6 +52,21 @@ _POST_KILL_DRAIN_S = 1.0
 
 # Which of the guest's pipes a chunk of output came from.
 Stream = typing.Literal['stdout', 'stderr']
+
+
+@dataclasses.dataclass
+class ProcResult:
+    """The outcome of one guest run."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    truncated: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0 and not self.timed_out
 
 
 def pidfd_open(pid: int) -> int:
@@ -265,9 +280,7 @@ class Process:
         """
         return self._popen.wait(timeout)
 
-    def communicate(
-        self, timeout: float | None = None, *, max_output: int | None = None
-    ) -> postern._sandbox.ProcResult:
+    def communicate(self, timeout: float | None = None, *, max_output: int | None = None) -> ProcResult:
         """Read the rest of the output, wait for the run to end, and close it.
 
         On ``timeout`` the sandbox is killed and the result is status 124 with
@@ -430,9 +443,7 @@ class AsyncProcess:
                 loop.remove_reader(self._exit_fd)
         return self._process.wait()
 
-    async def communicate(
-        self, timeout: float | None = None, *, max_output: int | None = None
-    ) -> postern._sandbox.ProcResult:
+    async def communicate(self, timeout: float | None = None, *, max_output: int | None = None) -> ProcResult:
         """Read the rest of the output, wait for the run to end, and close it. See :meth:`Process.communicate`."""
         out, err = bytearray(), bytearray()
         truncated = False
@@ -512,13 +523,11 @@ def _result(
     *,
     timed_out: bool,
     truncated: bool = False,
-) -> postern._sandbox.ProcResult:
-    from postern import _sandbox  # noqa: PLC0415 — _sandbox imports this module
-
+) -> ProcResult:
     stdout, stderr = bytes(out).decode('utf-8', 'replace'), bytes(err).decode('utf-8', 'replace')
     if truncated:
         stderr = (stderr + '\n' if stderr else '') + '[postern] output truncated'
     if timed_out:
         stderr = (stderr + '\n' if stderr else '\n') + '[postern] timed out'
-        return _sandbox.ProcResult(124, stdout, stderr, timed_out=True, truncated=truncated)
-    return _sandbox.ProcResult(typing.cast('int', returncode), stdout, stderr, timed_out=False, truncated=truncated)
+        return ProcResult(124, stdout, stderr, timed_out=True, truncated=truncated)
+    return ProcResult(typing.cast('int', returncode), stdout, stderr, timed_out=False, truncated=truncated)

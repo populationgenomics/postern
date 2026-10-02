@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import importlib.metadata
 
-from postern._process import AsyncProcess, Process
-from postern._sandbox import IsolationError, ProcResult, Sandbox, SandboxProfile, available
+from postern._process import AsyncProcess, Process, ProcResult
+from postern._sandbox import IsolationError, Sandbox, SandboxProfile, available
 from postern._workspace import (
     Workspace,
     WorkspaceError,
