@@ -10,9 +10,9 @@ import asyncio
 import contextlib
 import os
 import pathlib
-import select
 import shutil
 import signal
+import subprocess
 import threading
 import time
 import typing
@@ -483,26 +483,21 @@ def test_async_communicate_max_output_caps_buffer(sandbox):
     assert '[postern] output truncated' in result.stderr
 
 
-def test_release_kills_init_when_bwrap_already_dead(sandbox):
-    proc = sandbox.start_bash('sleep 30')
-    assert proc._launch.init_pidfd is not None
-    init_pidfd = os.dup(proc._launch.init_pidfd)
-    poller = select.poll()
-    poller.register(init_pidfd, select.POLLIN)
+def test_close_kills_the_init_when_bwrap_has_already_exited():
+    # A guest init can outlive bwrap only in the moment before it arms
+    # --die-with-parent, too brief to arrange with a real one. Host processes
+    # stand in for both, so the state is certain: "bwrap" gone, "init" running.
+    bwrap = subprocess.Popen(['true'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    init = subprocess.Popen(['sleep', '30'])
     try:
-        # bwrap dying out-of-band does not kill the guest init immediately
-        os.kill(proc._popen.pid, signal.SIGKILL)
-        proc._popen.wait()
-        assert proc._popen.poll() is not None
-        assert poller.poll(0) == []
-
-        # proc.close() must kill the guest init via its pidfd in _release()
-        proc.close()
-        assert poller.poll(1000) != []
+        launch = _process.Launch(bwrap, _process.pidfd_open(bwrap.pid))
+        launch.init_pidfd = _process.pidfd_open(init.pid)
+        bwrap.wait()
+        _process.Process(launch, resources=contextlib.ExitStack()).close()
+        assert init.wait(timeout=2) == -signal.SIGKILL
     finally:
-        with contextlib.suppress(OSError):
-            _process.pidfd_signal(init_pidfd, signal.SIGKILL)
-        os.close(init_pidfd)
+        init.kill()
+        init.wait()
 
 
 def test_launch_thread_keeps_bwrap_alive_when_spawner_thread_exits(sandbox):
