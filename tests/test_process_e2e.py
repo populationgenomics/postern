@@ -540,6 +540,57 @@ def test_close_kills_the_init_when_bwrap_has_already_exited():
         init.wait()
 
 
+def test_a_closed_launch_signals_nothing():
+    # Its pidfd's number, once closed, can name another process's pidfd.
+    bwrap = subprocess.Popen(['sleep', '30'])
+    bystander = subprocess.Popen(['sleep', '30'])
+    try:
+        launch = _process.Launch(bwrap, _process.pidfd_open(bwrap.pid))
+        number = launch.bwrap_pidfd
+        launch.close()
+        reused = _process.pidfd_open(bystander.pid)
+        try:
+            assert reused == number
+            launch.kill()
+            launch.signal_init(signal.SIGKILL)
+            with pytest.raises(subprocess.TimeoutExpired):
+                bystander.wait(0.5)
+        finally:
+            os.close(reused)
+    finally:
+        for process in (bwrap, bystander):
+            process.kill()
+            process.wait()
+
+
+def test_concurrent_closes_are_one_close(sandbox):
+    process = sandbox.start_bash('sleep 30')
+    errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            process.close()
+        except BaseException as exc:  # noqa: BLE001 — collected for the assertion
+            errors.append(exc)
+
+    closers = [threading.Thread(target=close) for _ in range(4)]
+    for closer in closers:
+        closer.start()
+    for closer in closers:
+        closer.join(10)
+    assert not errors
+    assert process.returncode is not None
+
+
+def test_concurrent_acloses_are_one_close(sandbox):
+    async def main() -> int | None:
+        process = await sandbox.astart_bash('sleep 30')
+        await asyncio.gather(*(process.aclose() for _ in range(3)))
+        return process.returncode
+
+    assert asyncio.run(main()) is not None
+
+
 def test_launch_thread_keeps_bwrap_alive_when_spawner_thread_exits(sandbox):
     proc_box = []
 

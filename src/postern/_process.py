@@ -105,19 +105,24 @@ class Launch:
     never reach a recycled pid, however late it is sent. ``init_pidfd`` is None
     only when no init is running: bwrap failed before starting one, or it has
     already exited, and its exit took the guest's namespace with it.
+
+    Safe from any thread. Signalling is a no-op once :meth:`close` has run: a
+    closed descriptor's number can be reused by an unrelated pidfd.
     """
 
     def __init__(self, popen: subprocess.Popen[bytes], bwrap_pidfd: int) -> None:
         self.popen = popen
         self.bwrap_pidfd = bwrap_pidfd
         self.init_pidfd: int | None = None
+        self._lock = threading.Lock()
         self._closed = False
 
     def signal_init(self, sig: int) -> None:
         """Send ``sig`` to the guest's init, if it is still running."""
-        if self.init_pidfd is not None:
-            with contextlib.suppress(ProcessLookupError):
-                pidfd_signal(self.init_pidfd, sig)
+        with self._lock:
+            if not self._closed and self.init_pidfd is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    pidfd_signal(self.init_pidfd, sig)
 
     def kill(self) -> None:
         """SIGKILL the init, then bwrap.
@@ -127,19 +132,24 @@ class Launch:
         child arms ``--die-with-parent`` only just before it execs the init, so a
         bwrap killed before then leaves the init running with no parent to die with.
         """
-        self.signal_init(signal.SIGKILL)
-        with contextlib.suppress(ProcessLookupError):
-            pidfd_signal(self.bwrap_pidfd, signal.SIGKILL)
+        with self._lock:
+            if self._closed:
+                return
+            for pidfd in (self.init_pidfd, self.bwrap_pidfd):
+                if pidfd is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        pidfd_signal(pidfd, signal.SIGKILL)
 
     def close(self) -> None:
-        """Close both pidfds. Does not stop the run; nothing may signal it afterwards."""
-        if self._closed:
-            return
-        self._closed = True
-        if self.init_pidfd is not None:
-            os.close(self.init_pidfd)
-            self.init_pidfd = None
-        os.close(self.bwrap_pidfd)
+        """Close both pidfds. Does not stop the run, and signals nothing afterwards."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self.init_pidfd is not None:
+                os.close(self.init_pidfd)
+                self.init_pidfd = None
+            os.close(self.bwrap_pidfd)
 
     def discard(self) -> None:
         """Kill the run, reap bwrap and release everything: for a launch no :class:`Process` will own."""
@@ -166,7 +176,9 @@ class Process:
         self._lock = threading.RLock()
         self._escalation: threading.Timer | None = None
         self._terminated = False
+        self._closing = False
         self._closed = False
+        self._released = threading.Event()
         self._open: dict[int, Stream] = {}
         pipes: tuple[tuple[Stream, typing.IO[bytes] | None], ...] = (('stdout', popen.stdout), ('stderr', popen.stderr))
         for name, pipe in pipes:
@@ -332,11 +344,15 @@ class Process:
 
         A run still going is stopped gracefully: SIGTERM, and a kill if it outlives
         a short grace. Its remaining output is discarded meanwhile, so a command
-        printing on its way out cannot stall on a full pipe.
+        printing on its way out cannot stall on a full pipe. Safe from any thread:
+        a call while another is closing waits for that one to finish.
         """
         with self._lock:
-            if self._closed:
-                return
+            first = not self._closing
+            self._closing = True
+        if not first:
+            self._released.wait()
+            return
         try:
             if self._popen.poll() is None:
                 self.terminate(grace=_CLOSE_GRACE_S)
@@ -351,19 +367,22 @@ class Process:
             self._release()
 
     def _release(self) -> None:
-        with self._lock:
-            self._closed = True
-            if self._escalation is not None:
-                self._escalation.cancel()
-            for pipe in (self._popen.stdout, self._popen.stderr):
-                if pipe is not None:
-                    pipe.close()
-            self._open.clear()
-            # Normally a no-op, the run having ended. Not if bwrap died on its own
-            # with the init still running, or close() itself was interrupted.
-            self._launch.kill()
-            self._launch.close()
-            self._resources.close()
+        try:
+            with self._lock:
+                self._closed = True
+                if self._escalation is not None:
+                    self._escalation.cancel()
+                for pipe in (self._popen.stdout, self._popen.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                self._open.clear()
+                # Normally a no-op, the run having ended. Not if bwrap died on its own
+                # with the init still running, or close() itself was interrupted.
+                self._launch.kill()
+                self._launch.close()
+                self._resources.close()
+        finally:
+            self._released.set()
 
     def __enter__(self) -> typing_extensions.Self:
         return self
@@ -385,6 +404,7 @@ class AsyncProcess:
         self._process = process
         # Its own descriptor, as the Process closes its pidfd on bwrap when it closes.
         self._exit_fd: int | None = os.dup(process._launch.bwrap_pidfd)  # noqa: SLF001 — the two faces of one run
+        self._closing: asyncio.Future[None] | None = None
 
     @property
     def pid(self) -> int:
@@ -481,7 +501,16 @@ class AsyncProcess:
         return _result(self._process.returncode, out, err, timed_out=timed_out, truncated=truncated)
 
     async def aclose(self) -> None:
-        """Stop the run if it is still going, and release it. See :meth:`Process.close`."""
+        """Stop the run if it is still going, and release it. See :meth:`Process.close`.
+
+        The stop runs as a task of its own, which every call awaits: a second call,
+        or one whose caller is cancelled, neither starts another nor cuts it short.
+        """
+        if self._closing is None:
+            self._closing = asyncio.ensure_future(self._aclose())
+        await asyncio.shield(self._closing)
+
+    async def _aclose(self) -> None:
         try:
             if self._process.returncode is None:
                 self.terminate(grace=_CLOSE_GRACE_S)
