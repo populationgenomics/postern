@@ -243,3 +243,47 @@ def test_cancelling_the_task_stops_the_run_gracefully(sandbox):
     process = asyncio.run(main())
     assert process.returncode == 0
     assert (sandbox.workspace / 'marker').read_text() == 'cleaned\n'
+
+
+def test_cancelling_astart_cleans_up_process(sandbox):
+    started = threading.Event()
+    orig_start = sandbox.start_bash
+
+    def slow_start(*args, **kwargs):
+        started.set()
+        time.sleep(0.1)
+        return orig_start(*args, **kwargs)
+
+    sandbox.start_bash = slow_start
+
+    async def main():
+        task = asyncio.create_task(sandbox.astart_bash('sleep 0.5; echo survived > /workspace/marker'))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.8)
+
+    asyncio.run(main())
+    assert not (sandbox.workspace / 'marker').exists()
+
+
+def test_start_cleans_up_on_init_pid_failure(sandbox, monkeypatch):
+    resources = contextlib.ExitStack()
+    cleaned_up = False
+
+    def cleanup():
+        nonlocal cleaned_up
+        cleaned_up = True
+
+    resources.callback(cleanup)
+
+    def bad_read(*_args, **_kwargs):
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr('postern._process.read_init_pid', bad_read)
+    with pytest.raises(RuntimeError, match='boom'):
+        sandbox._start(['/bin/true'], resources=resources)
+
+    assert cleaned_up

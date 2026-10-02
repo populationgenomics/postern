@@ -22,8 +22,10 @@ reports whether the runtime can launch here.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import contextlib
 import dataclasses
+import functools
 import json
 import os
 import pathlib
@@ -32,15 +34,11 @@ import shutil
 import subprocess
 import tempfile
 import typing
-from collections.abc import Callable, Sequence
 
 from postern import _process, _seccomp, _workspace
-from postern._process import AsyncProcess, Process
 
 if typing.TYPE_CHECKING:
-    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
-    # the floor is 3.10, so the backport must stay behind this guard.
-    from typing_extensions import Self
+    import typing_extensions
 
 _GUEST_DIR = '/run/postern'
 _GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # the unnamed hatch (GrpcHatch) → POSTERN_HATCH
@@ -250,7 +248,7 @@ class SandboxProfile:
     rootfs: pathlib.Path | None = None
     python: str = 'python3'
     ro_binds: list[tuple[str, str]] = dataclasses.field(default_factory=list)
-    stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None
+    stubs: str | os.PathLike[str] | collections.abc.Sequence[str | os.PathLike[str]] | None = None
     env: dict[str, str] = dataclasses.field(default_factory=lambda: {'PATH': '/usr/local/bin:/usr/bin:/bin'})
     seccomp: bool = True
     rlimit_nproc: int = 1024
@@ -369,7 +367,9 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     return argv
 
 
-def _stub_binds(stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]) -> list[str]:
+def _stub_binds(
+    stubs: str | os.PathLike[str] | collections.abc.Sequence[str | os.PathLike[str]],
+) -> list[str]:
     """Bwrap flags injecting importable stubs at ``/run/postern/stubs``.
 
     A directory is bound whole; a sequence of files is bound each to its basename
@@ -392,7 +392,12 @@ class Sandbox:
     path and environment variable.
     """
 
-    def __init__(self, profile: SandboxProfile | None = None, *, hatch: Hatch | Sequence[Hatch] | None = None) -> None:
+    def __init__(
+        self,
+        profile: SandboxProfile | None = None,
+        *,
+        hatch: Hatch | collections.abc.Sequence[Hatch] | None = None,
+    ) -> None:
         self._profile = profile or SandboxProfile()
         if hatch is None:
             self._hatches: list[Hatch] = []
@@ -435,7 +440,7 @@ class Sandbox:
         ):
             self._reject_duplicates(label, derive)
 
-    def _reject_duplicates(self, label: str, derive: Callable[[Hatch], str]) -> None:
+    def _reject_duplicates(self, label: str, derive: collections.abc.Callable[[Hatch], str]) -> None:
         """Raise if two configured hatches derive the same value."""
         seen: dict[str, list[str]] = {}
         for hatch in self._hatches:
@@ -483,7 +488,7 @@ class Sandbox:
         resources: contextlib.ExitStack,
         setenv: dict[str, str] | None = None,
         extra_binds: list[str] | None = None,
-    ) -> Process:
+    ) -> _process.Process:
         """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
 
         ``resources`` (the hatches' serving contexts) passes to the Process, which
@@ -539,12 +544,20 @@ class Sandbox:
             if seccomp is not None:
                 seccomp.close()
         try:
-            pidfd = _process.open_pidfd(_process.read_init_pid(info_read), popen)
-        finally:
-            os.close(info_read)
-        return Process(popen, pidfd=pidfd, resources=resources)
+            try:
+                pidfd = _process.open_pidfd(_process.read_init_pid(info_read), popen)
+            finally:
+                os.close(info_read)
+            return _process.Process(popen, pidfd=pidfd, resources=resources)
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                popen.kill()
+            with contextlib.suppress(Exception):
+                popen.wait()
+            resources.close()
+            raise
 
-    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False) -> Process:
+    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False) -> _process.Process:
         """Start ``work_argv`` under the guest's init, with every hatch bound and served.
 
         The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.
@@ -643,7 +656,7 @@ class Sandbox:
         """
         return self.start_python(code).communicate(timeout)
 
-    def start(self, argv: list[str]) -> Process:
+    def start(self, argv: list[str]) -> _process.Process:
         """Start ``argv`` in the sandbox, as :meth:`run` does, and return at once.
 
         The :class:`Process` streams the output as it arrives
@@ -652,25 +665,49 @@ class Sandbox:
         """
         return self._supervised(list(argv))
 
-    def start_bash(self, script: str, *, shell: str = 'bash') -> Process:
+    def start_bash(self, script: str, *, shell: str = 'bash') -> _process.Process:
         """Start ``shell -c script`` in the sandbox, as :meth:`run_bash` does, and return at once."""
         return self._supervised([shell, '-c', script])
 
-    def start_python(self, code: str) -> Process:
+    def start_python(self, code: str) -> _process.Process:
         """Start ``code`` in the sandbox, as :meth:`run_python` does, and return at once."""
         return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True)
 
-    async def astart(self, argv: list[str]) -> AsyncProcess:
+    async def _astart(
+        self,
+        starter: collections.abc.Callable[..., _process.Process],
+        *args: object,
+        **kwargs: object,
+    ) -> _process.AsyncProcess:
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, functools.partial(starter, *args, **kwargs))
+        try:
+            process = await asyncio.shield(future)
+        except asyncio.CancelledError:
+
+            def _cleanup(f: asyncio.Future[_process.Process]) -> None:
+                if f.cancelled() or f.exception() is not None:
+                    return
+                with contextlib.suppress(Exception):
+                    proc = f.result()
+                    proc.kill()
+                    proc.close()
+
+            future.add_done_callback(_cleanup)
+            raise
+        return _process.AsyncProcess(process)
+
+    async def astart(self, argv: list[str]) -> _process.AsyncProcess:
         """Start ``argv`` as :meth:`start` does, for asyncio. Use with ``async with``."""
-        return AsyncProcess(await asyncio.to_thread(self.start, argv))
+        return await self._astart(self.start, argv)
 
-    async def astart_bash(self, script: str, *, shell: str = 'bash') -> AsyncProcess:
+    async def astart_bash(self, script: str, *, shell: str = 'bash') -> _process.AsyncProcess:
         """Start ``shell -c script`` as :meth:`start_bash` does, for asyncio."""
-        return AsyncProcess(await asyncio.to_thread(self.start_bash, script, shell=shell))
+        return await self._astart(self.start_bash, script, shell=shell)
 
-    async def astart_python(self, code: str) -> AsyncProcess:
+    async def astart_python(self, code: str) -> _process.AsyncProcess:
         """Start ``code`` as :meth:`start_python` does, for asyncio."""
-        return AsyncProcess(await asyncio.to_thread(self.start_python, code))
+        return await self._astart(self.start_python, code)
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.
@@ -719,7 +756,7 @@ class Sandbox:
         if self._own_workspace:
             shutil.rmtree(self._workspace, ignore_errors=True)
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> typing_extensions.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
