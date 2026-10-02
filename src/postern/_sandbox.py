@@ -173,10 +173,12 @@ class ProcResult:
     returncode: int
     stdout: str
     stderr: str
+    timed_out: bool = False
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0
+        return self.returncode == 0 and not self.timed_out
 
 
 @dataclasses.dataclass
@@ -610,7 +612,7 @@ class Sandbox:
             raise
         return self._start(entrypoint, resources=stack, setenv=env, extra_binds=binds)
 
-    def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
+    def run(self, argv: list[str], *, timeout: float = 60, max_output: int | None = None) -> ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
 
         The entrypoint for a program that is not Python. It runs under the same
@@ -625,9 +627,11 @@ class Sandbox:
         ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so ``argv`` reaches it with no
         in-guest relay.
         """
-        return self.start(argv).communicate(timeout)
+        return self.start(argv).communicate(timeout, max_output=max_output)
 
-    def run_bash(self, script: str, *, shell: str = 'bash', timeout: float = 60) -> ProcResult:
+    def run_bash(
+        self, script: str, *, shell: str = 'bash', timeout: float = 60, max_output: int | None = None
+    ) -> ProcResult:
         """Run ``script`` inside the sandbox as ``shell -c script``.
 
         Args:
@@ -636,13 +640,15 @@ class Sandbox:
             shell: The shell to run it with. Must exist in the sandbox, which a
                 curated ``rootfs`` need not provide.
             timeout: Seconds before the launch is killed.
+            max_output: Maximum total bytes of stdout and stderr to buffer. Output
+                beyond this is discarded and result.truncated is set.
 
         Returns:
             The launch's result.
         """
-        return self.start_bash(script, shell=shell).communicate(timeout)
+        return self.start_bash(script, shell=shell).communicate(timeout, max_output=max_output)
 
-    def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
+    def run_python(self, code: str, *, timeout: float = 60, max_output: int | None = None) -> ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
         The shim's child re-execs ``profile.python`` to run ``code``, so the code
@@ -654,7 +660,7 @@ class Sandbox:
         ``POSTERN_HATCH_<NAME>``; the client library that dials it comes from the
         guest's bound environment.
         """
-        return self.start_python(code).communicate(timeout)
+        return self.start_python(code).communicate(timeout, max_output=max_output)
 
     def start(self, argv: list[str]) -> _process.Process:
         """Start ``argv`` in the sandbox, as :meth:`run` does, and return at once.

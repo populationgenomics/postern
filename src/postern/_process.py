@@ -268,19 +268,40 @@ class Process:
         """
         return self._popen.wait(timeout)
 
-    def communicate(self, timeout: float | None = None) -> postern._sandbox.ProcResult:
+    def communicate(
+        self, timeout: float | None = None, *, max_output: int | None = None
+    ) -> postern._sandbox.ProcResult:
         """Read the rest of the output, wait for the run to end, and close it.
 
         On ``timeout`` the sandbox is killed and the result is status 124 with
         ``[postern] timed out`` appended to stderr, as :meth:`Sandbox.run` reports
-        it. Output is decoded as UTF-8, with undecodable bytes replaced.
+        it. Output is decoded as UTF-8, with undecodable bytes replaced. If
+        ``max_output`` is set, buffered output is capped at that byte count,
+        further output discarded, and ``result.truncated`` set.
         """
         out, err = bytearray(), bytearray()
         deadline = None if timeout is None else time.monotonic() + timeout
         timed_out = False
+        truncated = False
+
+        def _append(target: bytearray, chunk: bytes) -> None:
+            nonlocal truncated
+            if max_output is None:
+                target.extend(chunk)
+                return
+            remaining = max_output - (len(out) + len(err))
+            if remaining <= 0:
+                truncated = True
+                return
+            if len(chunk) > remaining:
+                truncated = True
+                target.extend(chunk[:remaining])
+            else:
+                target.extend(chunk)
+
         try:
             for name, chunk in self._pump(deadline=deadline):
-                (out if name == 'stdout' else err).extend(chunk)
+                _append(out if name == 'stdout' else err, chunk)
             self._popen.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -288,13 +309,13 @@ class Process:
             drain_deadline = time.monotonic() + _POST_KILL_DRAIN_S
             try:
                 for name, chunk in self._pump(deadline=drain_deadline):
-                    (out if name == 'stdout' else err).extend(chunk)
+                    _append(out if name == 'stdout' else err, chunk)
                 self._popen.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 pass
         finally:
             self.close()
-        return _result(self._popen.returncode, out, err, timed_out=timed_out)
+        return _result(self._popen.returncode, out, err, timed_out=timed_out, truncated=truncated)
 
     def close(self) -> None:
         """Stop the run if it is still going, and release its pipes, pidfd and hatches.
@@ -418,13 +439,31 @@ class AsyncProcess:
                 loop.remove_reader(self._exit_fd)
         return self._process.wait()
 
-    async def communicate(self, timeout: float | None = None) -> postern._sandbox.ProcResult:
+    async def communicate(
+        self, timeout: float | None = None, *, max_output: int | None = None
+    ) -> postern._sandbox.ProcResult:
         """Read the rest of the output, wait for the run to end, and close it. See :meth:`Process.communicate`."""
         out, err = bytearray(), bytearray()
+        truncated = False
+
+        def _append(target: bytearray, chunk: bytes) -> None:
+            nonlocal truncated
+            if max_output is None:
+                target.extend(chunk)
+                return
+            remaining = max_output - (len(out) + len(err))
+            if remaining <= 0:
+                truncated = True
+                return
+            if len(chunk) > remaining:
+                truncated = True
+                target.extend(chunk[:remaining])
+            else:
+                target.extend(chunk)
 
         async def collect() -> None:
             async for name, chunk in self.output():
-                (out if name == 'stdout' else err).extend(chunk)
+                _append(out if name == 'stdout' else err, chunk)
             await self.wait()
 
         timed_out = False
@@ -437,7 +476,7 @@ class AsyncProcess:
                 await asyncio.wait_for(collect(), _POST_KILL_DRAIN_S)
         finally:
             await self.aclose()
-        return _result(self._process.returncode, out, err, timed_out=timed_out)
+        return _result(self._process.returncode, out, err, timed_out=timed_out, truncated=truncated)
 
     async def aclose(self) -> None:
         """Stop the run if it is still going, and release it. See :meth:`Process.close`."""
@@ -476,11 +515,19 @@ def _settle(future: asyncio.Future[None]) -> None:
 
 
 def _result(
-    returncode: int | None, out: bytes | bytearray, err: bytes | bytearray, *, timed_out: bool
+    returncode: int | None,
+    out: bytes | bytearray,
+    err: bytes | bytearray,
+    *,
+    timed_out: bool,
+    truncated: bool = False,
 ) -> postern._sandbox.ProcResult:
-    import postern._sandbox  # noqa: PLC0415 — _sandbox imports this module
+    from postern import _sandbox  # noqa: PLC0415 — _sandbox imports this module
 
     stdout, stderr = bytes(out).decode('utf-8', 'replace'), bytes(err).decode('utf-8', 'replace')
+    if truncated:
+        stderr = (stderr + '\n' if stderr else '') + '[postern] output truncated'
     if timed_out:
-        return postern._sandbox.ProcResult(124, stdout, stderr + '\n[postern] timed out')  # noqa: SLF001
-    return postern._sandbox.ProcResult(typing.cast('int', returncode), stdout, stderr)  # noqa: SLF001
+        stderr = (stderr + '\n' if stderr else '\n') + '[postern] timed out'
+        return _sandbox.ProcResult(124, stdout, stderr, timed_out=True, truncated=truncated)
+    return _sandbox.ProcResult(typing.cast('int', returncode), stdout, stderr, timed_out=False, truncated=truncated)

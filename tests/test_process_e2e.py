@@ -326,3 +326,38 @@ def test_async_aclose_does_not_block_event_loop_when_cancelled(sandbox):
         assert after_ticks > before_ticks
 
     asyncio.run(main())
+
+
+def test_procresult_timed_out_distinguishes_guest_exit_124(sandbox):
+    guest_124 = sandbox.run_bash('exit 124')
+    assert guest_124.returncode == 124
+    assert not guest_124.timed_out
+    assert not guest_124.ok
+    assert '[postern] timed out' not in guest_124.stderr
+
+    timed_out = sandbox.run_bash('sleep 30', timeout=0.2)
+    assert timed_out.returncode == 124
+    assert timed_out.timed_out
+    assert not timed_out.ok
+    assert '[postern] timed out' in timed_out.stderr
+
+
+def test_communicate_max_output_caps_buffer(sandbox):
+    result = sandbox.run_bash('echo "hello world"', max_output=5)
+    assert result.returncode == 0
+    assert result.stdout == 'hello'
+    assert result.truncated
+    assert not result.timed_out
+    assert '[postern] output truncated' in result.stderr
+
+
+def test_async_communicate_max_output_caps_buffer(sandbox):
+    async def main():
+        async with await sandbox.astart_bash('echo "streaming output"') as proc:
+            return await proc.communicate(max_output=7)
+
+    result = asyncio.run(main())
+    assert result.stdout == 'streami'
+    assert result.truncated
+    assert not result.timed_out
+    assert '[postern] output truncated' in result.stderr
