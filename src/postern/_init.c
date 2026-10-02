@@ -50,8 +50,9 @@
 
 /* Exit statuses for failures of the init itself, before the command runs. */
 #define EXIT_USAGE 2
-#define EXIT_NOEXEC 126
-#define EXIT_NOTFOUND 127
+/* Any failed exec, missing or not executable alike: the shim's status, and the one
+ * postern documents, so the two inits agree. */
+#define EXIT_NOEXEC 127
 
 static void usage(void) {
     fputs("usage: postern-init --version\n"
@@ -101,9 +102,8 @@ static void exec_command(char **argv, const sigset_t *original_mask, rlim_t npro
     }
 
     execvp(argv[0], argv);
-    int failure = errno;
-    fprintf(stderr, "postern: cannot exec '%s': %s\n", argv[0], strerror(failure));
-    _exit(failure == ENOENT ? EXIT_NOTFOUND : EXIT_NOEXEC);
+    fprintf(stderr, "postern: cannot exec '%s': %s\n", argv[0], strerror(errno));
+    _exit(EXIT_NOEXEC);
 }
 
 static int status_of(int status) {

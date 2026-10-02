@@ -62,6 +62,16 @@ def test_missing_program_is_127(profile):
     assert 'cannot exec' in result.stderr
 
 
+def test_non_executable_program_is_127_too(profile):
+    # Not only a missing program: one that exists but cannot be executed gets the
+    # same status from both inits, as documented.
+    sandbox = Sandbox(profile())
+    assert sandbox.run_bash('printf "#!/bin/sh\\n" > /workspace/plain; chmod 644 /workspace/plain').ok
+    result = sandbox.run(['/workspace/plain'])
+    assert result.returncode == 127
+    assert 'cannot exec' in result.stderr
+
+
 def test_rlimit_nproc_carries_across_the_exec(profile):
     result = Sandbox(profile(rlimit_nproc=8)).run_bash('ulimit -u')
     assert result.ok, result.stderr

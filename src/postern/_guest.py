@@ -1,8 +1,11 @@
-"""In-sandbox supervisor for `Sandbox.run`, `Sandbox.run_bash` and `Sandbox.run_python`.
+"""In-sandbox runner for `Sandbox.run_python`, and the fallback guest init.
 
-Runs *inside* the bubblewrap sandbox, so it is stdlib-only. bwrap launches this
-shim as the entrypoint for every run: it applies the resource backstops, forks,
-and the child execs whatever ``POSTERN_ARGV`` names — a re-exec of the interpreter
+Runs *inside* the bubblewrap sandbox, so it is stdlib-only. It has two roles.
+Under the C init (``SandboxProfile.init``, the recommended path) it is only the
+init's child for `Sandbox.run_python`, running ``POSTERN_CODE`` in this process.
+When the profile names no C init, bwrap launches this shim as the init for every
+run instead: it applies the resource backstops, forks, and the child execs
+whatever ``POSTERN_ARGV`` names — a re-exec of the interpreter
 to run ``POSTERN_CODE`` (`Sandbox.run_python`), or an arbitrary program
 (`Sandbox.run`, `Sandbox.run_bash`). One fork+exec shape for all three, so a
 non-Python entrypoint inherits the same limits across the exec that Python code
@@ -10,8 +13,8 @@ gets. Reaching a hatch is the guest's own business: the socket is a file at
 ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, dialled with whatever client library
 the guest's environment carries.
 
-bwrap launches this shim with ``--as-pid-1``, so it is PID 1 of the guest's PID
-namespace and owes that namespace a real init: it forks the work and reaps it plus
+As the fallback init, bwrap launches this shim with ``--as-pid-1``, so it is PID
+1 of the guest's PID namespace and owes that namespace a real init: it forks the work and reaps it plus
 any orphaned descendants that reparent here, and marks *itself* non-dumpable so a
 co-uid process the guest spawns cannot read this init's ``/proc/1``.
 
@@ -20,8 +23,9 @@ The host↔shim contract is five environment variables: ``POSTERN_ARGV``,
 ``POSTERN_HATCH``/``POSTERN_HATCH_<NAME>`` variables are set alongside them for the
 *guest* to read, not for this module.
 
-The supervisor being Python is what makes ``run``/``run_bash`` need an interpreter
-in the sandbox even for a non-Python program.
+As the fallback init, this being Python is what makes ``run``/``run_bash`` need
+an interpreter in the sandbox even for a non-Python program; the C init removes
+that need.
 """
 
 import contextlib

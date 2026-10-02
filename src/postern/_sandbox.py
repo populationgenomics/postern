@@ -3,10 +3,12 @@
 `Sandbox` runs a program (or a snippet of Python) under bubblewrap with the
 hardened profile: an empty network namespace, a surgical read-only view of the
 base system directories plus one writable workspace, `--cap-drop ALL`,
-`--new-session` and a seccomp denylist. Every entrypoint runs under the in-guest
-shim supervisor (`postern._guest`), which adds the ``RLIMIT_NPROC`` fork-bomb
-backstop and reaps the guest's orphans. The guest's only channel to the outside is
-whatever `Hatch` the caller binds in.
+`--new-session` and a seccomp denylist. Every entrypoint runs under the guest's
+init, PID 1 of its namespace, which adds the ``RLIMIT_NPROC`` fork-bomb backstop
+and reaps the guest's orphans: the static C init when the profile names one
+(``SandboxProfile.init``, the recommended path), the Python shim
+(`postern._guest`) otherwise. The guest's only channel to the outside is whatever
+`Hatch` the caller binds in.
 
 The base system directories come from the host by default, or from a curated
 ``rootfs`` directory assembled at image-build time, which hides the host userland
@@ -191,8 +193,10 @@ class SandboxProfile:
         rootfs: A curated base directory whose ``/usr``, ``/lib`` … are bound as
             the guest's system dirs. ``None`` binds the *host's* system dirs,
             exposing the host userland read-only.
-        python: Interpreter argv0 for the in-guest shim, and so for every
-            entrypoint (an absolute path when it lives in a bound venv).
+        python: Interpreter argv0 for the in-guest shim (an absolute path when it
+            lives in a bound venv). :meth:`Sandbox.run_python` always needs it;
+            under the C init (``init``) nothing else does, while the fallback
+            Python shim needs it for every entrypoint.
         ro_binds: Extra ``(host, guest)`` read-only binds beyond the base system
             dirs — e.g. a venv (see :meth:`with_venv`).
         stubs: Importable modules to inject at ``/run/postern/stubs`` (prepended to
@@ -323,7 +327,7 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     argv += ['--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
     # Without --as-pid-1 bwrap stays resident as PID 1 of the guest's namespace,
     # at the guest's own uid, so its /proc/1 (cmdline, maps, mem) is readable from
-    # inside. The shim is the init in its place.
+    # inside. The guest's init (the C init, or the Python shim) is PID 1 instead.
     argv += ['--as-pid-1']
     if profile.guest_uid is not None:
         argv += ['--uid', str(profile.guest_uid)]
@@ -512,11 +516,12 @@ class Sandbox:
                 seccomp.close()
 
     def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False, timeout: float) -> ProcResult:
-        """Launch ``work_argv`` under the guest shim, with every hatch bound and served.
+        """Launch ``work_argv`` under the guest's init, with every hatch bound and served.
 
         The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.
-        The shim (``postern._guest``) is bwrap's ``--as-pid-1`` entrypoint: it
-        applies the resource backstops, forks, and the child execs ``work_argv``.
+        The init is bwrap's ``--as-pid-1`` entrypoint: the C init when the profile
+        names one, the Python shim (``postern._guest``) otherwise. It applies the
+        resource backstops, forks, and the child execs ``work_argv``.
 
         Args:
             work_argv: What the shim's forked child execs.
@@ -563,11 +568,13 @@ class Sandbox:
     def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
 
-        The entrypoint for a program that is not Python. It runs under the same shim
-        supervisor as :meth:`run_python`, so ``argv`` inherits ``RLIMIT_NPROC`` and
+        The entrypoint for a program that is not Python. It runs under the same
+        guest init as :meth:`run_python`, so ``argv`` inherits ``RLIMIT_NPROC`` and
         ``RLIMIT_AS`` across the exec, has its orphaned descendants reaped, and is
-        not PID 1 itself. The supervisor is Python, so ``profile.python`` must exist
-        in the sandbox even when ``argv`` is a compiled program.
+        not PID 1 itself. Under the C init (``SandboxProfile.init``) it needs no
+        interpreter in the sandbox; under the fallback Python shim,
+        ``profile.python`` must exist there even when ``argv`` is a compiled
+        program.
 
         Every configured :class:`Hatch` is bound and served: the socket is a file at
         ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so ``argv`` reaches it with no
