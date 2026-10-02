@@ -33,6 +33,7 @@ import queue
 import re
 import selectors
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -483,6 +484,12 @@ class _Launcher:
         return job.result()
 
     def _serve(self) -> None:
+        # Inherited by bwrap and, across its exec, by the guest init. The init is
+        # PID 1 of its namespace, so the kernel drops a SIGTERM it has no handler for
+        # yet — a Process.terminate() just after start, while the init is still
+        # starting up. Blocked, the SIGTERM is held pending until the init takes it.
+        # bwrap itself is never sent SIGTERM; it is stopped with SIGKILL.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         while True:
             self._queue.get()()
 

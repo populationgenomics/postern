@@ -73,15 +73,18 @@ static rlim_t parse_limit(const char *flag, const char *text) {
 }
 
 /* In the child: limits, a clean signal state, then the command. Never returns. */
-static void exec_command(char **argv, const sigset_t *original_mask, rlim_t nproc, rlim_t as_bytes) {
+static void exec_command(char **argv, rlim_t nproc, rlim_t as_bytes) {
     /* Its own process group, so a forwarded signal reaches everything it starts. */
     setpgid(0, 0);
     /* Undo what the init set up for itself: an inherited SIG_IGN would survive the
-     * exec, and so would the blocked mask. */
+     * exec, and so would the blocked mask. Empty rather than the mask the init
+     * started with, which holds the SIGTERM the host blocks before launching. */
     for (int sig = 1; sig < NSIG; sig++) {
         signal(sig, SIG_DFL);
     }
-    sigprocmask(SIG_SETMASK, original_mask, NULL);
+    sigset_t none;
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
 
     struct rlimit limit;
     if (nproc > 0) {
@@ -144,10 +147,12 @@ int main(int argc, char **argv) {
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
     /* Block everything and take signals synchronously below: no async handlers,
-     * and nothing arrives between the fork and the wait loop unaccounted for. */
-    sigset_t all, original;
+     * and nothing arrives between the fork and the wait loop unaccounted for. A
+     * SIGTERM sent before this line is already pending: the host launches this
+     * init with SIGTERM blocked. */
+    sigset_t all;
     sigfillset(&all);
-    sigprocmask(SIG_BLOCK, &all, &original);
+    sigprocmask(SIG_BLOCK, &all, NULL);
 
     pid_t child = fork();
     if (child < 0) {
@@ -155,7 +160,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (child == 0) {
-        exec_command(command, &original, nproc, as_bytes);
+        exec_command(command, nproc, as_bytes);
     }
     /* Also from this side, so the group exists before any signal is forwarded to it. */
     setpgid(child, child);

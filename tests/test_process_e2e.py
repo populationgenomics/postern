@@ -151,6 +151,18 @@ def test_stop_right_after_start_kills_guest(sandbox, how):
     assert not (sandbox.workspace / 'marker').exists()
 
 
+def test_terminate_right_after_start_reaches_the_command(sandbox):
+    # Sent while the init may still be starting up, before it has a handler. PID 1
+    # would drop it then, so the run would sit out the grace and be killed; held
+    # pending, it reaches the command, here before any trap: death by SIGTERM.
+    with sandbox.start_bash('sleep 30') as process:
+        started = time.monotonic()
+        process.terminate(grace=5)
+        result = process.communicate(timeout=10)
+    assert result.returncode == 128 + signal.SIGTERM
+    assert time.monotonic() - started < 4
+
+
 def test_c_init_cancel_reaches_the_whole_process_group(c_init):
     # A pipeline's members are not the command itself; the C init signals its
     # process group, so they stop too and the trap can report it.
