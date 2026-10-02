@@ -134,7 +134,9 @@ profile = SandboxProfile(rootfs='/opt/guest-root', init='/opt/postern-init')
 ```
 
 Install the same postern version in both stages: the binary is stamped with the
-version it was built from, and `verify()` refuses a mismatch. It is static, so it
+version it was built from, and `verify()` refuses a mismatch. The check reads the
+init's own `--version` from a run *inside* the sandbox: postern never executes the
+init on the host, which only ever runs bwrap. `init=` must be an absolute path. It is static, so it
 needs nothing from the rootfs; postern binds it in at `/run/postern/init`.
 `examples/Dockerfile` does all of this.
 

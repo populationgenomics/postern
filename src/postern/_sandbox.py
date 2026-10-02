@@ -236,8 +236,10 @@ class SandboxProfile:
             every run. Under it :meth:`Sandbox.run` and :meth:`Sandbox.run_bash`
             need no interpreter in the sandbox; :meth:`Sandbox.run_python` execs
             ``python`` on the shim as the init's child. It is bound in read-only;
-            being static, it needs nothing from ``rootfs``. :meth:`Sandbox.verify`
-            refuses one built from a different postern version. ``None`` falls
+            being static, it needs nothing from ``rootfs``. It is only ever
+            executed inside the sandbox, never on the host. Must be absolute.
+            :meth:`Sandbox.verify` refuses one built from a different postern
+            version. ``None`` falls
             back to the Python shim as the init, which needs ``python`` for every
             entrypoint and costs an interpreter start on every run.
     """
@@ -397,6 +399,9 @@ class Sandbox:
         else:
             self._hatches = [typing.cast('Hatch', hatch)]
         self._check_hatches()
+        # Absolute, so the file bound in as PID 1 cannot depend on the worker's cwd.
+        if self._profile.init is not None and not os.path.isabs(self._profile.init):
+            raise ValueError(f'SandboxProfile.init must be an absolute path, got {os.fspath(self._profile.init)!r}')
         if self._profile.workspace is not None:
             self._workspace = pathlib.Path(self._profile.workspace)
             self._own_workspace = False
@@ -622,46 +627,34 @@ class Sandbox:
         platform — no user namespace, gVisor, an uncovered arch — surfaces at
         startup rather than on the first real request.
 
+        With an init set, the trivial launch is the init's own ``--version``, run
+        inside the sandbox, and its answer must be this postern's version.
+
         Raises:
-            IsolationError: If ``seccomp`` is disabled in the profile, or the
-                trivial launch fails.
+            IsolationError: If ``seccomp`` is disabled in the profile, the trivial
+                launch fails, or the init was built from another postern version.
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
-        if self._profile.init is not None:
-            self._check_init_version(timeout=timeout)
-            # The init itself, so the check needs nothing from the rootfs: under the
-            # C init a rootfs need not carry Python, and run_python('pass') would
-            # fail on that rather than on isolation.
-            result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
-        else:
+        if self._profile.init is None:
             result = self.run_python('pass', timeout=timeout)
+            if not result.ok:
+                raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+            return
+        # The init itself, inside the sandbox: it needs nothing from the rootfs (under
+        # the C init a rootfs need not carry Python), and the init is never executed
+        # on the host. The host only ever runs bwrap; running a deployer-supplied
+        # binary here, as the worker and with its environment, would hand anything
+        # that could swap that file the worker's privileges.
+        result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+        import postern  # noqa: PLC0415 — the package imports this module
 
-    def _check_init_version(self, *, timeout: float) -> None:
-        """Refuse an init built from a different postern than this one.
-
-        The init and this module share a contract (its flags, and the shim's
-        environment under it), and nothing else ties a binary built in one image
-        stage to the postern installed in another. It is static and host-built, so
-        it runs here as well as in the guest.
-
-        Raises:
-            IsolationError: If the init cannot be run or reports another version.
-        """
-        from postern import __version__  # noqa: PLC0415 — the package imports this module
-
-        init = os.fspath(typing.cast('str | os.PathLike[str]', self._profile.init))
-        try:
-            reported = subprocess.run(
-                [init, '--version'], capture_output=True, text=True, timeout=timeout, check=True
-            ).stdout.strip()
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise IsolationError(f'guest init {init} cannot run: {exc}') from exc
-        if reported != __version__:
+        reported = result.stdout.strip()
+        if reported != postern.__version__:
             raise IsolationError(
-                f'guest init {init} was built from postern {reported}, not {__version__}; '
+                f'guest init {self._profile.init} was built from postern {reported}, not {postern.__version__}; '
                 'rebuild it with `python -m postern.build_init`'
             )
 
