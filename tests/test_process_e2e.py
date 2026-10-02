@@ -372,6 +372,56 @@ def test_a_start_failing_before_bwrap_stops_serving_the_hatches(tmp_path, monkey
     assert not hatch.serving
 
 
+def test_a_slow_launch_does_not_hold_up_another(sandbox, monkeypatch):
+    # One bwrap slow to report its init (a hung bind source, say) must not stall
+    # the launcher thread every other launch forks from.
+    real = _sandbox._hold_init
+    entered, release = threading.Event(), threading.Event()
+
+    def stall_first(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            release.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_sandbox, '_hold_init', stall_first)
+    stalled: list[Process] = []
+    slow = threading.Thread(target=lambda: stalled.append(sandbox.start_bash('true')))
+    slow.start()
+    try:
+        assert entered.wait(5)
+        started = time.monotonic()
+        assert sandbox.run_bash('echo quick', timeout=5).stdout == 'quick\n'
+        assert time.monotonic() - started < 3
+    finally:
+        release.set()
+        slow.join(10)
+        for process in stalled:
+            process.close()
+
+
+def test_a_failure_after_the_guest_starts_leaves_no_guest(sandbox, monkeypatch):
+    # The seccomp descriptor is closed between bwrap starting and a Process
+    # owning it; a failure there must still take the guest down.
+    real = _seccomp.load_filter
+
+    class FailingClose:
+        def __init__(self) -> None:
+            self._file = real()
+
+        def fileno(self) -> int:
+            return self._file.fileno()
+
+        def close(self) -> None:
+            self._file.close()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(_seccomp, 'load_filter', FailingClose)
+    with pytest.raises(KeyboardInterrupt):
+        sandbox.start_bash(_SURVIVOR)
+    _assert_no_survivor(sandbox)
+
+
 def test_no_pidfds_fails_closed_before_launching(sandbox, monkeypatch):
     def refuse(_pid: int) -> int:
         raise PermissionError(1, 'blocked by seccomp')

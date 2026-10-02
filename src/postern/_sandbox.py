@@ -389,10 +389,12 @@ _INFO_TIMEOUT_S = 30.0
 
 
 class _Job(typing.Generic[_T]):
-    """One call run on the launcher thread, and the hand-off of its result.
+    """One call run on another thread, and the hand-off of its result.
 
     The result goes to the caller, or to ``discard`` if the caller stopped waiting
-    first, so something the call started is never left without an owner.
+    first, so something the call started is never left without an owner. The call
+    itself cannot be interrupted: a ``KeyboardInterrupt`` reaches only the main
+    thread.
     """
 
     def __init__(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> None:
@@ -405,7 +407,7 @@ class _Job(typing.Generic[_T]):
         self._error: BaseException | None = None
 
     def run(self) -> None:
-        """Run on the launcher thread. Never raises: an error goes to the caller."""
+        """Run the call, on the thread meant for it. An error in it goes to the caller."""
         try:
             value = self._fn()
         except BaseException as exc:  # noqa: BLE001 — re-raised in the caller
@@ -423,7 +425,9 @@ class _Job(typing.Generic[_T]):
         """Wait for the call, and return its result or raise its error.
 
         Interrupted while waiting (a ``KeyboardInterrupt``), the result is discarded
-        here if it has arrived, or by :meth:`run` when it does.
+        here if it has arrived, or by :meth:`run` when it does. Once this returns,
+        the result is the caller's: an interrupt in the few bytecodes before the
+        caller has bound it is beyond reach.
         """
         try:
             self._done.wait()
@@ -438,17 +442,21 @@ class _Job(typing.Generic[_T]):
             raise self._error
         return typing.cast('_T', self._value)
 
+    def in_thread(self, name: str) -> _T:
+        """Run the call on a new thread of its own and return :meth:`result`."""
+        threading.Thread(target=self.run, name=name, daemon=True).start()
+        return self.result()
+
 
 class _Launcher:
-    """Runs every launch on one long-lived thread.
+    """Forks every bwrap from one long-lived thread.
 
     bwrap's ``--die-with-parent`` is ``PR_SET_PDEATHSIG``, which fires when the
-    *thread* that forked bwrap exits, not the process. Launched from a caller or
+    *thread* that forked bwrap exits, not the process. Forked from a caller or
     pool thread, a guest would die when that thread finished.
 
-    A launch runs to completion here even if its caller is interrupted while
-    waiting — a ``KeyboardInterrupt`` reaches only the main thread — so it is never
-    left half-done, and :class:`_Job` hands an abandoned result to its ``discard``.
+    Only the fork belongs here, and whatever must follow it before anything else
+    can touch the child: one launch waiting on bwrap would hold up every other.
     """
 
     def __init__(self) -> None:
@@ -456,11 +464,11 @@ class _Launcher:
         self._queue: queue.SimpleQueue[collections.abc.Callable[[], None]] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
 
-    def launch(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> _T:
+    def call(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> _T:
         """Run ``fn`` on the launcher thread and return its result, or raise its error.
 
         Args:
-            fn: The launch.
+            fn: The fork.
             discard: Releases ``fn``'s result if the caller is interrupted before
                 receiving it.
         """
@@ -621,7 +629,7 @@ def _require_init_control() -> None:
 
 
 def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
-    """Start bwrap and take hold of the guest's init. Runs on the launcher thread.
+    """Start bwrap and take hold of the guest's init. Not on the caller's thread: see :class:`_Job`.
 
     ``cmd`` is the bwrap command line, with ``cmd[0]`` bwrap itself; ``--info-fd``
     is added here. On any failure, whatever was started is killed before this
@@ -637,46 +645,63 @@ def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile
     info_read, info_write = os.pipe()
     try:
         try:
-            # Bytes, decoded by Process. Cast because the credentials splat is Any,
-            # which lets the type checker pick Popen's text-mode overload.
-            popen = typing.cast(
-                'subprocess.Popen[bytes]',
-                subprocess.Popen(
+            launch = _launcher.call(
+                functools.partial(
+                    _fork_bwrap,
                     [cmd[0], '--info-fd', str(info_write), *cmd[1:]],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    # Scrub bwrap's own environment: it is PID 1 in the guest's
-                    # namespace at the guest uid, so an inherited secret would be
-                    # readable from inside via /proc/1/environ (see bwrap_env).
-                    env=bwrap_env(),
                     pass_fds=(*pass_fds, info_write),
-                    # Run bwrap at a non-root real uid when we are root, so the
-                    # guest's kernel uid (which bwrap maps --uid onto) is non-root and
-                    # owns none of root's files (see bwrap_credentials).
-                    **bwrap_credentials(profile, os.geteuid()),
+                    profile=profile,
                 ),
+                _process.Launch.discard,
             )
         finally:
             os.close(info_write)
         try:
-            # Nothing has polled bwrap, so it is unreaped and its pid still names it.
-            bwrap_pidfd = _process.pidfd_open(popen.pid)
-        except BaseException:
-            # Without a pidfd on bwrap the init cannot be held either; killing bwrap
-            # is the most there is to do. Popen's exit reaps it and closes the pipes.
-            with popen:
-                popen.kill()
-            raise
-        launch = _process.Launch(popen, bwrap_pidfd)
-        try:
-            launch.init_pidfd = _hold_init(info_read, popen.pid)
+            launch.init_pidfd = _hold_init(info_read, launch.popen.pid)
         except BaseException:
             launch.discard()
             raise
         return launch
     finally:
         os.close(info_read)
+
+
+def _fork_bwrap(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
+    """Fork bwrap and open its pidfd, before anything can reap it. On the launcher thread."""
+    # Bytes, decoded by Process. Cast because the credentials splat is Any,
+    # which lets the type checker pick Popen's text-mode overload.
+    popen = typing.cast(
+        'subprocess.Popen[bytes]',
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # Scrub bwrap's own environment: it is PID 1 in the guest's
+            # namespace at the guest uid, so an inherited secret would be
+            # readable from inside via /proc/1/environ (see bwrap_env).
+            env=bwrap_env(),
+            pass_fds=pass_fds,
+            # Run bwrap at a non-root real uid when we are root, so the
+            # guest's kernel uid (which bwrap maps --uid onto) is non-root and
+            # owns none of root's files (see bwrap_credentials).
+            **bwrap_credentials(profile, os.geteuid()),
+        ),
+    )
+    try:
+        # Nothing has polled bwrap, so it is unreaped and its pid still names it.
+        return _process.Launch(popen, _process.pidfd_open(popen.pid))
+    except BaseException:
+        # Without a pidfd on bwrap the init cannot be held either; killing bwrap
+        # is the most there is to do. Popen's exit reaps it and closes the pipes.
+        with popen:
+            popen.kill()
+        raise
+
+
+def _discard_process(process: _process.Process) -> None:
+    process.kill()
+    process.close()
 
 
 def _discard_started(future: asyncio.Future[_process.Process]) -> None:
@@ -798,23 +823,28 @@ class Sandbox:
         """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
 
         ``resources`` (the hatches' serving contexts) passes to the Process, which
-        closes it when the run is closed; on any failure it is closed here.
+        closes it when the run is closed; on any failure it is closed here. The
+        launch runs whole on a thread of its own, through to the Process that owns
+        it, so an interrupt cannot leave a guest between the two.
         """
+        job = _Job(
+            functools.partial(self._launch, argv, setenv=setenv, extra_binds=extra_binds, resources=resources),
+            _discard_process,
+        )
         try:
-            launch = self._launch(argv, setenv=setenv, extra_binds=extra_binds)
+            return job.in_thread('postern-launch')
         except BaseException:
-            resources.close()
-            raise
-        try:
-            return _process.Process(launch, resources=resources)
-        except BaseException:
-            launch.discard()
             resources.close()
             raise
 
     def _launch(
-        self, argv: list[str], *, setenv: dict[str, str] | None, extra_binds: list[str] | None
-    ) -> _process.Launch:
+        self,
+        argv: list[str],
+        *,
+        setenv: dict[str, str] | None,
+        extra_binds: list[str] | None,
+        resources: contextlib.ExitStack,
+    ) -> _process.Process:
         if not available():
             raise RuntimeError('bubblewrap (bwrap) not found on PATH; postern requires Linux + bubblewrap')
         # A non-root guest cannot write a host-owned workspace dir. 1777 rather than
@@ -826,19 +856,23 @@ class Sandbox:
                 self._workspace.chmod(0o1777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
         fd = seccomp.fileno() if seccomp is not None else None
+        launch: _process.Launch | None = None
         try:
             cmd = build_base_argv(dataclasses.replace(self._profile, workspace=self._workspace), fd)
             for key, val in (setenv or {}).items():
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            return _launcher.launch(
-                functools.partial(_spawn, cmd, pass_fds=() if fd is None else (fd,), profile=self._profile),
-                _process.Launch.discard,
-            )
-        finally:
+            launch = _spawn(cmd, pass_fds=() if fd is None else (fd,), profile=self._profile)
             if seccomp is not None:
                 seccomp.close()
+            return _process.Process(launch, resources=resources)
+        except BaseException:
+            if launch is not None:
+                launch.discard()
+            if seccomp is not None:
+                seccomp.close()
+            raise
 
     def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False) -> _process.Process:
         """Start ``work_argv`` under the guest's init, with every hatch bound and served.
