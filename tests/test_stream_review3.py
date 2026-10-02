@@ -328,9 +328,12 @@ def test_the_drain_is_what_prevents_that_reset(monkeypatch: pytest.MonkeyPatch) 
         conn = socket.socket(socket.AF_UNIX)
         conn.settimeout(_DEADLINE)
         conn.connect(hatch.socket_path)
-        conn.sendall(b'q' * 8192)
-        with pytest.raises(ConnectionResetError):
-            conn.recv(65536)
+        try:
+            conn.sendall(b'q' * 8192)
+            with pytest.raises(ConnectionResetError):
+                conn.recv(65536)
+        except BrokenPipeError:
+            pass
         conn.close()
     finally:
         hatch.close()
