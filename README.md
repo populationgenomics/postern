@@ -186,9 +186,13 @@ async with await sandbox.astart_bash('make test') as process:
   and clean up; if it is still running after `grace`, the init is killed through
   the same pidfd and the kernel kills the rest of its namespace with it. A launch
   raises `IsolationError` where pidfds do not work (before Linux 5.3, or under a
-  seccomp profile blocking `pidfd_open`), since a stop could not then be sure of
-  reaching the init. A SIGTERM sent before the init is ready for it is held
-  pending until it is, not dropped. `terminate()` returns at once and is safe
+  seccomp profile blocking `pidfd_open`) or `/proc` cannot vouch for the init (a
+  `/proc` from another pid namespace, `hidepid`), since a stop could not then be
+  sure of reaching it. A SIGTERM sent before the init is ready for it is held
+  pending until it is, not dropped: bwrap is launched with SIGTERM blocked, and
+  the init inherits that. bwrap therefore ignores SIGTERM itself (`pkill -TERM
+  bwrap` does nothing); a SIGTERM to the whole cgroup or process group still
+  reaches the init, which forwards it. `terminate()` returns at once and is safe
   from another thread, so keep reading to see what the command says on its way
   out. `kill()` skips the grace.
 - **Leaving early stops it too.** Leaving the `with` block while the run is still

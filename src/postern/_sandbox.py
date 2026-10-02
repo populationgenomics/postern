@@ -485,7 +485,8 @@ class _Launcher:
         # PID 1 of its namespace, so the kernel drops a SIGTERM it has no handler for
         # yet — a Process.terminate() just after start, while the init is still
         # starting up. Blocked, the SIGTERM is held pending until the init takes it.
-        # bwrap itself is never sent SIGTERM; it is stopped with SIGKILL.
+        # bwrap ignores SIGTERM as a result; postern stops it with SIGKILL, and a
+        # cgroup- or group-wide SIGTERM reaches the init directly.
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         while True:
             self._queue.get()()

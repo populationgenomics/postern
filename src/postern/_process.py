@@ -12,8 +12,9 @@ the pipes this reads. It is the *only* way to read output, deliberately: separat
 stdout and stderr readers invite draining one while the other's pipe fills and
 stalls the guest. A caller who wants one stream can write ``2>&1``.
 
-**Stopping.** bwrap does not forward signals: SIGTERM to bwrap kills bwrap, and
-``--die-with-parent`` then SIGKILLs the guest with no chance to clean up. So
+**Stopping.** bwrap does not forward signals, and it runs with SIGTERM blocked
+(inherited from the launcher thread, so that an early SIGTERM to the init is
+held rather than dropped): SIGTERM to bwrap does nothing. So
 :meth:`Process.terminate` signals the guest's *init* directly. bwrap reports the
 init's host pid on ``--info-fd``, and a pidfd is opened on it at start, so the
 signal can only ever reach that process even after its pid is recycled. The init
