@@ -9,7 +9,7 @@ FROM python:3.12-slim
 
 # git as well as bubblewrap: the stream-hatch e2e clones a real repository through
 # the hatch, with git itself as the sandbox entrypoint.
-RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap git \
+RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap git gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Toolchain only — no postern here; it is mounted at run time.

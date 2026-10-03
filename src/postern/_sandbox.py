@@ -3,9 +3,12 @@
 `Sandbox` runs a program (or a snippet of Python) under bubblewrap with the
 hardened profile: an empty network namespace, a surgical read-only view of the
 base system directories plus one writable workspace, `--cap-drop ALL`,
-`--new-session` and a seccomp denylist. :meth:`Sandbox.run_python` adds the
-``RLIMIT_NPROC`` fork-bomb backstop through its shim. The guest's only channel to
-the outside is whatever `Hatch` the caller binds in.
+`--new-session` and a seccomp denylist. Every entrypoint runs under the guest's
+init, PID 1 of its namespace, which adds the ``RLIMIT_NPROC`` fork-bomb backstop
+and reaps the guest's orphans: the static C init when the profile names one
+(``SandboxProfile.init``, the recommended path), the Python shim
+(`postern._guest`) otherwise. The guest's only channel to the outside is whatever
+`Hatch` the caller binds in.
 
 The base system directories come from the host by default, or from a curated
 ``rootfs`` directory assembled at image-build time, which hides the host userland
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
 import pathlib
 import re
@@ -39,6 +43,7 @@ if typing.TYPE_CHECKING:
 _GUEST_DIR = '/run/postern'
 _GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # the unnamed hatch (GrpcHatch) → POSTERN_HATCH
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
+_GUEST_INIT = f'{_GUEST_DIR}/init'
 _GUEST_STUBS = f'{_GUEST_DIR}/stubs'
 _GUEST_WORKSPACE = '/workspace'
 _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
@@ -188,8 +193,10 @@ class SandboxProfile:
         rootfs: A curated base directory whose ``/usr``, ``/lib`` … are bound as
             the guest's system dirs. ``None`` binds the *host's* system dirs,
             exposing the host userland read-only.
-        python: Interpreter argv0 for :meth:`Sandbox.run_python` (an absolute
-            path when it lives in a bound venv).
+        python: Interpreter argv0 for the in-guest shim (an absolute path when it
+            lives in a bound venv). :meth:`Sandbox.run_python` always needs it;
+            under the C init (``init``) nothing else does, while the fallback
+            Python shim needs it for every entrypoint.
         ro_binds: Extra ``(host, guest)`` read-only binds beyond the base system
             dirs — e.g. a venv (see :meth:`with_venv`).
         stubs: Importable modules to inject at ``/run/postern/stubs`` (prepended to
@@ -198,7 +205,8 @@ class SandboxProfile:
             bind in selectively.
         env: Environment for the guest (``--clearenv`` wipes everything first).
         seccomp: Load the syscall denylist.
-        rlimit_nproc: Per-run process-count cap (fork-bomb backstop).
+        rlimit_nproc: Per-run process-count cap (fork-bomb backstop), applied by
+            the guest shim.
         rlimit_as: Per-process address-space cap in bytes, applied by the guest
             shim. ``None`` leaves it unlimited. It bounds one process, not the
             guest's total memory; a cgroup ``memory.max`` at the deploy layer is
@@ -223,6 +231,17 @@ class SandboxProfile:
             rootfs — reachable by ``host_uid``. Ignored when already non-root.
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
             reuses ``guest_gid``.
+        init: Host path to the static guest init that
+            ``python -m postern.build_init`` builds: the recommended PID 1 of
+            every run. Under it :meth:`Sandbox.run` and :meth:`Sandbox.run_bash`
+            need no interpreter in the sandbox; :meth:`Sandbox.run_python` execs
+            ``python`` on the shim as the init's child. It is bound in read-only;
+            being static, it needs nothing from ``rootfs``. It is only ever
+            executed inside the sandbox, never on the host. Must be absolute.
+            :meth:`Sandbox.verify` refuses one built from a different postern
+            version. ``None`` falls
+            back to the Python shim as the init, which needs ``python`` for every
+            entrypoint and costs an interpreter start on every run.
     """
 
     workspace: pathlib.Path | None = None
@@ -238,6 +257,7 @@ class SandboxProfile:
     guest_gid: int | None = 65534
     host_uid: int | None = None
     host_gid: int | None = None
+    init: str | os.PathLike[str] | None = None
 
     @classmethod
     def with_venv(cls, venv: str | pathlib.Path, **kwargs: typing.Any) -> SandboxProfile:  # noqa: ANN401 — passthrough
@@ -309,8 +329,7 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     argv += ['--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
     # Without --as-pid-1 bwrap stays resident as PID 1 of the guest's namespace,
     # at the guest's own uid, so its /proc/1 (cmdline, maps, mem) is readable from
-    # inside. run_python's shim is then the init; a raw run() entrypoint must
-    # tolerate being PID 1 itself.
+    # inside. The guest's init (the C init, or the Python shim) is PID 1 instead.
     argv += ['--as-pid-1']
     if profile.guest_uid is not None:
         argv += ['--uid', str(profile.guest_uid)]
@@ -380,6 +399,9 @@ class Sandbox:
         else:
             self._hatches = [typing.cast('Hatch', hatch)]
         self._check_hatches()
+        # Absolute, so the file bound in as PID 1 cannot depend on the worker's cwd.
+        if self._profile.init is not None and not os.path.isabs(self._profile.init):
+            raise ValueError(f'SandboxProfile.init must be an absolute path, got {os.fspath(self._profile.init)!r}')
         if self._profile.workspace is not None:
             self._workspace = pathlib.Path(self._profile.workspace)
             self._own_workspace = False
@@ -498,48 +520,101 @@ class Sandbox:
             if seccomp is not None:
                 seccomp.close()
 
-    def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
-        """Run ``argv`` inside the sandbox and return its result.
+    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False, timeout: float) -> ProcResult:
+        """Launch ``work_argv`` under the guest's init, with every hatch bound and served.
 
-        The raw primitive for a non-Python entrypoint. It does not set
-        ``RLIMIT_NPROC`` — that is applied by :meth:`run_python`'s shim — so the
-        entrypoint manages its own limits and must tolerate being PID 1.
+        The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.
+        The init is bwrap's ``--as-pid-1`` entrypoint: the C init when the profile
+        names one, the Python shim (``postern._guest``) otherwise. It applies the
+        resource backstops, forks, and the child execs ``work_argv``.
 
-        Every configured :class:`Hatch` is still bound and served: the socket is a
-        file at ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so a bare entrypoint
-        reaches it with no in-guest relay.
+        Args:
+            work_argv: What the shim's forked child execs.
+            code: ``POSTERN_CODE`` for the :meth:`run_python` re-exec. Empty for an
+                arbitrary program, which reads its own input.
+            recode: Whether ``work_argv`` re-execs the shim to run ``code``. It makes
+                the shim defer ``RLIMIT_AS`` until the fresh interpreter has started.
+            timeout: Seconds before the launch is killed.
+
+        Returns:
+            The launch's result.
         """
         binds, env = self._hatch_wiring()
+        # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
+        # raise KeyError with no hatch configured; seed it empty instead.
+        env = {'POSTERN_HATCH': '', **env}
+        nproc, as_bytes = str(self._profile.rlimit_nproc), str(self._profile.rlimit_as or 0)
+        if self._profile.init is not None:
+            # The C init is PID 1 and execs work_argv itself. The shim is only bound
+            # when work_argv runs it (run_python), and then it is a plain child that
+            # applies RLIMIT_AS once its interpreter is up — so the init must not.
+            binds += ['--ro-bind', os.fspath(self._profile.init), _GUEST_INIT]
+            if recode:
+                binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+                env = {'POSTERN_CODE': code, 'POSTERN_NPROC': nproc, 'POSTERN_AS': as_bytes, **env}
+            limits = ['--nproc', nproc, '--as', '0' if recode else as_bytes]
+            entrypoint = [_GUEST_INIT, *limits, '--', *work_argv]
+        else:
+            binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+            env = {
+                'POSTERN_ARGV': json.dumps(work_argv),
+                'POSTERN_CODE': code,
+                'POSTERN_RECODE': '1' if recode else '',
+                'POSTERN_NPROC': nproc,
+                'POSTERN_AS': as_bytes,
+                **env,
+            }
+            entrypoint = [self._profile.python, '-u', _GUEST_SHIM]
         with contextlib.ExitStack() as stack:
             for hatch in self._hatches:
                 stack.enter_context(hatch.accepting())
-            return self._launch(list(argv), timeout=timeout, setenv=env, extra_binds=binds)
+            return self._launch(entrypoint, timeout=timeout, setenv=env, extra_binds=binds)
+
+    def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
+        """Run ``argv`` inside the sandbox and return its result.
+
+        The entrypoint for a program that is not Python. It runs under the same
+        guest init as :meth:`run_python`, so ``argv`` inherits ``RLIMIT_NPROC`` and
+        ``RLIMIT_AS`` across the exec, has its orphaned descendants reaped, and is
+        not PID 1 itself. Under the C init (``SandboxProfile.init``) it needs no
+        interpreter in the sandbox; under the fallback Python shim,
+        ``profile.python`` must exist there even when ``argv`` is a compiled
+        program.
+
+        Every configured :class:`Hatch` is bound and served: the socket is a file at
+        ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so ``argv`` reaches it with no
+        in-guest relay.
+        """
+        return self._supervised(list(argv), timeout=timeout)
+
+    def run_bash(self, script: str, *, shell: str = 'bash', timeout: float = 60) -> ProcResult:
+        """Run ``script`` inside the sandbox as ``shell -c script``.
+
+        Args:
+            script: The script text. It is an argument to ``shell`` in the guest,
+                never interpolated into a host command line.
+            shell: The shell to run it with. Must exist in the sandbox, which a
+                curated ``rootfs`` need not provide.
+            timeout: Seconds before the launch is killed.
+
+        Returns:
+            The launch's result.
+        """
+        return self._supervised([shell, '-c', script], timeout=timeout)
 
     def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
+        The shim's child re-execs ``profile.python`` to run ``code``, so the code
+        gets a clean interpreter rather than the supervisor's own process, and
+        ``RLIMIT_AS`` is applied once that interpreter is up.
+
         Each configured :class:`Hatch` binds its own UDS in. The unnamed hatch
         exports its path as ``POSTERN_HATCH``, a named one as
         ``POSTERN_HATCH_<NAME>``; the client library that dials it comes from the
-        guest's bound environment. The shim applies ``RLIMIT_NPROC`` and
-        ``RLIMIT_AS`` before running the code.
+        guest's bound environment.
         """
-        binds, env = self._hatch_wiring()
-        binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
-        # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
-        # raise KeyError with no hatch configured; seed it empty instead.
-        env = {
-            'POSTERN_CODE': code,
-            'POSTERN_NPROC': str(self._profile.rlimit_nproc),
-            'POSTERN_AS': str(self._profile.rlimit_as or 0),
-            'POSTERN_HATCH': '',
-            **env,
-        }
-        argv = [self._profile.python, '-u', _GUEST_SHIM]
-        with contextlib.ExitStack() as stack:
-            for hatch in self._hatches:
-                stack.enter_context(hatch.accepting())
-            return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
+        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True, timeout=timeout)
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.
@@ -552,15 +627,36 @@ class Sandbox:
         platform — no user namespace, gVisor, an uncovered arch — surfaces at
         startup rather than on the first real request.
 
+        With an init set, the trivial launch is the init's own ``--version``, run
+        inside the sandbox, and its answer must be this postern's version.
+
         Raises:
-            IsolationError: If ``seccomp`` is disabled in the profile, or the
-                trivial launch fails.
+            IsolationError: If ``seccomp`` is disabled in the profile, the trivial
+                launch fails, or the init was built from another postern version.
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
-        result = self.run_python('pass', timeout=timeout)
+        if self._profile.init is None:
+            result = self.run_python('pass', timeout=timeout)
+            if not result.ok:
+                raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+            return
+        # The init itself, inside the sandbox: it needs nothing from the rootfs (under
+        # the C init a rootfs need not carry Python), and the init is never executed
+        # on the host. The host only ever runs bwrap; running a deployer-supplied
+        # binary here, as the worker and with its environment, would hand anything
+        # that could swap that file the worker's privileges.
+        result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+        import postern  # noqa: PLC0415 — the package imports this module
+
+        reported = result.stdout.strip()
+        if reported != postern.__version__:
+            raise IsolationError(
+                f'guest init {self._profile.init} was built from postern {reported}, not {postern.__version__}; '
+                'rebuild it with `python -m postern.build_init`'
+            )
 
     def close(self) -> None:
         """Remove the workspace if this Sandbox created it (a no-op for a caller-owned path)."""

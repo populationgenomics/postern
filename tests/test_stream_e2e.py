@@ -90,8 +90,8 @@ def test_guest_has_no_network_but_still_reaches_the_stream_hatch():
 
 @requires_git
 def test_bare_argv_entrypoint_clones_through_the_hatch(origin_repo):
-    # `git` is the entrypoint: no shim, nothing in-guest to relay through, and the
-    # clone works because the hatch is a file the guest opens.
+    # `git` is the work argv the shim execs, with nothing in-guest to relay
+    # through: the clone works because the hatch is a file the guest opens.
     hatch = StreamHatch(splice_subprocess(['git', 'upload-pack', str(origin_repo)]), name='repo')
     sandbox = Sandbox(SandboxProfile(), hatch=hatch)
     result = sandbox.run(
