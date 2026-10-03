@@ -406,6 +406,7 @@ class AsyncProcess:
         # Its own descriptor, as the Process closes its pidfd on bwrap when it closes.
         self._exit_fd: int | None = os.dup(process._launch.bwrap_pidfd)  # noqa: SLF001 — the two faces of one run
         self._closing: asyncio.Future[None] | None = None
+        self._exited: asyncio.Future[None] | None = None
 
     @property
     def pid(self) -> int:
@@ -450,19 +451,42 @@ class AsyncProcess:
                         yield item
 
     async def wait(self) -> int:
-        """Wait for the run to end and return its status."""
+        """Wait for the run to end and return its status. Any number of tasks can wait at once."""
         if self._process.returncode is None:
+            await asyncio.shield(self._exit())
+        return self._process.wait()
+
+    def _exit(self) -> asyncio.Future[None]:
+        """The future every :meth:`wait` shares, settled when bwrap exits.
+
+        Shared because the loop keeps one reader per descriptor: a second
+        ``add_reader`` on the pidfd would replace the first waiter's, which would
+        then never wake.
+        """
+        if self._exited is None:
             if self._exit_fd is None:
                 raise ValueError('wait() on a closed AsyncProcess')
             loop = asyncio.get_running_loop()
-            exited = loop.create_future()
-            loop.add_reader(self._exit_fd, _settle, exited)
-            try:
-                if self._process.returncode is None:
-                    await exited
-            finally:
-                loop.remove_reader(self._exit_fd)
-        return self._process.wait()
+            exit_fd = self._exit_fd
+            exited: asyncio.Future[None] = loop.create_future()
+
+            def settle() -> None:
+                loop.remove_reader(exit_fd)
+                _settle(exited)
+
+            loop.add_reader(exit_fd, settle)
+            self._exited = exited
+        return self._exited
+
+    def _release_exit_fd(self) -> None:
+        """Close the pidfd :meth:`wait` watches, waking any waiter still on it."""
+        if self._exit_fd is None:
+            return
+        if self._exited is not None and not self._exited.done():
+            self._exited.get_loop().remove_reader(self._exit_fd)
+            self._exited.set_result(None)
+        os.close(self._exit_fd)
+        self._exit_fd = None
 
     async def communicate(self, timeout: float | None = None, *, max_output: int | None = None) -> ProcResult:
         """Read the rest of the output, wait for the run to end, and close it. See :meth:`Process.communicate`."""
@@ -527,11 +551,9 @@ class AsyncProcess:
                     self.kill()
                     await self.wait()
         finally:
-            if self._exit_fd is not None:
-                os.close(self._exit_fd)
-                self._exit_fd = None
             if self._process.returncode is None:
                 self._process.kill()
+            self._release_exit_fd()
             await asyncio.shield(asyncio.to_thread(self._process.close))
 
     async def __aenter__(self) -> typing_extensions.Self:
