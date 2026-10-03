@@ -429,6 +429,12 @@ guest rootfs copied to `/opt/guest-root`. `examples/worker.py` binds it with
 `SandboxProfile(rootfs='/opt/guest-root')`, so the guest sees only that curated
 image. Cloud Run gen2 provides the unprivileged user namespaces bubblewrap needs.
 
+Cloud Run stops a task with SIGTERM to the container's entrypoint, then SIGKILL
+10 s later. As the container's PID 1, a worker with no SIGTERM handler ignores
+the SIGTERM, so its guests get no chance to clean up before the SIGKILL.
+`examples/worker.py` installs one: it passes the stop on to the run with
+`terminate()`, so the guest's own cleanup runs, and exits 143.
+
 ## Roadmap
 
 Not implemented:
