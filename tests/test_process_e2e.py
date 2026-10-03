@@ -238,6 +238,36 @@ def test_async_terminate_lets_the_command_clean_up(sandbox):
     assert (rest, status) == (b'cleaning-up\n', 3)
 
 
+def test_concurrent_waits_all_return(sandbox):
+    async def main() -> list[int]:
+        async with await sandbox.astart_bash('sleep 0.3') as process:
+            return await asyncio.wait_for(asyncio.gather(*(process.wait() for _ in range(3))), 5)
+
+    assert asyncio.run(main()) == [0, 0, 0]
+
+
+def test_a_cancelled_wait_does_not_strand_another(sandbox):
+    async def main() -> int:
+        async with await sandbox.astart_bash('sleep 0.3') as process:
+            first = asyncio.create_task(process.wait())
+            await asyncio.sleep(0.05)
+            first.cancel()
+            return await asyncio.wait_for(process.wait(), 5)
+
+    assert asyncio.run(main()) == 0
+
+
+def test_closing_wakes_a_waiter(sandbox):
+    async def main() -> int:
+        process = await sandbox.astart_bash('sleep 30')
+        waiter = asyncio.create_task(process.wait())
+        await asyncio.sleep(0.05)
+        await process.aclose()
+        return await asyncio.wait_for(waiter, 5)
+
+    assert asyncio.run(main()) != 0
+
+
 def test_cancelling_the_task_stops_the_run_gracefully(sandbox):
     # asyncio cancellation of the task using the process becomes a graceful stop
     # of the guest, as the async with block unwinds.
