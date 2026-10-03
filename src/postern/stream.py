@@ -110,6 +110,7 @@ import contextlib
 import dataclasses
 import errno
 import fcntl
+import logging
 import os
 import select
 import selectors
@@ -120,13 +121,16 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Callable, Generator, Sequence
 from concurrent import futures
 
-from postern import _sandbox
+from postern import _log, _sandbox
 
 # Bound as names, not reached through _sandbox: __all__ below re-exports these two.
 from postern._sandbox import guest_env_var, guest_socket_path
+
+log = logging.getLogger(__name__)
 
 _CHUNK = 65536
 # Concurrent connections a hatch serves at once; gates accepting, not dispatch.
@@ -142,6 +146,8 @@ _REJECT_GRACE = 0.5
 _FATAL_ACCEPT_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
 # Pause before retrying a transient accept() failure: no hot spin on an fd shortage.
 _ACCEPT_RETRY_DELAY = 0.05
+# Escaped-traceback cap: enough for a real stack, still a bounded record.
+_TRACEBACK_CAP = 4000
 # How long to wait when probing whether a socket in the way is still live.
 _STALE_PROBE_TIMEOUT = 1.0
 # A poll rather than `Popen.wait(timeout=...)` because that reaps, and the reap is
@@ -462,8 +468,12 @@ class Process:
             self._disposed = True
         if self._proc is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             _reap(self._proc, grace, self._pgid)
+        except Exception:  # noqa: BLE001 — teardown must not raise; the log is the report
+            # A reap that fails leaves a live subprocess the hatch no longer tracks,
+            # so the host's process table grows silently. Never fatal to teardown.
+            log.warning('failed to reap the command for a stream verdict', exc_info=True)
 
 
 Handler = Callable[[Stream], 'Process | None']
@@ -701,6 +711,7 @@ class StreamHatch:
         self._started = True
         self._accepting = True
         threading.Thread(target=self._accept_loop, args=(srv,), daemon=True, name='postern-stream-accept').start()
+        log.info('stream hatch %s serving at %s', _log.safe(self._name), self._path)
 
     def _clear_stale_socket(self) -> None:
         """Remove a dead socket left where we are about to bind. Nothing else.
@@ -755,6 +766,9 @@ class StreamHatch:
                 # Transient: EMFILE/ENFILE when the *embedding* worker momentarily
                 # runs out of descriptors, ECONNABORTED when a dial dies during the
                 # handshake, EINTR. Riding these out rather than retiring the hatch.
+                # Host-side condition: the guest cannot reach it. The retry sleep
+                # bounds this at 1/_ACCEPT_RETRY_DELAY lines per second (20).
+                log.warning('accept() failed transiently on hatch %s: %s; retrying', _log.safe(self._name), exc)
                 self._slots.release()
                 time.sleep(_ACCEPT_RETRY_DELAY)
                 continue
@@ -790,10 +804,19 @@ class StreamHatch:
             if verdict is None:
                 # A raw stream has no way to say "no", so a refusal is end-of-stream
                 # and nothing else — no diagnostic, which here would be host state.
+                # DEBUG: a handler that refuses by policy is working correctly, and
+                # the guest picks the rate.
+                log.debug('handler refused a connection on hatch %s', _log.safe(self._name))
                 _drain(conn, self._grace)
             else:
                 _await_command(verdict)
-        except Exception:  # noqa: BLE001 — hostile input; contain it to this connection
+        except Exception as exc:  # noqa: BLE001 — hostile input; contain it to this connection
+            if isinstance(exc, ConnectionAbortedError) and self._closing:
+                # _track's teardown refusal, not a handler failure: close() ran while
+                # this connection was in flight. The guest picks how many fire.
+                log.debug('hatch %s closed with a connection in flight', _log.safe(self._name))
+            else:
+                _report_handler_failure(self._name, exc)
             _drain(conn, self._grace)
         finally:
             # The verdict must not outlive the connection: an abandoned subprocess
@@ -864,6 +887,7 @@ class StreamHatch:
         if self._dir is not None:
             with contextlib.suppress(OSError):
                 os.rmdir(self._dir)
+        log.info('stream hatch %s at %s stopped', _log.safe(self._name), self._path)
 
 
 # --------------------------------------------------------------------------- #
@@ -972,11 +996,39 @@ def _abnormal_stdio(conn: socket.socket) -> list[str]:
     return bad
 
 
+def _report_handler_failure(name: str, exc: BaseException) -> None:
+    """Report a handler failure without letting guest bytes into the record raw.
+
+    A handler runs on guest input, so both the exception's text and its traceback
+    are guest-derived. Neither is handed to ``exc_info``: a raw traceback in an
+    aggregated stream lets a guest-chosen message start what reads like a fresh
+    host-attributed line, which is the whole reason :func:`_log.safe` exists. The
+    type and message identify the bug at ``WARNING``; the escaped traceback is at
+    ``DEBUG`` for whoever is actually debugging it.
+
+    Args:
+        name: The hatch the failing handler belongs to.
+        exc: The exception the handler raised.
+    """
+    log.warning(
+        'handler raised for hatch %s: %s; connection dropped',
+        _log.safe(name),
+        _log.safe(f'{type(exc).__name__}: {exc}'),
+    )
+    log.debug(
+        'handler traceback for hatch %s: %s',
+        _log.safe(name),
+        _log.safe(traceback.format_exc(), _TRACEBACK_CAP),
+    )
+
+
 def _dispose(verdict: Process | None, grace: float) -> None:
     """Release whatever a verdict was holding. Idempotent, never raises."""
     if verdict is not None:
-        with contextlib.suppress(Exception):
+        try:
             verdict.dispose(grace)
+        except Exception:  # noqa: BLE001 — teardown must not raise; the log is the report
+            log.warning('failed to dispose a stream verdict', exc_info=True)
 
 
 def _readable(sock_or_fd: socket.socket | int, timeout: float) -> bool:
@@ -1183,8 +1235,11 @@ def _reap(proc: subprocess.Popen[bytes], grace: float, pgid: int | None = None) 
             # way an unreaped zombie pins the pid, so the group id is still valid.
             # The re-check matters because `_exited`'s last-resort tier reaps.
             _signal_group(proc, pgid, signal.SIGKILL)
-    with contextlib.suppress(Exception):
+    try:
         proc.wait()
+    except Exception:  # noqa: BLE001 — teardown must not raise; the log is the report
+        # The pid stays unreaped, so it lingers as a zombie for the worker's life.
+        log.warning('failed to wait on pid %d after signalling it', proc.pid, exc_info=True)
     # stderr too: `splice_subprocess` refuses PIPE, but a handler may build its own
     # Popen, and an unclosed read end leaks until the Popen is collected.
     for pipe in (proc.stdin, proc.stdout, proc.stderr):

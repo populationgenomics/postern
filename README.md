@@ -355,6 +355,55 @@ diagnostics onto *stdout* routes around it (`git upload-archive` reports
 `fatal: '<path>' does not appear to be a git repository` on its pkt-line
 sideband), so pass `cwd` and a bare basename rather than an absolute host path.
 
+## Logging
+
+postern logs through the stdlib and configures nothing. Each module logs to
+`logging.getLogger('postern.<module>')`; the package attaches a `NullHandler` to
+`postern` and adds no handler, sets no level and installs no format. Wiring the
+sink is the application's job — on Cloud Run, structured stdout is ingested, so a
+`logging.basicConfig` (or the app's own JSON formatter) is the whole integration.
+There is no `google-cloud-logging` dependency and no OpenTelemetry: tracing is a
+separate concern and a separate dependency decision.
+
+```python
+logging.getLogger('postern').setLevel(logging.INFO)     # hatch start and stop
+logging.getLogger('postern').setLevel(logging.DEBUG)    # every guest-driven event
+```
+
+**The level split is a security property.** A guest reaches the hatch, so a
+per-event line on a guest-driven path is an amplifier whose rate the guest sets —
+bounded only by `run_python(timeout=)`.
+
+- **`WARNING`** — evidence about the *host*: a handler that raised, with the
+  exception type and message, so a host bug is not indistinguishable from the
+  guest's clean end-of-stream; a reap or dispose that failed and therefore leaked
+  a subprocess; closing an unclosed `Workspace` failing; `accept()` failing
+  transiently because the embedding worker is out of descriptors (bounded at
+  `1/_ACCEPT_RETRY_DELAY` = 20 lines/second, and unreachable by the guest). Also a
+  gRPC method called that is not on the allowlist: in correct operation the guest
+  only calls what the host allowlisted, so it is either a misconfigured allowlist
+  or a guest probing the boundary.
+- **`INFO`** — a hatch starting and stopping: two lines per hatch per run, for
+  both `GrpcHatch` and `StreamHatch`.
+- **`DEBUG`** — what a well-behaved guest drives at its own rate: a handler
+  refusing by policy (that is the handler working), a connection in flight when
+  `close()` runs, and the traceback behind a `WARNING` handler failure.
+
+Nothing is rate-limited or aggregated: every event gets a line.
+
+**A handler failure is the one WARNING a guest can drive.** A handler runs on
+guest input, so a handler that raises on malformed input logs once per connection
+at the default level. That is deliberate — a host bug that only fires on hostile
+input is exactly what you want to see — but it means a handler should refuse by
+returning `None` (`DEBUG`) and raise only when something is genuinely wrong.
+
+**Guest-derived values are never interpolated raw, tracebacks included.** A gRPC
+method name, and a handler exception's type, message and traceback, go through
+`postern._log.safe`, which `repr`s and length-caps them so a newline cannot start
+what reads like a new host-attributed entry in an aggregated stream. Nothing on a
+guest-reachable path is handed to `exc_info`; the traceback is escaped and logged
+at `DEBUG` instead.
+
 ## Install
 
 ```bash
