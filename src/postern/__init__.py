@@ -20,11 +20,18 @@ coarse permission flag.
 The bare `Sandbox` has no third-party dependencies and no cloud dependency — it
 is a Linux + bubblewrap primitive. The gRPC hatch lives behind the ``grpc``
 extra; the stream hatch is stdlib-only.
+
+Logging: every module logs to ``logging.getLogger('postern.<module>')``. This
+package attaches a `logging.NullHandler` to ``postern`` and does nothing else —
+no handler, no level, no format. Configuring the sink is the application's job.
+``postern.grpc``'s allowlist denials and a handler that raises are logged at
+``WARNING``; everything a well-behaved guest can drive is ``DEBUG``.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 
 from postern._process import AsyncProcess, Process, ProcResult
 from postern._sandbox import IsolationError, Sandbox, SandboxProfile, available
@@ -35,6 +42,14 @@ from postern._workspace import (
     WorkspaceReport,
     reference_closed_filter,
 )
+
+# A library attaches no handler of its own. Without this, a host that configures
+# no logging at all gets `logging.lastResort`, which prints WARNING and above to
+# stderr — a library deciding on the application's behalf that a record is worth
+# a line. Guarded so a re-import cannot stack a second one.
+_root = logging.getLogger(__name__)
+if not any(isinstance(h, logging.NullHandler) for h in _root.handlers):
+    _root.addHandler(logging.NullHandler())
 
 try:
     __version__ = importlib.metadata.version('postern')

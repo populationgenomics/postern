@@ -22,6 +22,7 @@ postern.grpc`` only where you use it; the bare `Sandbox` stays dependency-free.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import tempfile
 import typing
@@ -29,6 +30,10 @@ from collections.abc import Callable, Generator
 from concurrent import futures
 
 import grpc
+
+from postern import _log
+
+log = logging.getLogger(__name__)
 
 
 class _Allowlist(grpc.ServerInterceptor):
@@ -45,6 +50,11 @@ class _Allowlist(grpc.ServerInterceptor):
         method = getattr(handler_call_details, 'method', None)
         if method in self._allowed:
             return continuation(handler_call_details)
+
+        # WARNING, not DEBUG: in correct operation the guest only calls what the
+        # host allowlisted, so this is either a misconfigured allowlist or a guest
+        # probing the boundary. `method` is guest-controlled — never raw.
+        log.warning('hatch denied a method not on the allowlist: %s', _log.Guest(method))
 
         def deny(_request: object, context: grpc.ServicerContext) -> typing.NoReturn:
             context.abort(grpc.StatusCode.PERMISSION_DENIED, f'{method} is not on the hatch allowlist')
@@ -100,6 +110,7 @@ class GrpcHatch:
             # when ``socket_path`` was supplied — never on the socket mode.
             with contextlib.suppress(OSError):
                 os.chmod(self._path, 0o666)  # noqa: S103 — see above
+            log.info('grpc hatch serving at %s', self._path)
 
     @contextlib.contextmanager
     def accepting(self) -> Generator[GrpcHatch, None, None]:
@@ -115,6 +126,7 @@ class GrpcHatch:
         if self._started:
             self._server.stop(0)
             self._started = False
+            log.info('grpc hatch at %s stopped', self._path)
         with contextlib.suppress(OSError):
             os.unlink(self._path)
         if self._dir is not None:
