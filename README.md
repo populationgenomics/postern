@@ -57,11 +57,11 @@ and the arguments and results are typed and language-neutral.
   root (a full host escape);
 - **`--cap-drop ALL`**, **`--new-session`** (anti terminal-injection),
   **`--die-with-parent`**, **`--clearenv`**;
-- **`--as-pid-1`** — the guest entrypoint *is* PID 1 of the guest's PID
-  namespace. A resident bwrap there would share the guest uid, putting its
-  `/proc/1` (cmdline, maps, read/write mem, env) within reach from inside. Who
-  plays init in its place depends on the entrypoint: see
-  [PID 1 and the resource backstops](#pid-1-and-the-resource-backstops) below;
+- **`--as-pid-1`** — postern's guest init *is* PID 1 of the guest's PID namespace.
+  A resident bwrap there would share the guest uid, putting its `/proc/1` (cmdline,
+  maps, read/write mem, env) within reach from inside. What the init does with that
+  role: see [PID 1 and the resource backstops](#pid-1-and-the-resource-backstops)
+  below;
 - **non-root guest** — the guest runs as uid/gid `65534` (`nobody`), so it holds
   no capabilities inside its user namespace, and if the userns fails to
   materialise on a root host it still drops to a non-root real uid
@@ -80,23 +80,65 @@ RPC rides that socket, the guest's own stdin/stdout/stderr stay free.
 
 ### PID 1 and the resource backstops
 
-Everything above is a bwrap flag, so every entrypoint gets it. These two are not,
-and they follow the entrypoint instead:
+Everything above is a bwrap flag, so every entrypoint gets it. The rlimits and the
+init role are not flags: they come from the guest's **init**, which postern binds in
+and makes the entrypoint for **every** run.
 
-- **`Sandbox.run_python`** binds in a shim (`_guest.py`) and makes *that* the
-  entrypoint. As PID 1 it is a real init: it forks the guest, reaps orphaned
-  descendants that reparent to it, propagates the guest's exit status, and marks
-  *itself* `PR_SET_DUMPABLE=0` so a co-uid process the guest spawns cannot read
-  the init. Before `exec`ing the guest code it applies **`RLIMIT_NPROC`**
-  (`SandboxProfile(rlimit_nproc=1024)`) as a fork-bomb backstop and, when set,
-  **`RLIMIT_AS`** (`SandboxProfile(rlimit_as=...)`, off by default; a cgroup
-  `memory.max` at the deploy layer is the real memory isolation).
-- **`Sandbox.run`** runs the caller's argv directly, with no shim. That argv is
-  PID 1 and must tolerate being it — nothing reaps orphans for it, nothing hides
-  its `/proc/1` from a same-uid child it spawns — and **neither rlimit is set**;
-  the entrypoint manages its own. `rlimit_nproc`/`rlimit_as` on the profile are
-  inert on this path. The stream hatch's `git_url` entrypoint is an example: git
-  is the PID 1 there.
+**Use the C init.** `SandboxProfile(init=...)` names a small static C program
+(`_init.c`, ~190 lines) that you build once, at image-build time, from the source
+postern ships. It needs nothing from the guest's rootfs, and with it the only
+things that need a Python interpreter in the sandbox are `run_python` and the stream
+hatch's `git_url` connector, so a rootfs for `run`/`run_bash` need not carry one.
+Without `init=`, postern falls back to the Python shim (`_guest.py`) as the init,
+which does the same job at the cost of an interpreter in every rootfs and an
+interpreter start on every run: about 16 ms per `run_bash('true')` against 2.9 ms
+under the C init, which is what a bare launch costs.
+
+Either way, the init is a real PID 1. It marks *itself* `PR_SET_DUMPABLE=0` so a
+co-uid process the guest spawns cannot read it, forks the work, reaps orphaned
+descendants that reparent to it, forwards termination signals (the C init to the
+work's whole *process group*, the shim to the work alone), and propagates the
+work's exit status, as 128+N for death by signal N. The forked child applies
+**`RLIMIT_NPROC`** (`SandboxProfile(rlimit_nproc=1024)`) as a fork-bomb backstop
+and, when set, **`RLIMIT_AS`** (`SandboxProfile(rlimit_as=...)`, off by default; a
+cgroup `memory.max` at the deploy layer is the real memory isolation), then `exec`s
+the work. Setting the limits before the `exec` is what carries them to a program
+that would not set them itself.
+
+What the child execs is the only difference between the entrypoints:
+
+- **`Sandbox.run`** execs the caller's argv, and **`Sandbox.run_bash`** execs
+  `shell -c script` (`bash` by default). Neither has to tolerate being PID 1 or
+  manage its own limits. A program the init cannot exec is a `returncode` of 127,
+  not an exception.
+- **`Sandbox.run_python`** execs `profile.python` on the shim, which runs the code
+  in that fresh interpreter. `RLIMIT_AS` is applied after the interpreter is up,
+  because a bare CPython's *virtual* size at startup can exceed a cap that its
+  resident use never approaches, and capping before the `exec` would abort the
+  startup. Under the C init this is one interpreter start; under the fallback shim
+  it is two (the supervising shim, then the re-exec).
+
+**Building the C init.** It ships as source in the package, not as a binary. Build
+it in a throwaway image stage, so no compiler reaches the rootfs or the worker:
+
+```dockerfile
+FROM python:3.12-slim AS init
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && pip install 'postern==X.Y.Z' && python -m postern.build_init /postern-init
+# ... later, in the worker stage:
+COPY --from=init /postern-init /opt/postern-init
+```
+
+```python
+profile = SandboxProfile(rootfs='/opt/guest-root', init='/opt/postern-init')
+```
+
+Install the same postern version in both stages: the binary is stamped with the
+version it was built from, and `verify()` refuses a mismatch. The check reads the
+init's own `--version` from a run *inside* the sandbox: postern never executes the
+init on the host, which only ever runs bwrap. `init=` must be an absolute path. It is static, so it
+needs nothing from the rootfs; postern binds it in at `/run/postern/init`.
+`examples/Dockerfile` does all of this.
 
 **Fail-closed boot check.** Every control is enforced on the launch path: the
 strict `--unshare-*` flags make bwrap abort if it can't create the namespaces,
@@ -106,6 +148,64 @@ probe. `Sandbox(profile).verify()` triggers one trivial launch at startup so a
 broken platform (no user namespace, gVisor, uncovered arch) raises
 `IsolationError` there rather than on the first request. Call it at worker startup
 and refuse to serve if it raises, as `examples/worker.py` does.
+
+### Streaming and stopping a run
+
+`run`, `run_bash` and `run_python` block until the run ends. `start`, `start_bash`
+and `start_python` return a `Process` at once, which streams the output as the
+guest writes it and can be stopped:
+
+```python
+with sandbox.start_bash('make test') as process:
+    for stream, chunk in process.output():   # stream is 'stdout' or 'stderr'
+        show(stream, chunk)
+        if user_pressed_stop():
+            process.terminate(grace=5)       # SIGTERM now, SIGKILL after 5 s
+status = process.returncode
+```
+
+The same run for asyncio comes from `astart`, `astart_bash` and `astart_python`:
+
+```python
+async with await sandbox.astart_bash('make test') as process:
+    async for stream, chunk in process.output():
+        await show(stream, chunk)
+    status = await process.wait()
+```
+
+- **One way to read output.** `output()` yields `(stream, bytes)` chunks from both
+  pipes in the order they arrive; a chunk can end mid-line or mid-character. There
+  are deliberately no separate stdout and stderr readers: draining one while the
+  other's pipe fills stalls the guest. For a single stream, write `2>&1`.
+  `communicate(timeout)` collects whatever `output()` has not into a `ProcResult`,
+  which is all `run*` does.
+- **Stopping is graceful.** bwrap does not forward signals, so `terminate()`
+  signals the guest's init directly, through a pidfd on the host pid bwrap reports
+  on `--info-fd` (so a recycled pid is never signalled). The init forwards the
+  SIGTERM to the command (the C init to its whole process group), which can trap it
+  and clean up; if it is still running after `grace`, the init is killed through
+  the same pidfd and the kernel kills the rest of its namespace with it. A launch
+  raises `IsolationError` where pidfds do not work (before Linux 5.3, or under a
+  seccomp profile blocking `pidfd_open`) or `/proc` cannot vouch for the init (a
+  `/proc` from another pid namespace, `hidepid`), since a stop could not then be
+  sure of reaching it. A SIGTERM sent before the init is ready for it is held
+  pending until it is, not dropped: bwrap is launched with SIGTERM blocked, and
+  the init inherits that. bwrap therefore ignores SIGTERM itself (`pkill -TERM
+  bwrap` does nothing); a SIGTERM to the whole cgroup or process group still
+  reaches the init, which forwards it. `terminate()` returns at once and is safe
+  from another thread, so keep reading to see what the command says on its way
+  out. `kill()` skips the grace.
+- **Leaving early stops it too.** Leaving the `with` block while the run is still
+  going (on an exception, a `break`, or an asyncio task cancellation) terminates it
+  with a 1 s grace, discarding its remaining output. Close the `Process` (the
+  `with` block does) to release the run's hatches, which serve until then.
+- **When the loop ends.** `output()` ends when both pipes close, which is normally
+  when the run ends: the init's exit takes everything else in the namespace with
+  it, so a backgrounded straggler cannot hold the loop open. A command that closes
+  its own output ends the loop early; `wait()` gives the status either way.
+- **No threads for asyncio.** `AsyncProcess` reads the non-blocking pipes with loop
+  readers and waits for the exit on a pidfd on bwrap. One reader per process:
+  `terminate()` and `kill()` are the calls meant to come from elsewhere.
 
 ## The environment (getting pandas etc. in)
 
@@ -122,6 +222,9 @@ mounted read-only — never `pip install`ed at run time.
   dir, or ship a single squashfs/erofs image file mounted read-only via FUSE
   (`squashfuse`, unprivileged, Cloud-Run-compatible) and point `rootfs` at the
   mountpoint. `bwrap --ro-overlay` can stack OCI layer dirs without flattening.
+  With the C init (`SandboxProfile(init=...)`) the rootfs needs `profile.python`
+  only for `run_python` and `git_url`; under the fallback Python shim every
+  entrypoint needs it.
 
 ## Requirements
 
@@ -168,7 +271,8 @@ sandbox.run(['git', '-c', 'protocol.ext.allow=always', 'clone',
 Pass `profile=` to `git_url`: the in-guest interpreter comes from
 `profile.python`, the same place `run_python` gets it, so the URL cannot disagree
 with the sandbox it runs in. Without it the default is a bare `python3` off the
-guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`.
+guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`. The connector
+is Python, so this needs an interpreter in the rootfs even under the C init.
 
 **The socket is the capability.** The same access could be brokered through an
 HTTP forward proxy with a handler policing each request; a bound stream socket
@@ -190,9 +294,9 @@ differs in four ways.
 - *No protocol translation.* The host side runs a subprocess and splices its
   stdio, rather than decoding framing and re-emitting headers to reach the same
   subprocess.
-- *It works with `Sandbox.run`.* A hatch needs nothing in-guest, so a bare `git`
-  entrypoint reaches it, not only a `run_python` guest. Both entrypoints bind and
-  serve every configured hatch.
+- *It works with `Sandbox.run`.* A hatch needs nothing in-guest, so a plain `git`
+  entrypoint reaches it, not only a `run_python` guest. Every entrypoint binds and
+  serves every configured hatch.
 
 Stream hatches are **named**, so a sandbox carries as many as it has resources:
 each binds at `/run/postern/<name>.sock` and is exported as
@@ -309,8 +413,9 @@ pip install 'postern[grpc]'      # + the gRPC hatch
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.verify()` (fail-closed boot check, raises `IsolationError`). Both entrypoints bind and serve every configured hatch and get the identical bwrap profile; they differ in PID 1 and the rlimits ([above](#pid-1-and-the-resource-backstops)). `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
-- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by `run_python`'s shim, so they are inert under `run()`.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.start(argv)`, `.start_bash(script, *, shell='bash')`, `.start_python(code)` → `Process`, and `await .astart(...)`, `.astart_bash(...)`, `.astart_python(...)` → `AsyncProcess` ([streaming and stopping](#streaming-and-stopping-a-run)); `.verify()` (fail-closed boot check, raises `IsolationError`, as does any launch where pidfds do not work). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `Process` — `.output()` → iterator of `(stream, bytes)`; `.terminate(*, grace=5.0)`, `.kill()`, `.wait(timeout=None)`, `.communicate(timeout=None)` → `ProcResult`, `.close()`; `.pid`, `.returncode`, `.terminated`; a context manager. `AsyncProcess` is the same run for asyncio: `async for` over `.output()`, `await .wait()`, `await .communicate(timeout=None)`, `await .aclose()`, `async with`.
+- `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None, init=None)` and `SandboxProfile.with_venv(venv, **kw)`. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `init=` names the static C init built by `python -m postern.build_init`, the recommended PID 1 ([above](#pid-1-and-the-resource-backstops)); `None` falls back to the Python shim, and `verify()` checks the init was built from this postern version. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by the guest init, so every entrypoint gets them.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
 - `postern.stream.StreamHatch(handler, *, name='stream', socket_path=None, max_conns=8, backlog=64, grace=5.0)` — a raw bidirectional byte stream over the sandbox UDS, reached as a plain file at `$POSTERN_HATCH_<NAME>`, so `run()` works and not only `run_python()`. Named, so several coexist: one socket per resource. Stdlib-only. `with hatch.accepting(): ...`, and `close()` is terminal as `GrpcHatch`'s is.
   - `handler(stream) -> Process | None`: return `Process(argv, cwd=None, env=None, stderr=DEVNULL)` to hand the connection to a subprocess as its stdio, or `None` to refuse. The hatch spawns it, so the descriptor is in ordinary-stdio shape (blocking, no signal-driven I/O, no socket timeouts) before there is a child to race.
@@ -372,6 +477,12 @@ and assembles the worker (bubblewrap + `postern[grpc]` + your servicer) with the
 guest rootfs copied to `/opt/guest-root`. `examples/worker.py` binds it with
 `SandboxProfile(rootfs='/opt/guest-root')`, so the guest sees only that curated
 image. Cloud Run gen2 provides the unprivileged user namespaces bubblewrap needs.
+
+Cloud Run stops a task with SIGTERM to the container's entrypoint, then SIGKILL
+10 s later. As the container's PID 1, a worker with no SIGTERM handler ignores
+the SIGTERM, so its guests get no chance to clean up before the SIGKILL.
+`examples/worker.py` installs one: it passes the stop on to the run with
+`terminate()`, so the guest's own cleanup runs, and exits 143.
 
 ## Roadmap
 

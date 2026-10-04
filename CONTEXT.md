@@ -18,8 +18,8 @@ gate the host opens.
 - **Sandbox** — the sealed wall. One bubblewrap-launched process with the
   hardened profile: empty network namespace (no egress), surgical read-only
   filesystem, `--cap-drop ALL`, `--new-session` and a seccomp denylist. Runs a
-  guest via `run` (raw argv) or `run_python` (the shim path, which adds the
-  `RLIMIT_NPROC` backstop). The security-critical module.
+  guest via `run` (an argv), `run_bash` (a shell script) or `run_python` (Python
+  code), all three under the guest init. The security-critical module.
 
 - **SandboxProfile** — the description of a sealed wall: workspace, rootfs,
   interpreter, extra read-only binds, stubs, env, and the seccomp/rlimit knobs.
@@ -74,11 +74,29 @@ gate the host opens.
   image-build time (never a runtime container engine). `None` binds the host's
   own system dirs — convenient for dev, exposes the host userland read-only.
 
-- **Shim** (`_guest.py`) — the in-sandbox entrypoint for `run_python`. Runs
-  *inside* the wall, so it is stdlib-only: it applies `RLIMIT_NPROC` and
-  `RLIMIT_AS`, then `exec`s the guest code as PID 1's forked child. The host↔shim
-  handshake rides three env vars (`POSTERN_CODE`, `POSTERN_NPROC`,
-  `POSTERN_AS`).
+- **Init** — PID 1 of the guest's namespace, and the entrypoint for every run: it
+  forks, the child applies `RLIMIT_NPROC` and `RLIMIT_AS` and then `exec`s the
+  work, and the init reaps the namespace, forwards signals and propagates the
+  work's exit status. The recommended init is the **C init** (`_init.c`), a static
+  program the profile names (`SandboxProfile(init=...)`): no interpreter needed,
+  signals forwarded to the whole process group, contract in its argv (`--nproc`,
+  `--as`, `-- argv...`). It ships as source; the deployer builds it with
+  `python -m postern.build_init` in a throwaway image stage, stamped with the
+  postern version `verify()` checks it against. Without one, the **Shim** is the
+  init.
+
+- **Process** — a run in progress, from `Sandbox.start*` (`AsyncProcess` from
+  `astart*`, for asyncio). Its output is one merged stream of
+  `(stream, bytes)`, never separate readers (draining one would stall the guest
+  on the other); it stops gracefully (`terminate`: SIGTERM to the init through a
+  pidfd, a kill after the grace), including when its `with` block is left early.
+  It owns the run's hatches until closed. `run*` is `start*` plus `communicate`.
+
+- **Shim** (`_guest.py`) — the stdlib-only Python that runs `run_python`'s code
+  in the guest, and the fallback init when the profile names no C init. Under the C
+  init it is a plain child; as the fallback init it forks a re-exec of itself for
+  `run_python`. The host↔shim handshake rides five env vars (`POSTERN_ARGV`,
+  `POSTERN_CODE`, `POSTERN_RECODE`, `POSTERN_NPROC`, `POSTERN_AS`).
 
 - **Stubs** — importable modules injected at `/run/postern/stubs` (on the
   guest's `PYTHONPATH`). Lets one shared rootfs carry the heavy base while the

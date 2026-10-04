@@ -68,8 +68,8 @@ elsewhere:
 
 - If the import is type-only because of a *circular import*, the abstractions are usually wrong. Restructure.
 - If the import is type-only because the module is not installed at run time, that is a real exception — keep the block
-  and say why on the line above it. postern has one such import, `typing_extensions.Self`, guarded in `_sandbox.py` and
-  `_workspace.py`: it is a type-check-only backport for the 3.10 floor and must not become a runtime dependency of a
+  and say why on the line above it. postern has one such import, `typing_extensions.Self`, guarded in `_sandbox.py`,
+  `_process.py` and `_workspace.py`: it is a type-check-only backport for the 3.10 floor and must not become a runtime dependency of a
   package whose core has none.
 
 For everything else (`Iterator`, `Sequence` from `collections.abc`), import at module level. The runtime cost is

@@ -3,9 +3,12 @@
 `Sandbox` runs a program (or a snippet of Python) under bubblewrap with the
 hardened profile: an empty network namespace, a surgical read-only view of the
 base system directories plus one writable workspace, `--cap-drop ALL`,
-`--new-session` and a seccomp denylist. :meth:`Sandbox.run_python` adds the
-``RLIMIT_NPROC`` fork-bomb backstop through its shim. The guest's only channel to
-the outside is whatever `Hatch` the caller binds in.
+`--new-session` and a seccomp denylist. Every entrypoint runs under the guest's
+init, PID 1 of its namespace, which adds the ``RLIMIT_NPROC`` fork-bomb backstop
+and reaps the guest's orphans: the static C init when the profile names one
+(``SandboxProfile.init``, the recommended path), the Python shim
+(`postern._guest`) otherwise. The guest's only channel to the outside is whatever
+`Hatch` the caller binds in.
 
 The base system directories come from the host by default, or from a curated
 ``rootfs`` directory assembled at image-build time, which hides the host userland
@@ -18,27 +21,36 @@ reports whether the runtime can launch here.
 
 from __future__ import annotations
 
+import asyncio
+import collections.abc
 import contextlib
 import dataclasses
+import functools
+import json
 import os
 import pathlib
+import queue
 import re
+import selectors
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 import typing
-from collections.abc import Callable, Sequence
 
-from postern import _seccomp, _workspace
+from postern import _process, _seccomp, _workspace
 
 if typing.TYPE_CHECKING:
     # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
     # the floor is 3.10, so the backport must stay behind this guard.
-    from typing_extensions import Self
+    import typing_extensions
 
 _GUEST_DIR = '/run/postern'
 _GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # the unnamed hatch (GrpcHatch) → POSTERN_HATCH
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
+_GUEST_INIT = f'{_GUEST_DIR}/init'
 _GUEST_STUBS = f'{_GUEST_DIR}/stubs'
 _GUEST_WORKSPACE = '/workspace'
 _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
@@ -154,24 +166,13 @@ def available() -> bool:
 
 
 class IsolationError(RuntimeError):
-    """A boot-time isolation self-test found a load-bearing control unenforced.
+    """A load-bearing control cannot be enforced here.
 
     Raised by :meth:`Sandbox.verify`, so a worker can refuse to serve rather than
-    run untrusted code with weaker isolation than intended.
+    run untrusted code with weaker isolation than intended, and by a launch that
+    could not hold the guest's init by pidfd, without which a stop could not be
+    sure of reaching it.
     """
-
-
-@dataclasses.dataclass
-class ProcResult:
-    """The outcome of one guest run."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0
 
 
 @dataclasses.dataclass
@@ -188,8 +189,10 @@ class SandboxProfile:
         rootfs: A curated base directory whose ``/usr``, ``/lib`` … are bound as
             the guest's system dirs. ``None`` binds the *host's* system dirs,
             exposing the host userland read-only.
-        python: Interpreter argv0 for :meth:`Sandbox.run_python` (an absolute
-            path when it lives in a bound venv).
+        python: Interpreter argv0 for the in-guest shim (an absolute path when it
+            lives in a bound venv). :meth:`Sandbox.run_python` always needs it;
+            under the C init (``init``) nothing else does, while the fallback
+            Python shim needs it for every entrypoint.
         ro_binds: Extra ``(host, guest)`` read-only binds beyond the base system
             dirs — e.g. a venv (see :meth:`with_venv`).
         stubs: Importable modules to inject at ``/run/postern/stubs`` (prepended to
@@ -198,7 +201,8 @@ class SandboxProfile:
             bind in selectively.
         env: Environment for the guest (``--clearenv`` wipes everything first).
         seccomp: Load the syscall denylist.
-        rlimit_nproc: Per-run process-count cap (fork-bomb backstop).
+        rlimit_nproc: Per-run process-count cap (fork-bomb backstop), applied by
+            the guest shim.
         rlimit_as: Per-process address-space cap in bytes, applied by the guest
             shim. ``None`` leaves it unlimited. It bounds one process, not the
             guest's total memory; a cgroup ``memory.max`` at the deploy layer is
@@ -223,13 +227,24 @@ class SandboxProfile:
             rootfs — reachable by ``host_uid``. Ignored when already non-root.
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
             reuses ``guest_gid``.
+        init: Host path to the static guest init that
+            ``python -m postern.build_init`` builds: the recommended PID 1 of
+            every run. Under it :meth:`Sandbox.run` and :meth:`Sandbox.run_bash`
+            need no interpreter in the sandbox; :meth:`Sandbox.run_python` execs
+            ``python`` on the shim as the init's child. It is bound in read-only;
+            being static, it needs nothing from ``rootfs``. It is only ever
+            executed inside the sandbox, never on the host. Must be absolute.
+            :meth:`Sandbox.verify` refuses one built from a different postern
+            version. ``None`` falls
+            back to the Python shim as the init, which needs ``python`` for every
+            entrypoint and costs an interpreter start on every run.
     """
 
     workspace: pathlib.Path | None = None
     rootfs: pathlib.Path | None = None
     python: str = 'python3'
     ro_binds: list[tuple[str, str]] = dataclasses.field(default_factory=list)
-    stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None
+    stubs: str | os.PathLike[str] | collections.abc.Sequence[str | os.PathLike[str]] | None = None
     env: dict[str, str] = dataclasses.field(default_factory=lambda: {'PATH': '/usr/local/bin:/usr/bin:/bin'})
     seccomp: bool = True
     rlimit_nproc: int = 1024
@@ -238,6 +253,7 @@ class SandboxProfile:
     guest_gid: int | None = 65534
     host_uid: int | None = None
     host_gid: int | None = None
+    init: str | os.PathLike[str] | None = None
 
     @classmethod
     def with_venv(cls, venv: str | pathlib.Path, **kwargs: typing.Any) -> SandboxProfile:  # noqa: ANN401 — passthrough
@@ -309,8 +325,7 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     argv += ['--new-session', '--cap-drop', 'ALL', '--die-with-parent', '--clearenv']
     # Without --as-pid-1 bwrap stays resident as PID 1 of the guest's namespace,
     # at the guest's own uid, so its /proc/1 (cmdline, maps, mem) is readable from
-    # inside. run_python's shim is then the init; a raw run() entrypoint must
-    # tolerate being PID 1 itself.
+    # inside. The guest's init (the C init, or the Python shim) is PID 1 instead.
     argv += ['--as-pid-1']
     if profile.guest_uid is not None:
         argv += ['--uid', str(profile.guest_uid)]
@@ -348,7 +363,9 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
     return argv
 
 
-def _stub_binds(stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]) -> list[str]:
+def _stub_binds(
+    stubs: str | os.PathLike[str] | collections.abc.Sequence[str | os.PathLike[str]],
+) -> list[str]:
     """Bwrap flags injecting importable stubs at ``/run/postern/stubs``.
 
     A directory is bound whole; a sequence of files is bound each to its basename
@@ -363,6 +380,342 @@ def _stub_binds(stubs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]
     return binds
 
 
+_T = typing.TypeVar('_T')
+
+# How long a launch waits for bwrap to report the init's pid. bwrap writes it once
+# it has cloned the guest, within milliseconds; one that fails first closes the
+# pipe, so this bounds only a bwrap that hangs.
+_INFO_TIMEOUT_S = 30.0
+
+
+class _Job(typing.Generic[_T]):
+    """One call run on another thread, and the hand-off of its result.
+
+    The result goes to the caller, or to ``discard`` if the caller stopped waiting
+    first, so something the call started is never left without an owner. The call
+    itself cannot be interrupted: a ``KeyboardInterrupt`` reaches only the main
+    thread.
+    """
+
+    def __init__(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> None:
+        self._fn = fn
+        self._discard = discard
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._abandoned = False
+        self._value: _T | None = None
+        self._error: BaseException | None = None
+
+    def run(self) -> None:
+        """Run the call, on the thread meant for it. An error in it goes to the caller."""
+        try:
+            value = self._fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the caller
+            self._error = exc
+            self._done.set()
+            return
+        with self._lock:
+            abandoned = self._abandoned
+            self._value = value
+            self._done.set()
+        if abandoned:
+            self._discard(value)
+
+    def result(self) -> _T:
+        """Wait for the call, and return its result or raise its error.
+
+        Interrupted while waiting (a ``KeyboardInterrupt``), the result is discarded
+        here if it has arrived, or by :meth:`run` when it does. Once this returns,
+        the result is the caller's: an interrupt in the few bytecodes before the
+        caller has bound it is beyond reach.
+        """
+        try:
+            self._done.wait()
+        except BaseException:
+            with self._lock:
+                self._abandoned = True
+                arrived = self._done.is_set() and self._error is None
+            if arrived:
+                self._discard(typing.cast('_T', self._value))
+            raise
+        if self._error is not None:
+            raise self._error
+        return typing.cast('_T', self._value)
+
+    def in_thread(self, name: str) -> _T:
+        """Run the call on a new thread of its own and return :meth:`result`."""
+        threading.Thread(target=self.run, name=name, daemon=True).start()
+        return self.result()
+
+
+class _Launcher:
+    """Forks every bwrap from one long-lived thread.
+
+    bwrap's ``--die-with-parent`` is ``PR_SET_PDEATHSIG``, which fires when the
+    *thread* that forked bwrap exits, not the process. Forked from a caller or
+    pool thread, a guest would die when that thread finished.
+
+    Only the fork belongs here, and whatever must follow it before anything else
+    can touch the child: one launch waiting on bwrap would hold up every other.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queue: queue.SimpleQueue[collections.abc.Callable[[], None]] = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+
+    def call(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> _T:
+        """Run ``fn`` on the launcher thread and return its result, or raise its error.
+
+        Args:
+            fn: The fork.
+            discard: Releases ``fn``'s result if the caller is interrupted before
+                receiving it.
+        """
+        job = _Job(fn, discard)
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._serve, name='postern-launcher', daemon=True)
+                self._thread.start()
+        self._queue.put(job.run)
+        return job.result()
+
+    def _serve(self) -> None:
+        # Inherited by bwrap and, across its exec, by the guest init. The init is
+        # PID 1 of its namespace, so the kernel drops a SIGTERM it has no handler for
+        # yet — a Process.terminate() just after start, while the init is still
+        # starting up. Blocked, the SIGTERM is held pending until the init takes it.
+        # bwrap ignores SIGTERM as a result; postern stops it with SIGKILL, and a
+        # cgroup- or group-wide SIGTERM reaches the init directly.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        while True:
+            self._queue.get()()
+
+
+# Process-wide, not per Sandbox: the thread must outlive every guest it launched,
+# and the only lifetime that does so is the worker process's.
+_launcher = _Launcher()
+
+
+def _read_init_pid(info_fd: int) -> int | None:
+    """The guest init's host pid, from bwrap's ``--info-fd`` JSON, or None.
+
+    Reads only until the JSON object is complete rather than to EOF: whether bwrap
+    closes the descriptor after writing is not something to depend on.
+
+    Returns:
+        The pid, or None if bwrap closed the pipe without reporting one, which it
+        does only when it fails before starting the guest.
+
+    Raises:
+        IsolationError: If the report is malformed or does not arrive in time.
+    """
+    deadline = time.monotonic() + _INFO_TIMEOUT_S
+    buffer = b''
+    with selectors.DefaultSelector() as selector:
+        selector.register(info_fd, selectors.EVENT_READ)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not selector.select(remaining):
+                continue
+            chunk = os.read(info_fd, 4096)
+            if not chunk:
+                if buffer:
+                    raise IsolationError(f'bwrap --info-fd report is truncated: {buffer!r}')
+                return None
+            buffer += chunk
+            try:
+                report = json.loads(buffer)
+            except ValueError:
+                continue  # not complete yet
+            pid = report.get('child-pid') if isinstance(report, dict) else None
+            if not isinstance(pid, int):
+                raise IsolationError(f'bwrap --info-fd report has no child-pid: {buffer!r}')
+            return pid
+    raise IsolationError(f'bwrap did not report the guest init within {_INFO_TIMEOUT_S}s')
+
+
+def _status_field(pid: int | str, field: str) -> int:
+    """An integer field (``Pid``, ``PPid``) of ``/proc/<pid>/status``.
+
+    Raises:
+        FileNotFoundError: If ``pid`` does not exist in this ``/proc``.
+        IsolationError: If the status has no such field.
+    """
+    for line in pathlib.Path(f'/proc/{pid}/status').read_text().splitlines():
+        name, _, value = line.partition(':')
+        if name == field:
+            return int(value.split()[0])
+    raise IsolationError(f'/proc/{pid}/status has no {field} line')
+
+
+def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
+    """A pidfd on the guest init bwrap reports on ``info_fd``, or None if no init is running.
+
+    The pid is checked to name bwrap's child once the pidfd is open: bwrap reaps
+    the init before it exits itself, so by the time the pid is read it may have
+    been recycled. The check reads ``/proc`` and then confirms through the pidfd
+    that the process is alive; alive, the pid cannot have changed hands in
+    between, so the ``/proc`` entry was its. Only the pidfd decides that the init
+    has exited: a process alive but not shown as bwrap's child is one this cannot
+    vouch for, and fails closed.
+
+    Returns:
+        The pidfd, or None if bwrap started no init or it has already exited.
+
+    Raises:
+        IsolationError: If bwrap's report is unusable, the pidfd cannot be opened,
+            or ``/proc`` does not show the live process as bwrap's child. The
+            process is SIGKILLed first: it is the init in all but a pid
+            recycled in the moments since bwrap reported it, while it was still
+            being set up.
+    """
+    pid = _read_init_pid(info_fd)
+    if pid is None:
+        return None
+    try:
+        pidfd = _process.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        raise IsolationError(f'cannot open a pidfd on the guest init: {exc}') from exc
+    try:
+        try:
+            parent: int | None = _status_field(pid, 'PPid')
+        except FileNotFoundError:
+            parent = None  # hidden from this /proc (hidepid), or the init has exited
+        try:
+            _process.pidfd_signal(pidfd, 0)
+        except ProcessLookupError:
+            os.close(pidfd)
+            return None
+        if parent != bwrap_pid:
+            with contextlib.suppress(ProcessLookupError):
+                _process.pidfd_signal(pidfd, signal.SIGKILL)
+            shown = 'no such process' if parent is None else f'parent {parent}'
+            raise IsolationError(
+                f'cannot confirm that pid {pid} is the guest init: /proc shows {shown}, not bwrap ({bwrap_pid})'
+            )
+    except BaseException:
+        os.close(pidfd)
+        raise
+    return pidfd
+
+
+def _require_init_control() -> None:
+    """Raise unless a guest init can be held and identified here: stopping a run depends on it.
+
+    Raises:
+        IsolationError: If pidfds do not work (off Linux, before 5.3, or under a
+            seccomp profile blocking ``pidfd_open`` or ``pidfd_send_signal``), or
+            ``/proc`` belongs to another pid namespace than this process's, so the
+            init's pid could not be checked against it.
+    """
+    try:
+        pidfd = _process.pidfd_open(os.getpid())
+        try:
+            _process.pidfd_signal(pidfd, 0)
+        finally:
+            os.close(pidfd)
+    except OSError as exc:
+        raise IsolationError(f'pidfds are unavailable, so a run could not be reliably stopped: {exc}') from exc
+    try:
+        shown: int | None = _status_field('self', 'Pid')
+    except FileNotFoundError:
+        shown = None  # no /proc, or one in which this process does not appear
+    if shown != os.getpid():
+        raise IsolationError(
+            f"/proc does not belong to this process's pid namespace (its self is {shown}, not {os.getpid()}), "
+            'so the guest init could not be identified'
+        )
+
+
+def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
+    """Start bwrap and take hold of the guest's init. Not on the caller's thread: see :class:`_Job`.
+
+    ``cmd`` is the bwrap command line, with ``cmd[0]`` bwrap itself; ``--info-fd``
+    is added here. On any failure, whatever was started is killed before this
+    raises — except an init that could not be held, which only killing bwrap can
+    reach: one already past ``--die-with-parent`` dies with it, one not yet past it
+    does not. Only descriptor exhaustion gets that far, with pidfds known to work.
+
+    Raises:
+        IsolationError: If the init cannot be held by a pidfd, and so could not be
+            reliably stopped.
+    """
+    _require_init_control()
+    info_read, info_write = os.pipe()
+    try:
+        try:
+            launch = _launcher.call(
+                functools.partial(
+                    _fork_bwrap,
+                    [cmd[0], '--info-fd', str(info_write), *cmd[1:]],
+                    pass_fds=(*pass_fds, info_write),
+                    profile=profile,
+                ),
+                _process.Launch.discard,
+            )
+        finally:
+            os.close(info_write)
+        try:
+            launch.init_pidfd = _hold_init(info_read, launch.popen.pid)
+        except BaseException:
+            launch.discard()
+            raise
+        return launch
+    finally:
+        os.close(info_read)
+
+
+def _fork_bwrap(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
+    """Fork bwrap and open its pidfd, before anything can reap it. On the launcher thread."""
+    # Bytes, decoded by Process. Cast because the credentials splat is Any,
+    # which lets the type checker pick Popen's text-mode overload.
+    popen = typing.cast(
+        'subprocess.Popen[bytes]',
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # Scrub bwrap's own environment: it is PID 1 in the guest's
+            # namespace at the guest uid, so an inherited secret would be
+            # readable from inside via /proc/1/environ (see bwrap_env).
+            env=bwrap_env(),
+            pass_fds=pass_fds,
+            # Run bwrap at a non-root real uid when we are root, so the
+            # guest's kernel uid (which bwrap maps --uid onto) is non-root and
+            # owns none of root's files (see bwrap_credentials).
+            **bwrap_credentials(profile, os.geteuid()),
+        ),
+    )
+    try:
+        # Nothing has polled bwrap, so it is unreaped and its pid still names it.
+        return _process.Launch(popen, _process.pidfd_open(popen.pid))
+    except BaseException:
+        # Without a pidfd on bwrap the init cannot be held either; killing bwrap
+        # is the most there is to do. Popen's exit reaps it and closes the pipes.
+        with popen:
+            popen.kill()
+        raise
+
+
+def _discard_process(process: _process.Process) -> None:
+    process.kill()
+    process.close()
+
+
+def _discard_started(future: asyncio.Future[_process.Process]) -> None:
+    """Stop and close a run whose start finished after the task awaiting it was cancelled."""
+    if future.cancelled() or future.exception() is not None:
+        return  # a start that failed has already released what it started
+    process = future.result()
+    process.kill()
+    # On a thread of its own rather than the loop's executor: a loop shutting down
+    # refuses new work, which would leave the hatches serving.
+    threading.Thread(target=process.close, name='postern-discard').start()
+
+
 class Sandbox:
     """A hardened bubblewrap sandbox with optional :class:`Hatch` channels.
 
@@ -371,7 +724,12 @@ class Sandbox:
     path and environment variable.
     """
 
-    def __init__(self, profile: SandboxProfile | None = None, *, hatch: Hatch | Sequence[Hatch] | None = None) -> None:
+    def __init__(
+        self,
+        profile: SandboxProfile | None = None,
+        *,
+        hatch: Hatch | collections.abc.Sequence[Hatch] | None = None,
+    ) -> None:
         self._profile = profile or SandboxProfile()
         if hatch is None:
             self._hatches: list[Hatch] = []
@@ -380,6 +738,9 @@ class Sandbox:
         else:
             self._hatches = [typing.cast('Hatch', hatch)]
         self._check_hatches()
+        # Absolute, so the file bound in as PID 1 cannot depend on the worker's cwd.
+        if self._profile.init is not None and not os.path.isabs(self._profile.init):
+            raise ValueError(f'SandboxProfile.init must be an absolute path, got {os.fspath(self._profile.init)!r}')
         if self._profile.workspace is not None:
             self._workspace = pathlib.Path(self._profile.workspace)
             self._own_workspace = False
@@ -411,7 +772,7 @@ class Sandbox:
         ):
             self._reject_duplicates(label, derive)
 
-    def _reject_duplicates(self, label: str, derive: Callable[[Hatch], str]) -> None:
+    def _reject_duplicates(self, label: str, derive: collections.abc.Callable[[Hatch], str]) -> None:
         """Raise if two configured hatches derive the same value."""
         seen: dict[str, list[str]] = {}
         for hatch in self._hatches:
@@ -452,14 +813,39 @@ class Sandbox:
         """
         return _workspace.Workspace(self._workspace)
 
+    def _start(
+        self,
+        argv: list[str],
+        *,
+        resources: contextlib.ExitStack,
+        setenv: dict[str, str] | None = None,
+        extra_binds: list[str] | None = None,
+    ) -> _process.Process:
+        """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
+
+        ``resources`` (the hatches' serving contexts) passes to the Process, which
+        closes it when the run is closed; on any failure it is closed here. The
+        launch runs whole on a thread of its own, through to the Process that owns
+        it, so an interrupt cannot leave a guest between the two.
+        """
+        job = _Job(
+            functools.partial(self._launch, argv, setenv=setenv, extra_binds=extra_binds, resources=resources),
+            _discard_process,
+        )
+        try:
+            return job.in_thread('postern-launch')
+        except BaseException:
+            resources.close()
+            raise
+
     def _launch(
         self,
         argv: list[str],
         *,
-        timeout: float,
-        setenv: dict[str, str] | None = None,
-        extra_binds: list[str] | None = None,
-    ) -> ProcResult:
+        setenv: dict[str, str] | None,
+        extra_binds: list[str] | None,
+        resources: contextlib.ExitStack,
+    ) -> _process.Process:
         if not available():
             raise RuntimeError('bubblewrap (bwrap) not found on PATH; postern requires Linux + bubblewrap')
         # A non-root guest cannot write a host-owned workspace dir. 1777 rather than
@@ -471,75 +857,175 @@ class Sandbox:
                 self._workspace.chmod(0o1777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
         fd = seccomp.fileno() if seccomp is not None else None
+        launch: _process.Launch | None = None
         try:
             cmd = build_base_argv(dataclasses.replace(self._profile, workspace=self._workspace), fd)
             for key, val in (setenv or {}).items():
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=bwrap_env(),
-                pass_fds=(fd,) if fd is not None else (),
-                **bwrap_credentials(self._profile, os.geteuid()),
-            )
-            try:
-                out, err = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
-                return ProcResult(124, out or '', (err or '') + '\n[postern] timed out')
-            return ProcResult(proc.returncode, out or '', err or '')
-        finally:
+            launch = _spawn(cmd, pass_fds=() if fd is None else (fd,), profile=self._profile)
             if seccomp is not None:
                 seccomp.close()
+            return _process.Process(launch, resources=resources)
+        except BaseException:
+            if launch is not None:
+                launch.discard()
+            if seccomp is not None:
+                seccomp.close()
+            raise
 
-    def run(self, argv: list[str], *, timeout: float = 60) -> ProcResult:
-        """Run ``argv`` inside the sandbox and return its result.
+    def _supervised(self, work_argv: list[str], *, code: str = '', recode: bool = False) -> _process.Process:
+        """Start ``work_argv`` under the guest's init, with every hatch bound and served.
 
-        The raw primitive for a non-Python entrypoint. It does not set
-        ``RLIMIT_NPROC`` — that is applied by :meth:`run_python`'s shim — so the
-        entrypoint manages its own limits and must tolerate being PID 1.
+        The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.
+        The init is bwrap's ``--as-pid-1`` entrypoint: the C init when the profile
+        names one, the Python shim (``postern._guest``) otherwise. It applies the
+        resource backstops, forks, and the child execs ``work_argv``.
 
-        Every configured :class:`Hatch` is still bound and served: the socket is a
-        file at ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so a bare entrypoint
-        reaches it with no in-guest relay.
+        Args:
+            work_argv: What the shim's forked child execs.
+            code: ``POSTERN_CODE`` for the :meth:`run_python` re-exec. Empty for an
+                arbitrary program, which reads its own input.
+            recode: Whether ``work_argv`` re-execs the shim to run ``code``. It makes
+                the shim defer ``RLIMIT_AS`` until the fresh interpreter has started.
+
+        Returns:
+            The running process, which owns the hatches' serving contexts.
         """
         binds, env = self._hatch_wiring()
-        with contextlib.ExitStack() as stack:
+        # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
+        # raise KeyError with no hatch configured; seed it empty instead.
+        env = {'POSTERN_HATCH': '', **env}
+        nproc, as_bytes = str(self._profile.rlimit_nproc), str(self._profile.rlimit_as or 0)
+        if self._profile.init is not None:
+            # The C init is PID 1 and execs work_argv itself. The shim is only bound
+            # when work_argv runs it (run_python), and then it is a plain child that
+            # applies RLIMIT_AS once its interpreter is up — so the init must not.
+            binds += ['--ro-bind', os.fspath(self._profile.init), _GUEST_INIT]
+            if recode:
+                binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+                env = {'POSTERN_CODE': code, 'POSTERN_NPROC': nproc, 'POSTERN_AS': as_bytes, **env}
+            limits = ['--nproc', nproc, '--as', '0' if recode else as_bytes]
+            entrypoint = [_GUEST_INIT, *limits, '--', *work_argv]
+        else:
+            binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
+            env = {
+                'POSTERN_ARGV': json.dumps(work_argv),
+                'POSTERN_CODE': code,
+                'POSTERN_RECODE': '1' if recode else '',
+                'POSTERN_NPROC': nproc,
+                'POSTERN_AS': as_bytes,
+                **env,
+            }
+            entrypoint = [self._profile.python, '-u', _GUEST_SHIM]
+        stack = contextlib.ExitStack()
+        try:
             for hatch in self._hatches:
                 stack.enter_context(hatch.accepting())
-            return self._launch(list(argv), timeout=timeout, setenv=env, extra_binds=binds)
+        except BaseException:
+            stack.close()
+            raise
+        return self._start(entrypoint, resources=stack, setenv=env, extra_binds=binds)
 
-    def run_python(self, code: str, *, timeout: float = 60) -> ProcResult:
+    def run(self, argv: list[str], *, timeout: float = 60, max_output: int | None = None) -> _process.ProcResult:
+        """Run ``argv`` inside the sandbox and return its result.
+
+        The entrypoint for a program that is not Python. It runs under the same
+        guest init as :meth:`run_python`, so ``argv`` inherits ``RLIMIT_NPROC`` and
+        ``RLIMIT_AS`` across the exec, has its orphaned descendants reaped, and is
+        not PID 1 itself. Under the C init (``SandboxProfile.init``) it needs no
+        interpreter in the sandbox; under the fallback Python shim,
+        ``profile.python`` must exist there even when ``argv`` is a compiled
+        program.
+
+        Every configured :class:`Hatch` is bound and served: the socket is a file at
+        ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so ``argv`` reaches it with no
+        in-guest relay.
+        """
+        return self.start(argv).communicate(timeout, max_output=max_output)
+
+    def run_bash(
+        self, script: str, *, shell: str = 'bash', timeout: float = 60, max_output: int | None = None
+    ) -> _process.ProcResult:
+        """Run ``script`` inside the sandbox as ``shell -c script``.
+
+        Args:
+            script: The script text. It is an argument to ``shell`` in the guest,
+                never interpolated into a host command line.
+            shell: The shell to run it with. Must exist in the sandbox, which a
+                curated ``rootfs`` need not provide.
+            timeout: Seconds before the launch is killed.
+            max_output: Maximum total bytes of stdout and stderr to buffer. Output
+                beyond this is discarded and result.truncated is set.
+
+        Returns:
+            The launch's result.
+        """
+        return self.start_bash(script, shell=shell).communicate(timeout, max_output=max_output)
+
+    def run_python(self, code: str, *, timeout: float = 60, max_output: int | None = None) -> _process.ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
+
+        The shim's child re-execs ``profile.python`` to run ``code``, so the code
+        gets a clean interpreter rather than the supervisor's own process, and
+        ``RLIMIT_AS`` is applied once that interpreter is up.
 
         Each configured :class:`Hatch` binds its own UDS in. The unnamed hatch
         exports its path as ``POSTERN_HATCH``, a named one as
         ``POSTERN_HATCH_<NAME>``; the client library that dials it comes from the
-        guest's bound environment. The shim applies ``RLIMIT_NPROC`` and
-        ``RLIMIT_AS`` before running the code.
+        guest's bound environment.
         """
-        binds, env = self._hatch_wiring()
-        binds += ['--ro-bind', _SHIM_SRC, _GUEST_SHIM]
-        # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
-        # raise KeyError with no hatch configured; seed it empty instead.
-        env = {
-            'POSTERN_CODE': code,
-            'POSTERN_NPROC': str(self._profile.rlimit_nproc),
-            'POSTERN_AS': str(self._profile.rlimit_as or 0),
-            'POSTERN_HATCH': '',
-            **env,
-        }
-        argv = [self._profile.python, '-u', _GUEST_SHIM]
-        with contextlib.ExitStack() as stack:
-            for hatch in self._hatches:
-                stack.enter_context(hatch.accepting())
-            return self._launch(argv, timeout=timeout, setenv=env, extra_binds=binds)
+        return self.start_python(code).communicate(timeout, max_output=max_output)
+
+    def start(self, argv: list[str]) -> _process.Process:
+        """Start ``argv`` in the sandbox, as :meth:`run` does, and return at once.
+
+        The :class:`Process` streams the output as it arrives
+        (:meth:`Process.output`) and can be stopped (:meth:`Process.terminate`).
+        Use it as a context manager: the run's hatches serve until it is closed.
+        """
+        return self._supervised(list(argv))
+
+    def start_bash(self, script: str, *, shell: str = 'bash') -> _process.Process:
+        """Start ``shell -c script`` in the sandbox, as :meth:`run_bash` does, and return at once."""
+        return self._supervised([shell, '-c', script])
+
+    def start_python(self, code: str) -> _process.Process:
+        """Start ``code`` in the sandbox, as :meth:`run_python` does, and return at once."""
+        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, recode=True)
+
+    async def _astart(
+        self,
+        starter: collections.abc.Callable[..., _process.Process],
+        *args: object,
+        **kwargs: object,
+    ) -> _process.AsyncProcess:
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, functools.partial(starter, *args, **kwargs))
+        try:
+            process = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            future.add_done_callback(_discard_started)
+            raise
+        try:
+            return _process.AsyncProcess(process)
+        except BaseException:
+            process.kill()
+            process.close()
+            raise
+
+    async def astart(self, argv: list[str]) -> _process.AsyncProcess:
+        """Start ``argv`` as :meth:`start` does, for asyncio. Use with ``async with``."""
+        return await self._astart(self.start, argv)
+
+    async def astart_bash(self, script: str, *, shell: str = 'bash') -> _process.AsyncProcess:
+        """Start ``shell -c script`` as :meth:`start_bash` does, for asyncio."""
+        return await self._astart(self.start_bash, script, shell=shell)
+
+    async def astart_python(self, code: str) -> _process.AsyncProcess:
+        """Start ``code`` as :meth:`start_python` does, for asyncio."""
+        return await self._astart(self.start_python, code)
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.
@@ -552,22 +1038,43 @@ class Sandbox:
         platform — no user namespace, gVisor, an uncovered arch — surfaces at
         startup rather than on the first real request.
 
+        With an init set, the trivial launch is the init's own ``--version``, run
+        inside the sandbox, and its answer must be this postern's version.
+
         Raises:
-            IsolationError: If ``seccomp`` is disabled in the profile, or the
-                trivial launch fails.
+            IsolationError: If ``seccomp`` is disabled in the profile, the trivial
+                launch fails, or the init was built from another postern version.
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
-        result = self.run_python('pass', timeout=timeout)
+        if self._profile.init is None:
+            result = self.run_python('pass', timeout=timeout)
+            if not result.ok:
+                raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+            return
+        # The init itself, inside the sandbox: it needs nothing from the rootfs (under
+        # the C init a rootfs need not carry Python), and the init is never executed
+        # on the host. The host only ever runs bwrap; running a deployer-supplied
+        # binary here, as the worker and with its environment, would hand anything
+        # that could swap that file the worker's privileges.
+        result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
+        import postern  # noqa: PLC0415 — the package imports this module
+
+        reported = result.stdout.strip()
+        if reported != postern.__version__:
+            raise IsolationError(
+                f'guest init {self._profile.init} was built from postern {reported}, not {postern.__version__}; '
+                'rebuild it with `python -m postern.build_init`'
+            )
 
     def close(self) -> None:
         """Remove the workspace if this Sandbox created it (a no-op for a caller-owned path)."""
         if self._own_workspace:
             shutil.rmtree(self._workspace, ignore_errors=True)
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> typing_extensions.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:

@@ -52,7 +52,7 @@ lint = ["ruff", "pyright", "pre-commit", "pytest", "grpcio>=1.60", "typing-exten
 where = ["src"]
 
 [tool.setuptools.package-data]
-postern = ["py.typed", "_seccomp.bpf", "_seccomp.spec"]
+postern = ["py.typed", "_seccomp.bpf", "_seccomp.spec", "_init.c"]
 
 [tool.ruff]
 line-length = 120
