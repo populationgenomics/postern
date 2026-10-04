@@ -711,7 +711,7 @@ class StreamHatch:
         self._started = True
         self._accepting = True
         threading.Thread(target=self._accept_loop, args=(srv,), daemon=True, name='postern-stream-accept').start()
-        log.info('stream hatch %s serving at %s', _log.safe(self._name), self._path)
+        log.info('stream hatch %s serving at %s', self._name, self._path)
 
     def _clear_stale_socket(self) -> None:
         """Remove a dead socket left where we are about to bind. Nothing else.
@@ -768,7 +768,7 @@ class StreamHatch:
                 # handshake, EINTR. Riding these out rather than retiring the hatch.
                 # Host-side condition: the guest cannot reach it. The retry sleep
                 # bounds this at 1/_ACCEPT_RETRY_DELAY lines per second (20).
-                log.warning('accept() failed transiently on hatch %s: %s; retrying', _log.safe(self._name), exc)
+                log.warning('accept() failed transiently on hatch %s: %s; retrying', self._name, exc)
                 self._slots.release()
                 time.sleep(_ACCEPT_RETRY_DELAY)
                 continue
@@ -806,7 +806,7 @@ class StreamHatch:
                 # and nothing else — no diagnostic, which here would be host state.
                 # DEBUG: a handler that refuses by policy is working correctly, and
                 # the guest picks the rate.
-                log.debug('handler refused a connection on hatch %s', _log.safe(self._name))
+                log.debug('handler refused a connection on hatch %s', self._name)
                 _drain(conn, self._grace)
             else:
                 _await_command(verdict)
@@ -814,7 +814,7 @@ class StreamHatch:
             if isinstance(exc, ConnectionAbortedError) and self._closing:
                 # _track's teardown refusal, not a handler failure: close() ran while
                 # this connection was in flight. The guest picks how many fire.
-                log.debug('hatch %s closed with a connection in flight', _log.safe(self._name))
+                log.debug('hatch %s closed with a connection in flight', self._name)
             else:
                 _report_handler_failure(self._name, exc)
             _drain(conn, self._grace)
@@ -887,7 +887,7 @@ class StreamHatch:
         if self._dir is not None:
             with contextlib.suppress(OSError):
                 os.rmdir(self._dir)
-        log.info('stream hatch %s at %s stopped', _log.safe(self._name), self._path)
+        log.info('stream hatch %s at %s stopped', self._name, self._path)
 
 
 # --------------------------------------------------------------------------- #
@@ -1002,7 +1002,7 @@ def _report_handler_failure(name: str, exc: BaseException) -> None:
     A handler runs on guest input, so both the exception's text and its traceback
     are guest-derived. Neither is handed to ``exc_info``: a raw traceback in an
     aggregated stream lets a guest-chosen message start what reads like a fresh
-    host-attributed line, which is the whole reason :func:`_log.safe` exists. The
+    host-attributed line, which is the whole reason :class:`_log.Guest` exists. The
     type and message identify the bug at ``WARNING``; the escaped traceback is at
     ``DEBUG`` for whoever is actually debugging it.
 
@@ -1012,13 +1012,13 @@ def _report_handler_failure(name: str, exc: BaseException) -> None:
     """
     log.warning(
         'handler raised for hatch %s: %s; connection dropped',
-        _log.safe(name),
-        _log.safe(f'{type(exc).__name__}: {exc}'),
+        name,
+        _log.Guest(exc),
     )
     log.debug(
         'handler traceback for hatch %s: %s',
-        _log.safe(name),
-        _log.safe(traceback.format_exc(), _TRACEBACK_CAP),
+        name,
+        _log.Guest(traceback.format_exc(), limit=_TRACEBACK_CAP),
     )
 
 

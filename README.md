@@ -399,11 +399,13 @@ input is exactly what you want to see — but it means a handler should refuse b
 returning `None` (`DEBUG`) and raise only when something is genuinely wrong.
 
 **Guest-derived values are never interpolated raw, tracebacks included.** A gRPC
-method name, and a handler exception's type, message and traceback, go through
-`postern._log.safe`, which `repr`s and length-caps them so a newline cannot start
-what reads like a new host-attributed entry in an aggregated stream. Nothing on a
-guest-reachable path is handed to `exc_info`; the traceback is escaped and logged
-at `DEBUG` instead.
+method name, and a handler exception's type, message and traceback, are passed to
+the log call wrapped in `postern._log.Guest`, which renders them escaped and
+length-capped when the record is formatted, so a newline cannot start what reads
+like a new host-attributed entry in an aggregated stream. Wrapping is the call
+site's job: nothing does it for a value passed bare. Nothing on a guest-reachable
+path is handed to `exc_info`; the traceback is wrapped and logged at `DEBUG`
+instead.
 
 ## Install
 

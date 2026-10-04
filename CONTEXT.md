@@ -107,8 +107,9 @@ gate the host opens.
   leaked subprocess, an off-allowlist method); `DEBUG` is everything a guest can
   drive at its own rate. A per-event line on a guest-reachable path is an
   amplifier the guest controls, so which level a site gets is a security decision.
-  Guest-derived values reach a record only through `_log.safe` — a handler's
-  traceback included, which is why no guest-reachable site uses `exc_info`.
+  A guest-derived value reaches a record only wrapped in `_log.Guest` — a
+  handler's traceback included, which is why no guest-reachable site uses
+  `exc_info`.
 
 ## Layering
 

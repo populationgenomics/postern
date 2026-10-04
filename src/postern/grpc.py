@@ -54,7 +54,7 @@ class _Allowlist(grpc.ServerInterceptor):
         # WARNING, not DEBUG: in correct operation the guest only calls what the
         # host allowlisted, so this is either a misconfigured allowlist or a guest
         # probing the boundary. `method` is guest-controlled — never raw.
-        log.warning('hatch denied a method not on the allowlist: %s', _log.safe(method))
+        log.warning('hatch denied a method not on the allowlist: %s', _log.Guest(method))
 
         def deny(_request: object, context: grpc.ServicerContext) -> typing.NoReturn:
             context.abort(grpc.StatusCode.PERMISSION_DENIED, f'{method} is not on the hatch allowlist')

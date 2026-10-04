@@ -1,47 +1,55 @@
-r"""Log-safety helper: render a guest-derived value so it cannot forge a record.
+"""`Guest`: how a guest-derived value enters a log call.
 
-Guest bytes reach the host as gRPC method names and as the text and traceback of
-an exception a handler raised on guest input. Interpolated raw into a log record
-they land in an aggregated stream (Cloud Logging, journald) where a newline
-starts what reads like a new entry from the host — so a guest whose RPC is named
-``/x\nseverity=ERROR breach detected`` writes host-attributed lines.
-
-:func:`safe` is the only way a guest-derived value enters a log call, tracebacks
-included: nothing on a guest-reachable path is handed to ``exc_info``.
+Raw, a newline in such a value starts what reads as a new host-attributed entry
+in an aggregated log stream. Wrap every one: ``log.warning('denied %s', Guest(method))``.
 """
 
 from __future__ import annotations
 
+import functools
+
 _LIMIT = 200
 
 
-def safe(value: object, limit: int = _LIMIT) -> str:
-    r"""Render ``value`` as a single-line, escaped, length-capped literal.
+class Guest:
+    """A guest-derived value, rendered for a log record as one escaped, length-capped line.
 
-    ``repr`` is what does the work: it quotes the result and escapes every
-    character `str.isprintable` rejects, which covers ``\n``, ``\r``, NUL, NEL
-    (U+0085), the Unicode line separators (U+2028/U+2029), bidi controls and lone
-    surrogates. Nothing that survives it can start a line.
-
-    Args:
-        value: Any guest-derived value. A non-``str``/``bytes`` value is
-            ``repr``'d as it is, then capped like any other.
-        limit: Cap, applied to the input *and* to the rendered output. Capping
-            only the input would leave the record's size guest-controlled, since
-            an escape-heavy value renders up to ten times its own length.
-
-    Returns:
-        A literal safe to interpolate into a log message. A truncated result
-        carries a trailing ``…`` after the closing quote — outside the literal,
-        so a guest cannot forge it — naming the input's full length when the
-        input was sized.
+    Rendered only when the record is formatted, so a disabled level costs nothing.
+    How a value renders depends on its type; see :func:`_render`.
     """
-    sized = isinstance(value, (str, bytes))
-    text = repr(value[:limit] if sized else value)
-    clipped = sized and len(value) > limit
-    if len(text) > limit:
-        text = text[:limit]
-        clipped = True
-    if not clipped:
+
+    __slots__ = ('_limit', '_value')
+
+    def __init__(self, value: object, *, limit: int = _LIMIT) -> None:
+        self._value = value
+        self._limit = limit
+
+    def __str__(self) -> str:
+        return _render(self._value, self._limit)
+
+    __repr__ = __str__
+
+
+@functools.singledispatch
+def _render(value: object, limit: int) -> str:
+    """``value`` as one escaped line of about ``limit`` characters."""
+    text = repr(value)
+    return text if len(text) <= limit else f'{text[:limit]}…'
+
+
+@_render.register(str)
+@_render.register(bytes)
+def _(value: str | bytes, limit: int) -> str:
+    # repr escapes everything str.isprintable rejects: newlines, NUL, NEL, U+2028/9,
+    # bidi controls, lone surrogates. Escaping can multiply the length, so the
+    # output is capped as well as the input. The marker sits outside the quotes,
+    # where a guest cannot forge it.
+    text = repr(value[:limit])
+    if len(value) <= limit and len(text) <= limit:
         return text
-    return f'{text}…({len(value)} total)' if sized else f'{text}…'
+    return f'{text[:limit]}…({len(value)} total)'
+
+
+@_render.register
+def _(value: BaseException, limit: int) -> str:
+    return _render(f'{type(value).__name__}: {value}', limit)

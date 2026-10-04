@@ -60,26 +60,45 @@ def test_library_adds_no_handler_below_the_package_root(name):
         '\n\n\n',
     ],
 )
-def test_safe_renders_a_forging_attempt_on_one_line(hostile):
-    rendered = _log.safe(hostile)
+def test_guest_renders_a_forging_attempt_on_one_line(hostile):
+    rendered = str(_log.Guest(hostile))
     assert '\n' not in rendered
     assert '\r' not in rendered
     assert '\x00' not in rendered
 
 
-def test_safe_caps_length_and_says_it_did():
-    rendered = _log.safe('A' * 5000)
+def test_guest_caps_length_and_says_it_did():
+    rendered = str(_log.Guest('A' * 5000))
     assert len(rendered) < 300
     assert '5000 total' in rendered
 
 
-def test_safe_does_not_mark_an_uncapped_value():
-    assert _log.safe('short') == "'short'"
+def test_guest_caps_an_escape_heavy_value_by_its_rendering():
+    # 200 NULs are within the input cap but render four times longer.
+    rendered = str(_log.Guest('\x00' * 200))
+    assert len(rendered) < 250
+    assert '200 total' in rendered
 
 
-def test_safe_handles_bytes_and_none():
-    assert '\n' not in _log.safe(b'a\nb')
-    assert _log.safe(None) == 'None'
+def test_guest_does_not_mark_an_uncapped_value():
+    assert str(_log.Guest('short')) == "'short'"
+
+
+def test_guest_handles_bytes_and_none():
+    assert '\n' not in str(_log.Guest(b'a\nb'))
+    assert str(_log.Guest(None)) == 'None'
+
+
+def test_guest_renders_an_exception_as_its_type_and_escaped_message():
+    assert str(_log.Guest(ValueError('bad\nline'))) == repr('ValueError: bad\nline')
+
+
+def test_guest_renders_only_when_the_record_is_formatted():
+    class Unrenderable:
+        def __repr__(self) -> str:
+            raise AssertionError('rendered at a disabled level')
+
+    logging.getLogger('postern.stream').debug('%s', _log.Guest(Unrenderable()))
 
 
 def test_a_denied_grpc_method_is_logged_escaped_and_at_warning(caplog):
@@ -156,18 +175,6 @@ def test_the_same_refusals_are_all_visible_at_debug(caplog):
     hatch.close()
 
     assert _count(caplog, 'refused a connection') == _LOOP, 'every refusal gets a line; nothing is aggregated'
-
-
-def test_the_hatch_name_goes_through_safe(caplog):
-    handler = _Counted(_exploding)
-    hatch = StreamHatch(handler, name='a_b')
-    with caplog.at_level(logging.DEBUG, logger='postern.stream'), hatch.accepting():
-        _drive(hatch, handler)
-        _wait_for(lambda: _named(caplog, 'handler raised'), 'the handler-failure WARNING')
-    hatch.close()
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert any(repr('a_b') in m for m in messages), 'the name is quoted, so it cannot run into the message'
 
 
 def test_dispose_failure_is_logged_rather_than_swallowed(caplog, monkeypatch):
