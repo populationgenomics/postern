@@ -371,8 +371,9 @@ logging.getLogger('postern').setLevel(logging.DEBUG)    # every guest-driven eve
 ```
 
 **The level split is a security property.** A guest reaches the hatch, so a
-per-event line on a guest-driven path is an amplifier whose rate the guest sets —
-bounded only by `run_python(timeout=)`.
+per-event line on a guest-driven path is an amplifier whose rate the guest sets,
+for as long as the run lives: until its `timeout` for `run*`, and until the
+caller stops it for `start*`.
 
 - **`WARNING`** — evidence about the *host*: a handler that raised, with the
   exception type and message, so a host bug is not indistinguishable from the
