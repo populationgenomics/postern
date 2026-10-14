@@ -194,7 +194,13 @@ class SandboxProfile:
             under the C init (``init``) nothing else does, while the fallback
             Python shim needs it for every entrypoint.
         ro_binds: Extra ``(host, guest)`` read-only binds beyond the base system
-            dirs — e.g. a venv (see :meth:`with_venv`).
+            dirs, mapped to ``--ro-bind-try``: a missing source is skipped
+            silently, so use these only for binds the guest can do without.
+        required_ro_binds: ``(host, guest)`` read-only binds mapped to
+            ``--ro-bind``, so a missing source is a launch failure rather than a
+            silent skip that surfaces later as a confusing in-guest ``ENOENT``.
+            Use these for a bind the guest cannot run without — e.g. a host
+            directory carrying a tool's inputs, or a venv (see :meth:`with_venv`).
         stubs: Importable modules to inject at ``/run/postern/stubs`` (prepended to
             the guest's ``PYTHONPATH``) — a directory, or a list of files, so a
             shared rootfs can carry the heavy base while the per-agent gRPC stubs
@@ -244,6 +250,7 @@ class SandboxProfile:
     rootfs: pathlib.Path | None = None
     python: str = 'python3'
     ro_binds: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+    required_ro_binds: list[tuple[str, str]] = dataclasses.field(default_factory=list)
     stubs: str | os.PathLike[str] | collections.abc.Sequence[str | os.PathLike[str]] | None = None
     env: dict[str, str] = dataclasses.field(default_factory=lambda: {'PATH': '/usr/local/bin:/usr/bin:/bin'})
     seccomp: bool = True
@@ -260,16 +267,18 @@ class SandboxProfile:
         """A profile that binds ``venv`` read-only and runs its interpreter.
 
         The venv is bound at its own path so the interpreter's ``pyvenv.cfg`` /
-        ``site.py`` resolution finds its site-packages unchanged.
+        ``site.py`` resolution finds its site-packages unchanged. The bind is
+        strict (``required_ro_binds``): a missing venv is a launch failure, not a
+        ``run_python`` that dies later on an unresolvable interpreter.
 
         Args:
             venv: The venv root on the host.
-            **kwargs: Any other :class:`SandboxProfile` field; ``ro_binds`` is
-                extended rather than replaced.
+            **kwargs: Any other :class:`SandboxProfile` field; ``required_ro_binds``
+                is extended rather than replaced.
         """
         path = pathlib.Path(venv).resolve()
-        binds = [*kwargs.pop('ro_binds', []), (str(path), str(path))]
-        return cls(python=str(path / 'bin' / 'python'), ro_binds=binds, **kwargs)
+        binds = [*kwargs.pop('required_ro_binds', []), (str(path), str(path))]
+        return cls(python=str(path / 'bin' / 'python'), required_ro_binds=binds, **kwargs)
 
 
 def bwrap_env() -> dict[str, str]:
@@ -337,8 +346,7 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
         flag = '--ro-bind' if d == '/usr' else '--ro-bind-try'
         argv += [flag, root + d, d]
     argv += ['--ro-bind-try', root + '/etc/ld.so.cache', '/etc/ld.so.cache']
-    for host, guest in profile.ro_binds:
-        argv += ['--ro-bind-try', host, guest]
+    argv += _caller_ro_binds(profile)
     argv += ['--proc', '/proc', '--dev', '/dev']
     # Must come after --proc: it re-masks what the fresh procfs re-exposed.
     for path in _PROC_RO_PATHS:
@@ -360,6 +368,20 @@ def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str
         argv += ['--setenv', key, val]
     if seccomp_fd is not None:
         argv += ['--seccomp', str(seccomp_fd)]
+    return argv
+
+
+def _caller_ro_binds(profile: SandboxProfile) -> list[str]:
+    """Bwrap flags for the profile's caller-supplied read-only binds.
+
+    ``ro_binds`` map to ``--ro-bind-try`` (a missing source is skipped);
+    ``required_ro_binds`` map to ``--ro-bind`` (a missing source fails the launch).
+    """
+    argv: list[str] = []
+    for host, guest in profile.ro_binds:
+        argv += ['--ro-bind-try', host, guest]
+    for host, guest in profile.required_ro_binds:
+        argv += ['--ro-bind', host, guest]
     return argv
 
 

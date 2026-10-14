@@ -106,13 +106,38 @@ def test_rootfs_prefixes_system_dirs():
     assert '/opt/guest-root/bin' in argv  # the rest of the base too
 
 
+def test_optional_ro_bind_is_try():
+    argv = build_base_argv(SandboxProfile(ro_binds=[('/host/opt', '/opt')]), seccomp_fd=None)
+    i = argv.index('/host/opt')
+    assert argv[i - 1] == '--ro-bind-try'  # missing source skipped silently
+    assert argv[i + 1] == '/opt'
+
+
+def test_required_ro_bind_is_strict():
+    # A required bind maps to --ro-bind, so a missing source fails the launch
+    # instead of being skipped and surfacing later as an in-guest ENOENT.
+    argv = build_base_argv(SandboxProfile(required_ro_binds=[('/host/tools', '/tools')]), seccomp_fd=None)
+    i = argv.index('/host/tools')
+    assert argv[i - 1] == '--ro-bind'
+    assert argv[i + 1] == '/tools'
+
+
 def test_with_venv_binds_and_sets_python(tmp_path):
     venv = tmp_path / 'env'
     (venv / 'bin').mkdir(parents=True)
     profile = SandboxProfile.with_venv(venv)
     assert profile.python == str(venv.resolve() / 'bin' / 'python')
     argv = build_base_argv(profile, seccomp_fd=None)
-    assert str(venv.resolve()) in argv  # the venv is bound read-only
+    i = argv.index(str(venv.resolve()))
+    assert argv[i - 1] == '--ro-bind'  # strict: a missing venv fails the launch
+
+
+def test_with_venv_extends_required_ro_binds(tmp_path):
+    venv = tmp_path / 'env'
+    (venv / 'bin').mkdir(parents=True)
+    profile = SandboxProfile.with_venv(venv, required_ro_binds=[('/host/tools', '/tools')])
+    assert ('/host/tools', '/tools') in profile.required_ro_binds
+    assert (str(venv.resolve()), str(venv.resolve())) in profile.required_ro_binds
 
 
 def test_stubs_dir_bound_and_on_pythonpath():
