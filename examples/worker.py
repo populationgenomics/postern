@@ -1,8 +1,7 @@
 """Deployable worker for the Cloud Run recipe (``examples/Dockerfile``).
 
 Binds the curated guest rootfs the Dockerfile builds at ``/opt/guest-root``, so
-the guest sees none of the worker's userland, and runs every guest under the C
-init the Dockerfile builds at ``/opt/postern-init``. The guest code here is a fixed
+the guest sees none of the worker's userland. The guest code here is a fixed
 smoke-test snippet where a real Job would take it from the caller.
 
 Cloud Run stops a task with SIGTERM to this process, then SIGKILL 10 s later. The
@@ -56,9 +55,9 @@ def main() -> int:
     # Raising unwinds whatever is under way; a launch interrupted that way is
     # discarded, guest and all.
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
-    profile = SandboxProfile(rootfs='/opt/guest-root', init='/opt/postern-init')
-    # Boot-time gate: a platform that cannot enforce the profile, or an init built
-    # from another postern version, fails here rather than on the first request.
+    profile = SandboxProfile(rootfs='/opt/guest-root')
+    # Boot-time gate: a platform that cannot enforce the profile, or an install
+    # without its guest init, fails here rather than on the first request.
     try:
         Sandbox(profile).verify()
     except IsolationError as exc:
