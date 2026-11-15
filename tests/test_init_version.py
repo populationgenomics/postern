@@ -1,7 +1,7 @@
 """`Sandbox.verify` and the guest init: the version check, inside the sandbox only.
 
-The init is a deployer-supplied binary, and the host never executes it: the
-version check reads the init's own ``--version`` from a run inside the sandbox.
+The host never executes the init: the version check reads the init's own
+``--version`` from a run inside the sandbox.
 The "inits" here are stand-in scripts that only answer with a version.
 """
 
@@ -10,7 +10,7 @@ import stat
 
 import pytest
 
-from postern import IsolationError, Sandbox, SandboxProfile, available
+from postern import IsolationError, Sandbox, SandboxProfile, _sandbox, available
 
 needs_bwrap = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
 
@@ -50,3 +50,10 @@ def test_verify_never_executes_the_init_on_the_host(tmp_path):
     with pytest.raises(IsolationError, match='was built from postern'):
         Sandbox(SandboxProfile(init=init)).verify()
     assert not marker.exists()
+
+
+def test_a_launch_without_an_init_fails_loudly(tmp_path, monkeypatch):
+    # No init named and none carried by the install: there is nothing to fall back to.
+    monkeypatch.setattr(_sandbox, '_PACKAGED_INIT', tmp_path / 'no-init-here')
+    with pytest.raises(IsolationError, match='carries no guest init'):
+        Sandbox(SandboxProfile()).run(['true'])

@@ -77,13 +77,12 @@ gate the host opens.
 - **Init** — PID 1 of the guest's namespace, and the entrypoint for every run: it
   forks, the child applies `RLIMIT_NPROC` and `RLIMIT_AS` and then `exec`s the
   work, and the init reaps the namespace, forwards signals and propagates the
-  work's exit status. The recommended init is the **C init** (`_init.c`), a static
-  program the profile names (`SandboxProfile(init=...)`): no interpreter needed,
-  signals forwarded to the whole process group, contract in its argv (`--nproc`,
-  `--as`, `-- argv...`). It ships as source; the deployer builds it with
-  `python -m postern.build_init` in a throwaway image stage, stamped with the
-  postern version `verify()` checks it against. Without one, the **Shim** is the
-  init.
+  work's exit status. It is the **C init** (`_init.c`), a static program: no
+  interpreter needed, signals forwarded to the whole process group, contract in its
+  argv (`--nproc`, `--as`, `-- argv...`). The Linux wheels carry it, built by
+  `setup.py` and stamped with the postern version `verify()` checks it against;
+  `SandboxProfile(init=...)` names one built with `python -m postern.build_init`
+  instead. With neither, a launch raises.
 
 - **Process** — a run in progress, from `Sandbox.start*` (`AsyncProcess` from
   `astart*`, for asyncio). Its output is one merged stream of
@@ -93,10 +92,8 @@ gate the host opens.
   It owns the run's hatches until closed. `run*` is `start*` plus `communicate`.
 
 - **Shim** (`_guest.py`) — the stdlib-only Python that runs `run_python`'s code
-  in the guest, and the fallback init when the profile names no C init. Under the C
-  init it is a plain child; as the fallback init it forks a re-exec of itself for
-  `run_python`. The host↔shim handshake rides five env vars (`POSTERN_ARGV`,
-  `POSTERN_CODE`, `POSTERN_RECODE`, `POSTERN_NPROC`, `POSTERN_AS`).
+  in the guest, as the init's child. The host↔shim handshake rides two env vars
+  (`POSTERN_CODE`, `POSTERN_AS`).
 
 - **Stubs** — importable modules injected at `/run/postern/stubs` (on the
   guest's `PYTHONPATH`). Lets one shared rootfs carry the heavy base while the

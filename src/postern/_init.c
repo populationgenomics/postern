@@ -50,8 +50,8 @@
 
 /* Exit statuses for failures of the init itself, before the command runs. */
 #define EXIT_USAGE 2
-/* Any failed exec, missing or not executable alike: the shim's status, and the one
- * postern documents, so the two inits agree. */
+/* Any failed exec, missing or not executable alike: the status a shell gives, and
+ * the one postern documents. */
 #define EXIT_NOEXEC 127
 
 static void usage(void) {

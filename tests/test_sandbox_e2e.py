@@ -19,7 +19,7 @@ def test_run_python_sealed():
 
 
 def test_run_python_propagates_exit_status():
-    # The status has to survive the re-exec, the fork and the reap.
+    # The status has to survive the init's fork, the exec and the reap.
     result = Sandbox().run_python('import sys; sys.exit(7)')
     assert result.returncode == 7
 
@@ -50,7 +50,7 @@ def test_run_missing_program_is_127():
 
 
 def test_run_python_address_space_limit_does_not_break_startup():
-    # RLIMIT_AS lands after the re-exec'd interpreter is up: a fresh CPython's
+    # RLIMIT_AS lands after the shim's interpreter is up: a fresh CPython's
     # virtual size at startup would trip a cap applied before the execvp.
     result = Sandbox(SandboxProfile(rlimit_as=1024 * 1024 * 1024)).run_python('print(sum(range(1000)))')
     assert result.ok, result.stderr
@@ -100,7 +100,7 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
     # bwrap runs at the guest uid, so a worker secret it inherited would be a
     # same-uid environ read away. Two controls cover it — bwrap_env scrubbing what
     # bwrap is exec'd with, and --as-pid-1 keeping bwrap out of the guest's PID
-    # namespace so /proc/1 is the shim's own non-dumpable init. Either is "clean".
+    # namespace so /proc/1 is the non-dumpable init. Either is "clean".
     monkeypatch.setenv('WORKER_SESSION_TOKEN', 'worker-SECRET-should-not-leak')
     code = (
         'try:\n'
@@ -115,7 +115,7 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
 
 
 def test_pid1_is_the_guest_entrypoint_not_bwrap():
-    # --as-pid-1 runs the shim as PID 1; the shim then forks the work.
+    # --as-pid-1 runs the init as PID 1; the init then forks the work.
     result = Sandbox().run_python('import os; print(os.getpid(), open("/proc/1/comm").read().strip())')
     assert result.ok, result.stderr
     pid, comm = result.stdout.split()

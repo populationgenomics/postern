@@ -1,7 +1,7 @@
 """`Sandbox.start*` and `Process`: output as it arrives, and stopping a run.
 
-Require Linux + bubblewrap. Stopping runs under both guest inits, since each
-must turn a SIGTERM from the host into one the command sees.
+Require Linux + bubblewrap. Stopping depends on the guest init turning a SIGTERM
+from the host into one the command sees.
 """
 
 from __future__ import annotations
@@ -21,22 +21,13 @@ import typing
 import pytest
 
 from postern import IsolationError, Process, Sandbox, SandboxProfile, _process, _sandbox, _seccomp, available
-from postern.build_init import build
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
 
 
-@pytest.fixture(scope='session')
-def c_init(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    if shutil.which('cc') is None:
-        pytest.skip('requires a C compiler to build the guest init')
-    return build(tmp_path_factory.mktemp('init') / 'postern-init')
-
-
-@pytest.fixture(params=['shim', 'c'])
-def sandbox(request: pytest.FixtureRequest) -> Sandbox:
-    init = request.getfixturevalue('c_init') if request.param == 'c' else None
-    return Sandbox(SandboxProfile(init=init))
+@pytest.fixture
+def sandbox() -> Sandbox:
+    return Sandbox(SandboxProfile())
 
 
 def _drain(process: Process) -> tuple[list[tuple[float, str, bytes]], float]:
@@ -111,8 +102,8 @@ def test_terminate_from_another_thread_while_streaming(sandbox):
         output = b''.join(data for _, data in process.output())
         assert process.wait() == 0
     assert output.count(b'tick') >= 2
-    # The trap ran. Under the C init the running `sleep` got the TERM too, so bash
-    # may also report it as Terminated: the whole group heard the signal.
+    # The trap ran. The running `sleep` got the TERM too, so bash may also report
+    # it as Terminated: the whole group heard the signal.
     assert b'bye\n' in output
 
 
@@ -164,11 +155,11 @@ def test_terminate_right_after_start_reaches_the_command(sandbox):
     assert time.monotonic() - started < 4
 
 
-def test_c_init_cancel_reaches_the_whole_process_group(c_init):
-    # A pipeline's members are not the command itself; the C init signals its
+def test_init_cancel_reaches_the_whole_process_group():
+    # A pipeline's members are not the command itself; the init signals its
     # process group, so they stop too and the trap can report it.
     script = 'trap "echo stopped; exit 0" TERM; echo ready; sleep 30 | cat & wait'
-    with Sandbox(SandboxProfile(init=c_init)).start_bash(script) as process:
+    with Sandbox(SandboxProfile()).start_bash(script) as process:
         assert next(process.output()) == ('stdout', b'ready\n')
         process.terminate(grace=5)
         result = process.communicate(timeout=10)
@@ -478,14 +469,16 @@ def test_an_init_proc_cannot_vouch_for_fails_closed(sandbox, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which('unshare') is None, reason='requires unshare(1)')
-def test_a_proc_from_another_pid_namespace_fails_closed(tmp_path):
+def test_a_proc_from_another_pid_namespace_fails_closed(tmp_path, packaged_init):
     # The worker in a pid namespace of its own, still seeing its parent's /proc.
     marker = tmp_path / 'marker'
+    # Named outright: the conftest's patched default does not reach another interpreter.
+    init = None if packaged_init is None else str(packaged_init)
     script = (
         'import sys\n'
-        'from postern import IsolationError, Sandbox\n'
+        'from postern import IsolationError, Sandbox, SandboxProfile\n'
         'try:\n'
-        f'    Sandbox().start_bash("sleep 0.5; echo survived > {marker}")\n'
+        f'    Sandbox(SandboxProfile(init={init!r})).start_bash("sleep 0.5; echo survived > {marker}")\n'
         'except IsolationError as exc:\n'
         '    sys.exit(f"refused: {exc}")\n'
     )
