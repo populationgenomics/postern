@@ -9,8 +9,13 @@ on:
     types: [published]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # One wheel per architecture, each built on its own runner: the wheel carries the
+  # static guest init compiled for that machine (setup.py).
+  wheel:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     permissions:
       contents: read
     steps:
@@ -28,14 +33,30 @@ jobs:
             echo "Release tag '$GITHUB_REF_NAME' does not match package version '$pkg'"
             exit 1
           fi
-      - run: uv build
+      - run: uv build --wheel
+      - run: python3 tools/check_wheel.py dist/*.whl
       - uses: actions/upload-artifact@v5
         with:
-          name: dist
+          name: dist-wheel-${{ matrix.runner }}
+          path: dist/
+
+  sdist:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist-sdist
           path: dist/
 
   publish:
-    needs: build
+    needs: [wheel, sdist]
     runs-on: ubuntu-latest
     # The trusted-publisher and OIDC scope both key off this environment name.
     environment: pypi
@@ -44,6 +65,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1

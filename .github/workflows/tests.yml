@@ -37,6 +37,38 @@ jobs:
       - run: uv sync --locked --group test --python ${{ matrix.python-version }}
       - run: uv run pytest -q
 
+  wheel:
+    # The suite against the installed wheel rather than the source tree: the init a
+    # default profile launches is the one setup.py built into the wheel.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      # As in the pytest job: bubblewrap, user namespaces, and grpcio for the
+      # system interpreter the hatch e2e guests run against.
+      - run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap python3-pip
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo /usr/bin/python3 -m pip install --break-system-packages --no-deps grpcio
+      - run: uv build --wheel
+      - run: python3 tools/check_wheel.py dist/*.whl
+      # Not an editable install, so `import postern` in the suite resolves to the wheel.
+      - run: |
+          uv venv --python 3.13
+          uv pip install dist/*.whl pytest 'grpcio>=1.60'
+          # Else conftest would build an init and hide a lookup that misses the wheel's.
+          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file(), _sandbox._PACKAGED_INIT'
+          .venv/bin/python -m pytest -q
+
   seccomp-drift:
     # The authoritative drift check: regenerate the blob from the syscall lists with
     # libseccomp and fail if the committed _seccomp.bpf / _seccomp.spec differ.
