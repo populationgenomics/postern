@@ -33,12 +33,12 @@ jobs:
             echo "Release tag '$GITHUB_REF_NAME' does not match package version '$pkg'"
             exit 1
           fi
-      - run: uv build --wheel
-      - run: python3 tools/check_wheel.py dist/*.whl
+      - run: tools/build_wheel.sh
       - uses: actions/upload-artifact@v5
         with:
           name: dist-wheel-${{ matrix.runner }}
-          path: dist/
+          # The sdist job publishes the one sdist.
+          path: dist/*.whl
 
   sdist:
     runs-on: ubuntu-latest

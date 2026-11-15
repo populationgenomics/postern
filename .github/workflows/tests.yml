@@ -59,8 +59,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y bubblewrap python3-pip
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo /usr/bin/python3 -m pip install --break-system-packages --no-deps grpcio
-      - run: uv build --wheel
-      - run: python3 tools/check_wheel.py dist/*.whl
+      - run: tools/build_wheel.sh
       # Not an editable install, so `import postern` in the suite resolves to the wheel.
       - run: |
           uv venv --python 3.13

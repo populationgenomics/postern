@@ -3,9 +3,10 @@
 Everything declarative lives in ``pyproject.toml``. This file adds the one step
 setuptools cannot express there: on Linux, ``build_py`` compiles ``_init.c`` into
 ``postern/_bin/postern-init``, and the wheel is tagged for the platform it was
-built on. The binary is static, so it depends on no libc at run time, and the tag
-claims both manylinux and musllinux. Elsewhere the wheel is pure and carries no
-init: a sandbox runs only on Linux.
+built on, ``linux_<arch>``, which any local installer accepts. The binary is
+static, so it depends on no libc at run time; ``tools/build_wheel.sh`` retags a
+release wheel for manylinux and musllinux on that basis. Elsewhere the wheel is
+pure and carries no init: a sandbox runs only on Linux.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
-import sysconfig
 
 import setuptools
 from setuptools.command import bdist_wheel, build_py
@@ -36,7 +36,6 @@ def _compile_init(output: pathlib.Path, version: str) -> None:
     spec.loader.exec_module(module)
     output.parent.mkdir(parents=True, exist_ok=True)
     module.compile_init(output, version=version)
-    output.chmod(0o755)
 
 
 class BuildPy(build_py.build_py):
@@ -60,12 +59,11 @@ class BdistWheel(bdist_wheel.bdist_wheel):
     """A ``py3-none-<platform>`` wheel on Linux, where it carries the init; pure elsewhere."""
 
     def get_tag(self) -> tuple[str, str, str]:
+        python, abi, platform_tag = super().get_tag()
         if not _builds_init():
-            return super().get_tag()
-        # The interpreter's platform, not the kernel's: a 32-bit userland can run on a 64-bit kernel.
-        arch = sysconfig.get_platform().split('-', 1)[1]
-        # The init is the wheel's only native file, and it is statically linked.
-        return 'py3', 'none', f'manylinux_2_17_{arch}.manylinux2014_{arch}.musllinux_1_1_{arch}'
+            return python, abi, platform_tag
+        # No Python extension: the init is the wheel's only native file, and any CPython runs it.
+        return 'py3', 'none', platform_tag
 
 
 setuptools.setup(distclass=Distribution, cmdclass={'build_py': BuildPy, 'bdist_wheel': BdistWheel})
