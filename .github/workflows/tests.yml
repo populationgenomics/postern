@@ -65,7 +65,7 @@ jobs:
           uv venv --python 3.13
           uv pip install dist/*.whl pytest 'grpcio>=1.60'
           # Else conftest would build an init and hide a lookup that misses the wheel's.
-          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file(), _sandbox._PACKAGED_INIT'
+          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file()'
           .venv/bin/python -m pytest -q
 
   seccomp-drift:

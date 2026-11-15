@@ -30,7 +30,9 @@ import collections.abc
 import contextlib
 import dataclasses
 import errno
+import fcntl
 import os
+import select
 import selectors
 import signal
 import subprocess
@@ -99,24 +101,78 @@ def pidfd_signal(pidfd: int, sig: int) -> None:
     send(pidfd, sig)
 
 
+# CPython ignores these at startup, and an ignored disposition survives exec:
+# Popen restores the default for its children, and so does :func:`spawn`.
+_RESTORED_SIGNALS = tuple(getattr(signal, name) for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ') if hasattr(signal, name))
+
+
 class Launch:
-    """A started bwrap, with pidfds on it and on the guest's init: what stopping a run needs.
+    """A started bwrap: its pid, its output pipes, and pidfds on it and on the guest's init.
 
     A pidfd names one process for its lifetime, so a signal through either can
     never reach a recycled pid, however late it is sent. ``init_pidfd`` is None
     only when no init is running: bwrap failed before starting one, or it has
     already exited, and its exit took the guest's namespace with it.
 
-    Safe from any thread. Signalling is a no-op once :meth:`close` has run: a
-    closed descriptor's number can be reused by an unrelated pidfd.
+    Only this reaps bwrap, so until it does, the pid still names it. Safe from
+    any thread. Signalling is a no-op once :meth:`close` has run: a closed
+    descriptor's number can be reused by an unrelated pidfd.
     """
 
-    def __init__(self, popen: subprocess.Popen[bytes], bwrap_pidfd: int) -> None:
-        self.popen = popen
-        self.bwrap_pidfd = bwrap_pidfd
+    def __init__(self, pid: int, pidfd: int, *, stdout: int, stderr: int, args: collections.abc.Sequence[str]) -> None:
+        """Take ownership of ``pidfd`` and of the read ends ``stdout`` and ``stderr``."""
+        self.pid = pid
+        self.args = list(args)
+        self.bwrap_pidfd = pidfd
         self.init_pidfd: int | None = None
+        self.stdout: int | None = stdout
+        self.stderr: int | None = stderr
         self._lock = threading.Lock()
         self._closed = False
+        # Readable once bwrap exits; held, unlike bwrap_pidfd, until it is reaped.
+        self._exit_fd = os.dup(pidfd)
+        self._reap_lock = threading.Lock()
+        self._returncode: int | None = None
+
+    @property
+    def returncode(self) -> int | None:
+        """The exit status of bwrap once it has ended, else None. Negative N means it died of signal N."""
+        return self.poll()
+
+    def poll(self) -> int | None:
+        """Reap bwrap if it has exited, and return :attr:`returncode`."""
+        with self._reap_lock:
+            return self._poll_locked()
+
+    def _poll_locked(self) -> int | None:
+        if self._returncode is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self._returncode = os.waitstatus_to_exitcode(status)
+                os.close(self._exit_fd)
+        return self._returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for bwrap to exit, reap it, and return its status. Any number of threads can wait at once.
+
+        Raises:
+            subprocess.TimeoutExpired: If it is still running after ``timeout``.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._reap_lock:
+                status = self._poll_locked()
+                if status is not None:
+                    return status
+                # A descriptor of this waiter's own: another may reap and close _exit_fd meanwhile.
+                watch = os.dup(self._exit_fd)
+            try:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                ready, _, _ = select.select([watch], [], [], remaining)
+            finally:
+                os.close(watch)
+            if not ready:
+                raise subprocess.TimeoutExpired(self.args, timeout or 0)
 
     def signal_init(self, sig: int) -> None:
         """Send ``sig`` to the guest's init, if it is still running."""
@@ -141,6 +197,14 @@ class Launch:
                     with contextlib.suppress(ProcessLookupError):
                         pidfd_signal(pidfd, signal.SIGKILL)
 
+    def close_pipes(self) -> None:
+        """Close the read ends of bwrap's stdout and stderr. Idempotent."""
+        with self._lock:
+            pipes, self.stdout, self.stderr = (self.stdout, self.stderr), None, None
+        for fd in pipes:
+            if fd is not None:
+                os.close(fd)
+
     def close(self) -> None:
         """Close both pidfds. Does not stop the run, and signals nothing afterwards."""
         with self._lock:
@@ -155,11 +219,60 @@ class Launch:
     def discard(self) -> None:
         """Kill the run, reap bwrap and release everything: for a launch no :class:`Process` will own."""
         self.kill()
-        self.popen.wait()
-        for pipe in (self.popen.stdout, self.popen.stderr):
-            if pipe is not None:
-                pipe.close()
+        self.wait()
+        self.close_pipes()
         self.close()
+
+
+def spawn(
+    path: str,
+    argv: collections.abc.Sequence[str],
+    *,
+    env: collections.abc.Mapping[str, str],
+    inherit: collections.abc.Sequence[int] = (),
+) -> Launch:
+    """Start ``path`` with ``posix_spawn``: stdin on ``/dev/null``, stdout and stderr on new pipes.
+
+    Never a ``fork``: glibc's ``posix_spawn`` clones with ``CLONE_VM|CLONE_VFORK``,
+    so no ``pthread_atfork`` handler runs, in the parent or the child. Each of
+    ``inherit`` lands in the child at 3, 4, … in that order. The child also gets any
+    descriptor a library opened without ``O_CLOEXEC``; ``postern-launch`` closes
+    those before it execs bwrap.
+
+    Raises:
+        OSError: If the spawn fails, or no pidfd can be opened on the child, which
+            is then killed and reaped first.
+    """
+    lowest = 3 + len(inherit)
+    out_read, out_write = os.pipe()
+    err_read, err_write = os.pipe()
+    try:
+        moved: list[int] = []
+        try:
+            # Every source above every target, so no dup2 overwrites a source a later one reads.
+            for fd in (out_write, err_write, *inherit):
+                moved.append(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, lowest))
+            actions = [
+                (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+                (os.POSIX_SPAWN_DUP2, moved[0], 1),
+                (os.POSIX_SPAWN_DUP2, moved[1], 2),
+                *((os.POSIX_SPAWN_DUP2, fd, 3 + index) for index, fd in enumerate(moved[2:])),
+            ]
+            pid = os.posix_spawn(path, list(argv), dict(env), file_actions=actions, setsigdef=_RESTORED_SIGNALS)
+        finally:
+            for fd in (out_write, err_write, *moved):
+                os.close(fd)
+        try:
+            pidfd = pidfd_open(pid)
+        except BaseException:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            raise
+    except BaseException:
+        os.close(out_read)
+        os.close(err_read)
+        raise
+    return Launch(pid, pidfd, stdout=out_read, stderr=err_read, args=argv)
 
 
 class Process:
@@ -172,7 +285,6 @@ class Process:
 
     def __init__(self, launch: Launch, *, resources: contextlib.ExitStack) -> None:
         self._launch = launch
-        self._popen = popen = launch.popen
         self._resources = resources
         self._lock = threading.RLock()
         self._escalation: threading.Timer | None = None
@@ -181,21 +293,21 @@ class Process:
         self._closed = False
         self._released = threading.Event()
         self._open: dict[int, Stream] = {}
-        pipes: tuple[tuple[Stream, typing.IO[bytes] | None], ...] = (('stdout', popen.stdout), ('stderr', popen.stderr))
-        for name, pipe in pipes:
-            if pipe is not None:
-                os.set_blocking(pipe.fileno(), False)
-                self._open[pipe.fileno()] = name
+        pipes: tuple[tuple[Stream, int | None], ...] = (('stdout', launch.stdout), ('stderr', launch.stderr))
+        for name, fd in pipes:
+            if fd is not None:
+                os.set_blocking(fd, False)
+                self._open[fd] = name
 
     @property
     def pid(self) -> int:
         """The host pid of the run's bwrap process."""
-        return self._popen.pid
+        return self._launch.pid
 
     @property
     def returncode(self) -> int | None:
         """The exit status once the run has ended, else None. Negative N means bwrap died of signal N."""
-        return self._popen.poll()
+        return self._launch.poll()
 
     @property
     def terminated(self) -> bool:
@@ -229,7 +341,7 @@ class Process:
             while self._open:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
-                    raise subprocess.TimeoutExpired(self._popen.args, 0)
+                    raise subprocess.TimeoutExpired(self._launch.args, 0)
                 if selector.select(remaining):
                     for fd in list(self._open):
                         if fd not in self._open:
@@ -263,7 +375,7 @@ class Process:
                 kills it at once.
         """
         with self._lock:
-            if self._closed or self._popen.poll() is not None or self._terminated:
+            if self._closed or self._launch.poll() is not None or self._terminated:
                 return
             self._terminated = True
             if self._launch.init_pidfd is None or grace <= 0:
@@ -291,7 +403,7 @@ class Process:
         Raises:
             subprocess.TimeoutExpired: If it is still running after ``timeout``.
         """
-        return self._popen.wait(timeout)
+        return self._launch.wait(timeout)
 
     def communicate(self, timeout: float | None = None, *, max_output: int | None = None) -> ProcResult:
         """Read the rest of the output, wait for the run to end, and close it.
@@ -325,7 +437,7 @@ class Process:
         try:
             for name, chunk in self._pump(deadline=deadline):
                 _append(out if name == 'stdout' else err, chunk)
-            self._popen.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
+            self._launch.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
             self.kill()
@@ -333,12 +445,12 @@ class Process:
             try:
                 for name, chunk in self._pump(deadline=drain_deadline):
                     _append(out if name == 'stdout' else err, chunk)
-                self._popen.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
+                self._launch.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 pass
         finally:
             self.close()
-        return _result(self._popen.returncode, out, err, timed_out=timed_out, truncated=truncated)
+        return _result(self._launch.returncode, out, err, timed_out=timed_out, truncated=truncated)
 
     def close(self) -> None:
         """Stop the run if it is still going, and release its pipes, pidfds and hatches.
@@ -355,15 +467,15 @@ class Process:
             self._released.wait()
             return
         try:
-            if self._popen.poll() is None:
+            if self._launch.poll() is None:
                 self.terminate(grace=_CLOSE_GRACE_S)
                 try:
                     for _ in self._pump(deadline=time.monotonic() + _CLOSE_GRACE_S + 1):
                         pass
-                    self._popen.wait(_CLOSE_GRACE_S + 1)
+                    self._launch.wait(_CLOSE_GRACE_S + 1)
                 except subprocess.TimeoutExpired:
                     self.kill()
-            self._popen.wait()
+            self._launch.wait()
         finally:
             self._release()
 
@@ -373,9 +485,7 @@ class Process:
                 self._closed = True
                 if self._escalation is not None:
                     self._escalation.cancel()
-                for pipe in (self._popen.stdout, self._popen.stderr):
-                    if pipe is not None:
-                        pipe.close()
+                self._launch.close_pipes()
                 self._open.clear()
                 # Normally a no-op, the run having ended. Not if bwrap died on its own
                 # with the init still running, or close() itself was interrupted.

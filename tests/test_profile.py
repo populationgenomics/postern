@@ -62,21 +62,23 @@ def test_proc_sysctl_surface_masked_read_only():
 
 def test_bwrap_credentials_no_drop_by_default():
     # host_uid unset: no privilege drop, at either euid.
-    assert bwrap_credentials(SandboxProfile(), euid=0) == {}
-    assert bwrap_credentials(SandboxProfile(), euid=1000) == {}
+    assert bwrap_credentials(SandboxProfile(), euid=0) == []
+    assert bwrap_credentials(SandboxProfile(), euid=1000) == []
 
 
 def test_bwrap_credentials_opt_in_when_root():
     # host_uid set + we are root: run bwrap non-root, dropping supplementary groups.
     creds = bwrap_credentials(SandboxProfile(host_uid=65534), euid=0)
-    assert creds == {'user': 65534, 'group': 65534, 'extra_groups': []}  # gid from guest_gid
+    assert creds == ['--uid', '65534', '--gid', '65534']  # gid from guest_gid
     creds = bwrap_credentials(SandboxProfile(host_uid=100000, host_gid=100000, guest_gid=65534), euid=0)
-    assert creds == {'user': 100000, 'group': 100000, 'extra_groups': []}  # host_gid wins
+    assert creds == ['--uid', '100000', '--gid', '100000']  # host_gid wins
+    creds = bwrap_credentials(SandboxProfile(host_uid=100000, guest_gid=None), euid=0)
+    assert creds == ['--uid', '100000']  # no gid to drop to
 
 
 def test_bwrap_credentials_ignored_when_not_root():
     # Cannot setuid unless root; bwrap then runs at our (already non-root) uid.
-    assert bwrap_credentials(SandboxProfile(host_uid=65534), euid=1000) == {}
+    assert bwrap_credentials(SandboxProfile(host_uid=65534), euid=1000) == []
 
 
 def test_bound_workspace(tmp_path):
