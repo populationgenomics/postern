@@ -1,9 +1,9 @@
-"""The guest shim's exit-status dispatch and rlimit gating — no bubblewrap needed.
+"""The guest shim's exit-status dispatch and address-space limit — no bubblewrap needed.
 
-Loads the bound-in shim by path and drives `_run_code` and `_apply_rlimits`
-directly, so the ``SystemExit``/exception → status mapping is covered on any
-platform. The fork+exec supervisor itself, and the ``run``/``run_bash`` wiring
-above it, need a real sandbox and are covered in ``test_sandbox_e2e``.
+Loads the bound-in shim by path and drives `_run_code` directly, so the
+``SystemExit``/exception → status mapping is covered on any platform. The
+``run_python`` wiring above it needs a real sandbox and is covered in
+``test_init_e2e``.
 """
 
 import importlib.util
@@ -26,8 +26,7 @@ def _load_shim():
 
 @pytest.fixture
 def shim(monkeypatch):
-    # Unset, so _apply_rlimits is a no-op and cannot touch this process's limits.
-    monkeypatch.delenv('POSTERN_NPROC', raising=False)
+    # Unset, so the limit is a no-op and cannot touch this process's limits.
     monkeypatch.delenv('POSTERN_AS', raising=False)
     return _load_shim()
 
@@ -64,21 +63,16 @@ def test_run_code_string_exit_prints_message(shim, monkeypatch, capsys):
     assert 'nope' in capsys.readouterr().err
 
 
-def test_apply_rlimits_applies_both_when_address_space(shim, monkeypatch):
+def test_run_code_applies_the_address_space_limit(shim, monkeypatch):
     calls = []
-    monkeypatch.setattr(shim.resource, 'setrlimit', lambda which, _lim: calls.append(which))
-    monkeypatch.setenv('POSTERN_NPROC', '32')
+    monkeypatch.setattr(shim.resource, 'setrlimit', lambda which, lim: calls.append((which, lim)))
     monkeypatch.setenv('POSTERN_AS', str(1024 * 1024))
-    shim._apply_rlimits(address_space=True)
-    assert shim.resource.RLIMIT_NPROC in calls
-    assert shim.resource.RLIMIT_AS in calls
+    assert shim._run_code() == 0
+    assert calls == [(shim.resource.RLIMIT_AS, (1024 * 1024, 1024 * 1024))]
 
 
-def test_apply_rlimits_defers_address_space(shim, monkeypatch):
+def test_run_code_leaves_the_address_space_unlimited_by_default(shim, monkeypatch):
     calls = []
-    monkeypatch.setattr(shim.resource, 'setrlimit', lambda which, _lim: calls.append(which))
-    monkeypatch.setenv('POSTERN_NPROC', '32')
-    monkeypatch.setenv('POSTERN_AS', str(1024 * 1024))
-    shim._apply_rlimits(address_space=False)
-    assert shim.resource.RLIMIT_NPROC in calls
-    assert shim.resource.RLIMIT_AS not in calls
+    monkeypatch.setattr(shim.resource, 'setrlimit', lambda which, lim: calls.append((which, lim)))
+    assert shim._run_code() == 0
+    assert calls == []

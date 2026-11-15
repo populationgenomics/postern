@@ -100,7 +100,7 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
     # bwrap runs at the guest uid, so a worker secret it inherited would be a
     # same-uid environ read away. Two controls cover it — bwrap_env scrubbing what
     # bwrap is exec'd with, and --as-pid-1 keeping bwrap out of the guest's PID
-    # namespace so /proc/1 is the shim's own non-dumpable init. Either is "clean".
+    # namespace so /proc/1 is the non-dumpable init. Either is "clean".
     monkeypatch.setenv('WORKER_SESSION_TOKEN', 'worker-SECRET-should-not-leak')
     code = (
         'try:\n'
@@ -115,7 +115,7 @@ def test_bwrap_pid1_environ_holds_no_host_secrets(monkeypatch):
 
 
 def test_pid1_is_the_guest_entrypoint_not_bwrap():
-    # --as-pid-1 runs the shim as PID 1; the shim then forks the work.
+    # --as-pid-1 runs the init as PID 1; the init then forks the work.
     result = Sandbox().run_python('import os; print(os.getpid(), open("/proc/1/comm").read().strip())')
     assert result.ok, result.stderr
     pid, comm = result.stdout.split()
