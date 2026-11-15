@@ -84,6 +84,13 @@ gate the host opens.
   `SandboxProfile(init=...)` names one built with `python -m postern.build_init`
   instead. With neither, a launch raises.
 
+- **Launcher** (`postern-launch`, `_launch.c`) — the static program every bwrap
+  is started through, with `posix_spawn` rather than `fork`, so no library's
+  `pthread_atfork` handler runs. It closes the descriptors bwrap should not
+  inherit, drops to `host_uid`/`host_gid` by number when asked, and execs bwrap.
+  Always the one installed with postern, never configurable: it runs on the host
+  as the worker.
+
 - **Process** — a run in progress, from `Sandbox.start*` (`AsyncProcess` from
   `astart*`, for asyncio). Its output is one merged stream of
   `(stream, bytes)`, never separate readers (draining one would stall the guest
