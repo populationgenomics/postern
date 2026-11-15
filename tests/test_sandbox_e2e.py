@@ -19,7 +19,7 @@ def test_run_python_sealed():
 
 
 def test_run_python_propagates_exit_status():
-    # The status has to survive the re-exec, the fork and the reap.
+    # The status has to survive the init's fork, the exec and the reap.
     result = Sandbox().run_python('import sys; sys.exit(7)')
     assert result.returncode == 7
 
@@ -50,7 +50,7 @@ def test_run_missing_program_is_127():
 
 
 def test_run_python_address_space_limit_does_not_break_startup():
-    # RLIMIT_AS lands after the re-exec'd interpreter is up: a fresh CPython's
+    # RLIMIT_AS lands after the shim's interpreter is up: a fresh CPython's
     # virtual size at startup would trip a cap applied before the execvp.
     result = Sandbox(SandboxProfile(rlimit_as=1024 * 1024 * 1024)).run_python('print(sum(range(1000)))')
     assert result.ok, result.stderr

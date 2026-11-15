@@ -170,9 +170,9 @@ class IsolationError(RuntimeError):
     """A load-bearing control cannot be enforced here.
 
     Raised by :meth:`Sandbox.verify`, so a worker can refuse to serve rather than
-    run untrusted code with weaker isolation than intended, and by a launch that
-    could not hold the guest's init by pidfd, without which a stop could not be
-    sure of reaching it.
+    run untrusted code with weaker isolation than intended; by a launch with no
+    guest init to run; and by a launch that could not hold the guest's init by
+    pidfd, without which a stop could not be sure of reaching it.
     """
 
 
@@ -190,8 +190,9 @@ class SandboxProfile:
         rootfs: A curated base directory whose ``/usr``, ``/lib`` … are bound as
             the guest's system dirs. ``None`` binds the *host's* system dirs,
             exposing the host userland read-only.
-        python: Interpreter argv0 for the in-guest shim (an absolute path when it
-            lives in a bound venv). Only :meth:`Sandbox.run_python` needs it.
+        python: The guest's interpreter argv0 (an absolute path when it lives in
+            a bound venv): what :meth:`Sandbox.run_python` runs the shim on, and
+            what :func:`postern.stream.git_url` runs the connector on.
         ro_binds: Extra ``(host, guest)`` read-only binds beyond the base system
             dirs, mapped to ``--ro-bind-try``: a missing source is skipped
             silently, so use these only for binds the guest can do without.
@@ -1070,8 +1071,8 @@ class Sandbox:
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
-        # The init itself, inside the sandbox: it needs nothing from the rootfs (under
-        # the C init a rootfs need not carry Python), and the init is never executed
+        # The init itself, inside the sandbox: it needs nothing from the rootfs (a
+        # rootfs need not carry Python), and the init is never executed
         # on the host. The host only ever runs bwrap; running a deployer-supplied
         # binary here, as the worker and with its environment, would hand anything
         # that could swap that file the worker's privileges.

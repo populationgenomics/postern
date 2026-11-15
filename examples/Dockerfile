@@ -9,7 +9,6 @@
 # with postern's Linux wheel.
 #
 #   docker build --build-arg POSTERN_VERSION=X.Y.Z -t worker .
-ARG POSTERN_VERSION
 
 # --- 1. Generate gRPC stubs from the contract (needed by the worker servicer
 #        AND the guest client). ---

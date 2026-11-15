@@ -174,7 +174,7 @@ async with await sandbox.astart_bash('make test') as process:
 - **Stopping is graceful.** bwrap does not forward signals, so `terminate()`
   signals the guest's init directly, through a pidfd on the host pid bwrap reports
   on `--info-fd` (so a recycled pid is never signalled). The init forwards the
-  SIGTERM to the command (the C init to its whole process group), which can trap it
+  SIGTERM to the command's whole process group, which can trap it
   and clean up; if it is still running after `grace`, the init is killed through
   the same pidfd and the kernel kills the rest of its namespace with it. A launch
   raises `IsolationError` where pidfds do not work (before Linux 5.3, or under a
@@ -262,7 +262,7 @@ Pass `profile=` to `git_url`: the in-guest interpreter comes from
 `profile.python`, the same place `run_python` gets it, so the URL cannot disagree
 with the sandbox it runs in. Without it the default is a bare `python3` off the
 guest `PATH`, which is wrong for `with_venv` or a curated `rootfs`. The connector
-is Python, so this needs an interpreter in the rootfs even under the C init.
+is Python, so this needs an interpreter in the rootfs.
 
 **The socket is the capability.** The same access could be brokered through an
 HTTP forward proxy with a handler policing each request; a bound stream socket
@@ -410,7 +410,7 @@ libc; elsewhere it installs without one, and no sandbox runs there anyway.
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.start(argv)`, `.start_bash(script, *, shell='bash')`, `.start_python(code)` → `Process`, and `await .astart(...)`, `.astart_bash(...)`, `.astart_python(...)` → `AsyncProcess` ([streaming and stopping](#streaming-and-stopping-a-run)); `.verify()` (fail-closed boot check, raises `IsolationError`, as does any launch where pidfds do not work). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
+- `Sandbox(profile=None, *, hatch=None)` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.start(argv)`, `.start_bash(script, *, shell='bash')`, `.start_python(code)` → `Process`, and `await .astart(...)`, `.astart_bash(...)`, `.astart_python(...)` → `AsyncProcess` ([streaming and stopping](#streaming-and-stopping-a-run)); `.verify()` (fail-closed boot check, raises `IsolationError`, as does any launch with no guest init or where pidfds do not work). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var.
 - `Process` — `.output()` → iterator of `(stream, bytes)`; `.terminate(*, grace=5.0)`, `.kill()`, `.wait(timeout=None)`, `.communicate(timeout=None)` → `ProcResult`, `.close()`; `.pid`, `.returncode`, `.terminated`; a context manager. `AsyncProcess` is the same run for asyncio: `async for` over `.output()`, `await .wait()`, `await .communicate(timeout=None)`, `await .aclose()`, `async with`.
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], required_ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None, init=None)` and `SandboxProfile.with_venv(venv, **kw)`. `ro_binds=` are `--ro-bind-try` (a missing source is skipped silently); `required_ro_binds=` are `--ro-bind` (a missing source fails the launch), for a bind the guest cannot run without. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source reachable by it. `init=` names a static C init built by `python -m postern.build_init` ([above](#pid-1-and-the-resource-backstops)); `None` uses the one the Linux wheel carries, and a launch with neither raises `IsolationError`. `verify()` checks the init was built from this postern version. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by the guest init, so every entrypoint gets them.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)

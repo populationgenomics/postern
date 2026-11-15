@@ -155,10 +155,8 @@ and reflective tricks. They exist for library-level use cases; in application co
 harder to type-check, and harder for tools (including AI assistants) to reason about. Reaching for one usually means an
 abstraction is missing or wrong — fix that instead.
 
-Two uses in `_guest.py` are deliberate, and both are the whole point of that module: it `exec`s the untrusted guest
-code (carrying `# noqa: S102` and the reason), and it reaches `PR_SET_DUMPABLE` through `ctypes.CDLL(None).prctl`
-because a stdlib-only script inside the sandbox has no other route to a `prctl`. A power feature needs justification at
-that level or it doesn't go in.
+One use in `_guest.py` is deliberate, and it is the whole point of that module: it `exec`s the untrusted guest code
+(carrying `# noqa: S102` and the reason). A power feature needs justification at that level or it doesn't go in.
 
 ## Docstrings
 

@@ -18,7 +18,7 @@ held rather than dropped): SIGTERM to bwrap does nothing. So
 :meth:`Process.terminate` signals the guest's *init* directly. bwrap reports the
 init's host pid on ``--info-fd``, and a pidfd is opened on it at start, so the
 signal can only ever reach that process even after its pid is recycled. The init
-forwards SIGTERM to the command (the C init to its whole process group); if the
+forwards SIGTERM to the command's whole process group; if the
 command is still running when ``grace`` expires, the init is SIGKILLed through
 the same pidfd, and the kernel kills everything in its PID namespace with it.
 """
