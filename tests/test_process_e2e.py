@@ -473,11 +473,12 @@ def test_a_proc_from_another_pid_namespace_fails_closed(tmp_path, packaged_init)
     # The worker in a pid namespace of its own, still seeing its parent's /proc.
     marker = tmp_path / 'marker'
     # Named outright: the conftest's patched default does not reach another interpreter.
+    init = None if packaged_init is None else str(packaged_init)
     script = (
         'import sys\n'
         'from postern import IsolationError, Sandbox, SandboxProfile\n'
         'try:\n'
-        f'    Sandbox(SandboxProfile(init={str(packaged_init)!r})).start_bash("sleep 0.5; echo survived > {marker}")\n'
+        f'    Sandbox(SandboxProfile(init={init!r})).start_bash("sleep 0.5; echo survived > {marker}")\n'
         'except IsolationError as exc:\n'
         '    sys.exit(f"refused: {exc}")\n'
     )

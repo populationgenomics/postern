@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import shlex
 import subprocess
 
 SOURCE = pathlib.Path(__file__).with_name('_init.c')
@@ -33,18 +34,18 @@ def compile_init(output: str | os.PathLike[str], *, version: str, cc: str | None
         output: Where to write the binary.
         version: What the binary's ``--version`` prints, which
             :meth:`~postern.Sandbox.verify` compares with the installed postern.
-        cc: The C compiler. Defaults to ``$CC``, then ``cc``.
+        cc: The C compiler command, split like a shell word list (``ccache gcc``).
+            Defaults to ``$CC``, then ``cc``.
 
     Returns:
-        The path written.
+        The path written, mode 0755.
 
     Raises:
         subprocess.CalledProcessError: If the compiler fails.
     """
     target = pathlib.Path(output)
-    compiler = cc or os.environ.get('CC') or 'cc'
     command = [
-        compiler,
+        *shlex.split(cc or os.environ.get('CC') or 'cc'),
         '-static',
         '-O2',
         '-Wall',
@@ -56,6 +57,8 @@ def compile_init(output: str | os.PathLike[str], *, version: str, cc: str | None
         str(SOURCE),
     ]
     subprocess.run(command, check=True)  # noqa: S603 — fixed argv, no shell
+    # Whatever the umask: a bwrap at another uid (host_uid=) must read and exec it.
+    target.chmod(0o755)
     return target
 
 
@@ -73,9 +76,9 @@ def build(output: str | os.PathLike[str], *, cc: str | None = None) -> pathlib.P
         subprocess.CalledProcessError: If the compiler fails.
     """
     # Here rather than at module level: compile_init must stay importable without postern.
-    from postern import __version__  # noqa: PLC0415
+    import postern  # noqa: PLC0415
 
-    return compile_init(output, version=__version__, cc=cc)
+    return compile_init(output, version=postern.__version__, cc=cc)
 
 
 def main(argv: list[str] | None = None) -> None:
