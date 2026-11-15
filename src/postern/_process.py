@@ -146,7 +146,13 @@ class Launch:
 
     def _poll_locked(self) -> int | None:
         if self._returncode is None:
-            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError as exc:
+                raise ChildProcessError(
+                    f'bwrap (pid {self.pid}) was reaped by something else in this process, so its exit status is '
+                    'lost: postern needs its own children, not a SIGCHLD set to SIG_IGN or a waitpid(-1) loop'
+                ) from exc
             if pid:
                 self._returncode = os.waitstatus_to_exitcode(status)
                 os.close(self._exit_fd)
@@ -167,8 +173,11 @@ class Launch:
                 # A descriptor of this waiter's own: another may reap and close _exit_fd meanwhile.
                 watch = os.dup(self._exit_fd)
             try:
+                # poll, not select: a busy worker's descriptors run past select's 1024.
+                poller = select.poll()
+                poller.register(watch, select.POLLIN)
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                ready, _, _ = select.select([watch], [], [], remaining)
+                ready = poller.poll(None if remaining is None else remaining * 1000)
             finally:
                 os.close(watch)
             if not ready:
@@ -233,8 +242,9 @@ def spawn(
 ) -> Launch:
     """Start ``path`` with ``posix_spawn``: stdin on ``/dev/null``, stdout and stderr on new pipes.
 
-    Never a ``fork``: glibc's ``posix_spawn`` clones with ``CLONE_VM|CLONE_VFORK``,
-    so no ``pthread_atfork`` handler runs, in the parent or the child. Each of
+    Never a ``fork``: from glibc 2.24 (which the launch checks for), ``posix_spawn``
+    clones with ``CLONE_VM|CLONE_VFORK``, so no ``pthread_atfork`` handler runs, in
+    the parent or the child. Each of
     ``inherit`` lands in the child at 3, 4, … in that order. The child also gets any
     descriptor a library opened without ``O_CLOEXEC``; ``postern-launch`` closes
     those before it execs bwrap.
@@ -262,9 +272,13 @@ def spawn(
         finally:
             for fd in (out_write, err_write, *moved):
                 os.close(fd)
+        pidfd: int | None = None
         try:
             pidfd = pidfd_open(pid)
+            return Launch(pid, pidfd, stdout=out_read, stderr=err_read, args=argv)
         except BaseException:
+            if pidfd is not None:
+                os.close(pidfd)
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
             raise
@@ -272,7 +286,6 @@ def spawn(
         os.close(out_read)
         os.close(err_read)
         raise
-    return Launch(pid, pidfd, stdout=out_read, stderr=err_read, args=argv)
 
 
 class Process:
@@ -492,6 +505,9 @@ class Process:
                 self._launch.kill()
                 self._launch.close()
                 self._resources.close()
+            # Last and unlocked: a foreign reaper's error cannot keep the rest open.
+            # Killed, bwrap exits at once; reaped, it leaves no zombie behind.
+            self._launch.wait()
         finally:
             self._released.set()
 

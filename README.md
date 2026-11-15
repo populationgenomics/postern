@@ -159,10 +159,16 @@ the seccomp filter at fixed descriptors; the launcher closes every descriptor
 above them that a library left without `O_CLOEXEC`, drops to `host_uid`/`host_gid`
 with no supplementary groups when the profile asks for it (by number: a static
 binary resolving names would load the host's NSS modules), checks the drop cannot
-be undone, and execs bwrap. A failure there is a run with status 125 and the
-reason on stderr, before bwrap starts. The launcher is never configurable: it runs
-on the host as the worker, root included, so postern runs only the copy installed
-with its own code.
+be undone, and execs bwrap. A failure there raises `IsolationError` with the
+launcher's reason, which it reports on the `--info-fd` pipe before bwrap starts.
+The launcher is never configurable: it runs on the host as the worker, root
+included, so postern runs only the copy installed with its own code.
+
+Two things in the embedding process can defeat this. glibc before 2.24 forks
+inside `posix_spawn` itself, so a launch refuses to run on one. And postern reaps
+bwrap itself, so a process-wide reaper (a `SIGCHLD` set to `SIG_IGN`, a
+`waitpid(-1)` loop) makes a run raise `ChildProcessError` rather than report a
+status it never saw.
 
 **Fail-closed boot check.** Every control is enforced on the launch path: the
 strict `--unshare-*` flags make bwrap abort if it can't create the namespaces,

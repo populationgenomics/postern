@@ -67,6 +67,8 @@ jobs:
           # Else conftest would build an init and hide a lookup that misses the wheel's.
           .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file()'
           .venv/bin/python -m pytest -q
+      # The uid-drop tests need root, which the job's user is not.
+      - run: sudo .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_launch_e2e.py
 
   seccomp-drift:
     # The authoritative drift check: regenerate the blob from the syscall lists with

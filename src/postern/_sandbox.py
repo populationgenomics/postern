@@ -478,13 +478,13 @@ class _Job(typing.Generic[_T]):
 
 
 class _Launcher:
-    """Forks every bwrap from one long-lived thread.
+    """Spawns every bwrap from one long-lived thread.
 
     bwrap's ``--die-with-parent`` is ``PR_SET_PDEATHSIG``, which fires when the
-    *thread* that forked bwrap exits, not the process. Forked from a caller or
+    *thread* that created bwrap exits, not the process. Spawned from a caller or
     pool thread, a guest would die when that thread finished.
 
-    Only the fork belongs here, and whatever must follow it before anything else
+    Only the spawn belongs here, and whatever must follow it before anything else
     can touch the child: one launch waiting on bwrap would hold up every other.
     """
 
@@ -497,7 +497,7 @@ class _Launcher:
         """Run ``fn`` on the launcher thread and return its result, or raise its error.
 
         Args:
-            fn: The fork.
+            fn: The spawn.
             discard: Releases ``fn``'s result if the caller is interrupted before
                 receiving it.
         """
@@ -537,7 +537,8 @@ def _read_init_pid(info_fd: int) -> int | None:
         does only when it fails before starting the guest.
 
     Raises:
-        IsolationError: If the report is malformed or does not arrive in time.
+        IsolationError: If postern-launch reports its own failure there, before
+            bwrap ran, or the report is malformed or does not arrive in time.
     """
     deadline = time.monotonic() + _INFO_TIMEOUT_S
     buffer = b''
@@ -556,6 +557,8 @@ def _read_init_pid(info_fd: int) -> int | None:
                 report = json.loads(buffer)
             except ValueError:
                 continue  # not complete yet
+            if isinstance(report, dict) and isinstance(report.get('postern-launch'), str):
+                raise IsolationError(f'postern-launch: {report["postern-launch"]}')
             pid = report.get('child-pid') if isinstance(report, dict) else None
             if not isinstance(pid, int):
                 raise IsolationError(f'bwrap --info-fd report has no child-pid: {buffer!r}')
@@ -674,6 +677,7 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
             reliably stopped, or this install carries no launcher.
     """
     _require_init_control()
+    _require_spawn_without_fork()
     launcher = _launcher_path()
     env = bwrap_env()
     bwrap = shutil.which(cmd[0], path=env['PATH'])
@@ -686,6 +690,8 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
             launcher,
             '--close-from',
             str(3 + len(inherit)),
+            '--error-fd',
+            str(_INFO_SLOT),
             *bwrap_credentials(profile, os.geteuid()),
             '--',
             bwrap,
@@ -708,6 +714,24 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
         return launch
     finally:
         os.close(info_read)
+
+
+def _require_spawn_without_fork() -> None:
+    """Raise unless ``posix_spawn`` here never forks, so runs no ``pthread_atfork`` handler.
+
+    glibc's clones with ``CLONE_VM|CLONE_VFORK`` from 2.24; before that it forks
+    whenever it has file actions, which every launch does. musl's never forks.
+
+    Raises:
+        IsolationError: On glibc older than 2.24.
+    """
+    try:
+        version = os.confstr('CS_GNU_LIBC_VERSION')
+    except (ValueError, OSError):
+        return  # not glibc
+    name, _, number = (version or '').partition(' ')
+    if name == 'glibc' and tuple(int(part) for part in number.split('.')[:2]) < (2, 24):
+        raise IsolationError(f'{version} forks inside posix_spawn; postern needs glibc 2.24 or later')
 
 
 def _launcher_path() -> str:

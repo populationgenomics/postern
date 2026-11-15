@@ -14,13 +14,18 @@
  *     and confirm the drop cannot be undone;
  *   - exec bwrap.
  *
+ * A failure exits 125 before bwrap runs, with the reason on stderr and, given
+ * --error-fd, as {"postern-launch": "reason"} on that descriptor: the --info-fd
+ * pipe, where the worker waits for bwrap's report and so can raise rather than
+ * mistake the failure for the command's own status.
+ *
  * Ids are numbers only: resolving a name would have static glibc dlopen the
  * host's NSS modules. The signal mask is left alone: it carries the worker's
  * blocked SIGTERM through bwrap to the guest init.
  *
  * Usage:
  *   postern-launch --version
- *   postern-launch --close-from FD [--uid UID [--gid GID]] -- BWRAP [ARG...]
+ *   postern-launch --close-from FD [--error-fd FD] [--uid UID [--gid GID]] -- BWRAP [ARG...]
  *
  * Built static, next to postern-init, into the Linux wheel.
  */
@@ -28,6 +33,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <grp.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,21 +52,35 @@
 /* Any failure before bwrap runs. Distinct from bwrap's own 1 and the shell's 126/127. */
 #define EXIT_LAUNCH 125
 
+static int error_fd = -1;
+
+/* Report the failure on stderr and, as a JSON string, on error_fd; exit 125. */
+__attribute__((noreturn, format(printf, 1, 2))) static void die(const char *format, ...) {
+    char message[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof message, format, args);
+    va_end(args);
+    fprintf(stderr, "postern-launch: %s\n", message);
+    if (error_fd >= 0) {
+        char json[sizeof message * 6 + 32];
+        size_t n = (size_t)snprintf(json, sizeof json, "{\"postern-launch\": \"");
+        for (const unsigned char *c = (const unsigned char *)message; *c; c++) {
+            if (*c == '"' || *c == '\\')
+                n += (size_t)snprintf(json + n, sizeof json - n, "\\%c", *c);
+            else if (*c < 0x20)
+                n += (size_t)snprintf(json + n, sizeof json - n, "\\u%04x", *c);
+            else
+                json[n++] = (char)*c;
+        }
+        n += (size_t)snprintf(json + n, sizeof json - n, "\"}");
+        (void)!write(error_fd, json, n);
+    }
+    exit(EXIT_LAUNCH);
+}
+
 __attribute__((noreturn)) static void usage(void) {
-    fputs("usage: postern-launch --version\n"
-          "       postern-launch --close-from FD [--uid UID [--gid GID]] -- BWRAP [ARG...]\n",
-          stderr);
-    exit(EXIT_LAUNCH);
-}
-
-__attribute__((noreturn)) static void fail(const char *what) {
-    fprintf(stderr, "postern-launch: %s: %s\n", what, strerror(errno));
-    exit(EXIT_LAUNCH);
-}
-
-__attribute__((noreturn)) static void refuse(const char *what) {
-    fprintf(stderr, "postern-launch: %s\n", what);
-    exit(EXIT_LAUNCH);
+    die("usage: postern-launch --version | --close-from FD [--error-fd FD] [--uid UID [--gid GID]] -- BWRAP [ARG...]");
 }
 
 /* A decimal id or descriptor in [0, max]; anything else is a usage error. */
@@ -76,14 +96,21 @@ static unsigned long parse_number(const char *text, unsigned long max) {
 }
 
 static void close_from(int lowest) {
-    if (syscall(SYS_close_range, (unsigned int)lowest, ~0U, 0) == 0)
+#ifdef POSTERN_TEST_NO_CLOSE_RANGE /* the tests' way to reach the fallback */
+    long closed = -1;
+    errno = ENOSYS;
+#else
+    long closed = syscall(SYS_close_range, (unsigned int)lowest, ~0U, 0);
+#endif
+    if (closed == 0)
         return;
-    if (errno != ENOSYS)
-        fail("close_range");
-    /* Before Linux 5.9. Read before any uid drop: that makes /proc/self root's. */
+    /* ENOSYS before Linux 5.9; EPERM under a seccomp profile older than the call. */
+    if (errno != ENOSYS && errno != EPERM)
+        die("close_range: %s", strerror(errno));
+    /* Read before any uid drop: that makes /proc/self root's. */
     DIR *dir = opendir("/proc/self/fd");
     if (dir == NULL)
-        fail("open /proc/self/fd");
+        die("open /proc/self/fd: %s", strerror(errno));
     int own = dirfd(dir);
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -98,23 +125,23 @@ static void close_from(int lowest) {
 
 static void drop(uid_t uid, int have_gid, gid_t gid) {
     if (setgroups(0, NULL) != 0)
-        fail("setgroups");
+        die("setgroups: %s", strerror(errno));
     if (have_gid && setresgid(gid, gid, gid) != 0)
-        fail("setresgid");
+        die("setresgid: %s", strerror(errno));
     if (setresuid(uid, uid, uid) != 0)
-        fail("setresuid");
+        die("setresuid: %s", strerror(errno));
     uid_t ruid, euid, suid;
     gid_t rgid, egid, sgid;
     if (getresuid(&ruid, &euid, &suid) != 0 || getresgid(&rgid, &egid, &sgid) != 0)
-        fail("getresuid");
+        die("getresuid: %s", strerror(errno));
     if (ruid != uid || euid != uid || suid != uid)
-        refuse("the uid drop did not take");
+        die("the uid drop did not take");
     if (have_gid && (rgid != gid || egid != gid || sgid != gid))
-        refuse("the gid drop did not take");
+        die("the gid drop did not take");
     if (getgroups(0, NULL) != 0)
-        refuse("supplementary groups survived the drop");
+        die("supplementary groups survived the drop");
     if (uid != 0 && setuid(0) == 0)
-        refuse("the uid drop could be undone");
+        die("the uid drop could be undone");
 }
 
 int main(int argc, char **argv) {
@@ -132,6 +159,8 @@ int main(int argc, char **argv) {
             usage();
         if (strcmp(argv[i], "--close-from") == 0) {
             lowest = (long)parse_number(argv[i + 1], 1L << 30);
+        } else if (strcmp(argv[i], "--error-fd") == 0) {
+            error_fd = (int)parse_number(argv[i + 1], 1L << 30);
         } else if (strcmp(argv[i], "--uid") == 0) {
             uid = (uid_t)parse_number(argv[i + 1], 0xfffffffeUL);
             have_uid = 1;
@@ -142,6 +171,11 @@ int main(int argc, char **argv) {
             usage();
         }
     }
+    /* The error descriptor must survive the close; refused, it is not written to. */
+    if (error_fd >= lowest) {
+        error_fd = -1;
+        usage();
+    }
     /* Stdio stays open: bwrap needs it. A gid alone would leave root's uid. */
     if (i + 1 >= argc || lowest < 3 || (have_gid && !have_uid))
         usage();
@@ -150,5 +184,5 @@ int main(int argc, char **argv) {
     if (have_uid)
         drop(uid, have_gid, gid);
     execv(argv[i + 1], &argv[i + 1]);
-    fail(argv[i + 1]);
+    die("%s: %s", argv[i + 1], strerror(errno));
 }

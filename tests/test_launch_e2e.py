@@ -15,7 +15,7 @@ from collections.abc import Iterator
 import pytest
 
 import postern
-from postern import Sandbox, SandboxProfile, _sandbox, available
+from postern import IsolationError, Sandbox, SandboxProfile, _sandbox, available, build_init
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
 requires_root = pytest.mark.skipif(os.geteuid() != 0, reason='a uid drop needs root')
@@ -23,10 +23,24 @@ requires_root = pytest.mark.skipif(os.geteuid() != 0, reason='a uid drop needs r
 _LIST_FDS = 'import os; print(sorted(int(fd) for fd in os.listdir("/proc/self/fd")))'
 
 
-def _launcher(*args: str, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
+def _launcher(
+    *args: str, pass_fds: tuple[int, ...] = (), launcher: str | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(_sandbox._PACKAGED_LAUNCH), *args], capture_output=True, text=True, check=False, pass_fds=pass_fds
+        [launcher or str(_sandbox._PACKAGED_LAUNCH), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        pass_fds=pass_fds,
     )
+
+
+@pytest.fixture(scope='module')
+def proc_fallback_launcher(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A launcher built to find close_range unavailable, as before Linux 5.9 or under an old seccomp profile."""
+    cc = f'{os.environ.get("CC") or "cc"} -DPOSTERN_TEST_NO_CLOSE_RANGE'
+    output = tmp_path_factory.mktemp('fallback') / 'postern-launch'
+    return str(build_init.compile_binary(build_init.LAUNCH_SOURCE, output, version=postern.__version__, cc=cc))
 
 
 @pytest.fixture
@@ -70,17 +84,60 @@ def test_launcher_refuses_a_malformed_command_line(args):
 
 
 def test_launcher_reports_a_failed_exec_as_its_own_status():
-    result = _launcher('--close-from', '3', '--', '/nonexistent')
+    read, write = os.pipe()
+    try:
+        os.dup2(write, 40)
+        result = _launcher('--close-from', '41', '--error-fd', '40', '--', '/nonexistent', pass_fds=(40,))
+        os.close(40)
+        os.close(write)
+        report = os.read(read, 4096)
+    finally:
+        os.close(read)
     assert result.returncode == 125
     assert 'postern-launch: /nonexistent' in result.stderr
+    assert json.loads(report) == {'postern-launch': '/nonexistent: No such file or directory'}
 
 
-def test_launcher_closes_every_descriptor_from_close_from():
+def test_a_launcher_failure_raises_rather_than_reading_as_the_commands_status(monkeypatch):
+    monkeypatch.setattr(_sandbox.shutil, 'which', lambda *_args, **_kwargs: '/nonexistent/bwrap')
+    with pytest.raises(IsolationError, match='postern-launch: /nonexistent/bwrap: No such file'):
+        Sandbox().run(['true'])
+
+
+def test_a_foreign_reaper_is_named_rather_than_read_as_success(child_prelude):
+    script = child_prelude + (
+        'import signal\n'
+        'from postern import Sandbox\n'
+        'signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n'
+        'try:\n'
+        '    Sandbox().run(["true"])\n'
+        'except ChildProcessError as exc:\n'
+        '    print(exc)\n'
+    )
+    worker = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, check=False)
+    assert 'was reaped by something else in this process' in worker.stdout, worker.stderr
+
+
+@pytest.mark.parametrize(('version', 'refused'), [('glibc 2.17', True), ('glibc 2.23', True), ('glibc 2.24', False)])
+def test_a_glibc_whose_posix_spawn_forks_is_refused(monkeypatch, version, refused):
+    monkeypatch.setattr(_sandbox.os, 'confstr', lambda _name: version)
+    if refused:
+        with pytest.raises(IsolationError, match='forks inside posix_spawn'):
+            _sandbox._require_spawn_without_fork()
+    else:
+        _sandbox._require_spawn_without_fork()
+
+
+@pytest.mark.parametrize('variant', ['close_range', '/proc/self/fd'])
+def test_launcher_closes_every_descriptor_from_close_from(variant, proc_fallback_launcher):
+    launcher = proc_fallback_launcher if variant == '/proc/self/fd' else None
     read, write = os.pipe()
     try:
         os.dup2(read, 40)
         os.dup2(read, 41)
-        result = _launcher('--close-from', '41', '--', sys.executable, '-c', _LIST_FDS, pass_fds=(40, 41))
+        result = _launcher(
+            '--close-from', '41', '--', sys.executable, '-c', _LIST_FDS, pass_fds=(40, 41), launcher=launcher
+        )
     finally:
         for fd in (read, write, 40, 41):
             os.close(fd)
@@ -139,8 +196,8 @@ def test_host_uid_runs_bwrap_at_that_uid_with_no_groups(reachable_init):
     assert status['Groups'].split() == []
 
 
-@requires_root
-def test_a_launch_runs_no_atfork_handler(child_prelude, reachable_init):
+@pytest.mark.parametrize('host_uid', [None, pytest.param(65534, marks=requires_root)], ids=['no-drop', 'uid-drop'])
+def test_a_launch_runs_no_atfork_handler(child_prelude, reachable_init, host_uid):
     # A handler that aborts the child of any real fork, as gRPC's can. The uid drop
     # is what once forced a real fork; posix_spawn never runs the handler.
     script = child_prelude + (
@@ -149,7 +206,7 @@ def test_a_launch_runs_no_atfork_handler(child_prelude, reachable_init):
         'libc = ctypes.CDLL(None)\n'
         'libc.__register_atfork.argtypes = [ctypes.c_void_p] * 4\n'
         'libc.__register_atfork(None, None, ctypes.cast(libc.abort, ctypes.c_void_p), None)\n'
-        f'result = Sandbox(SandboxProfile(host_uid=65534, init={reachable_init!r})).run(["true"])\n'
+        f'result = Sandbox(SandboxProfile(host_uid={host_uid!r}, init={reachable_init!r})).run(["true"])\n'
         'pid = os.fork()\n'
         'if pid == 0:\n'
         '    os._exit(0)\n'
