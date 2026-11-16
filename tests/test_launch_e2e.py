@@ -294,3 +294,14 @@ def test_a_bwrap_reaped_before_postern_holds_it_is_named_rather_than_an_isolatio
     monkeypatch.setattr(_process, 'pidfd_open', reaped_first)
     with pytest.raises(ChildProcessError, match='reaped by something else'):
         Sandbox().run(['true'])
+
+
+def test_built_binaries_are_reachable_whatever_the_umask(tmp_path):
+    # A bwrap at host_uid must traverse _bin and exec the init: the directory too, not only the files.
+    old = os.umask(0o077)
+    try:
+        built = build_init.compile_binaries(tmp_path / '_bin', version=postern.__version__)
+    finally:
+        os.umask(old)
+    for path in (built, *built.iterdir()):
+        assert path.stat().st_mode & 0o7777 == 0o755, path

@@ -75,6 +75,9 @@ def _check(wheel: pathlib.Path) -> None:
             # bwrap may run at another uid than the one that installed the wheel (host_uid=).
             if stat.S_IMODE(mode) & 0o555 != 0o555:
                 sys.exit(f'{name} has mode {oct(mode)}, not readable and executable by all')
+            # The launcher runs on the host as the worker, root included.
+            if stat.S_IMODE(mode) & 0o7022:
+                sys.exit(f'{name} has mode {oct(mode)}: group- or world-writable, or setuid, setgid or sticky')
             _check_elf(name, archive.read(info), arch)
             binary = pathlib.Path(archive.extract(info, tmp))
             binary.chmod(0o755)

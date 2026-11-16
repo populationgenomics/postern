@@ -81,7 +81,7 @@ def compile_binaries(directory: str | os.PathLike[str], *, version: str, cc: str
     """Compile the init and the launcher into ``directory``, a package's ``_bin``.
 
     Args:
-        directory: Created if missing.
+        directory: Created if missing, and made mode 0755 either way.
         version: What the binaries' ``--version`` prints.
         cc: As :func:`compile_binary`.
 
@@ -93,6 +93,7 @@ def compile_binaries(directory: str | os.PathLike[str], *, version: str, cc: str
     """
     target = pathlib.Path(directory)
     target.mkdir(parents=True, exist_ok=True)
+    target.chmod(0o755)  # as compile_binary's files: a bwrap at host_uid must traverse to the init
     for source, name in BINARIES.items():
         compile_binary(source, target / name, version=version, cc=cc)
     return target
