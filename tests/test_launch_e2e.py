@@ -270,10 +270,26 @@ def test_a_bwrap_reaped_elsewhere_is_never_waited_for_again(monkeypatch):
 
     monkeypatch.setattr(_process.os, 'waitpid', counting)
     try:
+        raised = []
         for _ in range(2):
-            with pytest.raises(ChildProcessError, match='reaped by something else'):
+            with pytest.raises(ChildProcessError, match='reaped by something else') as caught:
                 launch.wait()
+            raised.append(caught.value)
         assert calls == [launch.pid]
+        assert raised[0] is not raised[1]  # a shared instance would carry both tracebacks
     finally:
         launch.close_pipes()
         launch.close()
+
+
+def test_a_bwrap_reaped_before_postern_holds_it_is_named_rather_than_an_isolation_failure(monkeypatch):
+    real = _process.pidfd_open
+
+    def reaped_first(pid: int) -> int:
+        if pid != os.getpid():  # the init-control check opens one on the worker itself
+            os.waitpid(pid, 0)  # the foreign reaper, between posix_spawn and pidfd_open
+        return real(pid)
+
+    monkeypatch.setattr(_process, 'pidfd_open', reaped_first)
+    with pytest.raises(ChildProcessError, match='reaped by something else'):
+        Sandbox().run(['true'])

@@ -101,6 +101,14 @@ def pidfd_signal(pidfd: int, sig: int) -> None:
     send(pidfd, sig)
 
 
+def _reaped_elsewhere(pid: int) -> ChildProcessError:
+    # A new instance per raise: one shared across raises and threads would accumulate their tracebacks.
+    return ChildProcessError(
+        f'bwrap (pid {pid}) was reaped by something else in this process, so its exit status is lost: '
+        'postern needs its own children, not a SIGCHLD set to SIG_IGN or a waitpid(-1) loop'
+    )
+
+
 # Where :func:`spawn` puts the first descriptor it is asked to pass on, above stdio.
 FIRST_INHERITED = 3
 
@@ -137,7 +145,7 @@ class Launch:
         self._reap_lock = threading.Lock()
         self._returncode: int | None = None
         # Set once waitpid finds bwrap gone: its pid may since name another process.
-        self._lost: ChildProcessError | None = None
+        self._lost = False
 
     @property
     def returncode(self) -> int | None:
@@ -155,21 +163,17 @@ class Launch:
             return self._poll_locked()
 
     def _poll_locked(self) -> int | None:
-        if self._lost is not None:
-            raise self._lost
+        if self._lost:
+            raise _reaped_elsewhere(self.pid)
         if self._returncode is None:
             if self._exit_fd is None:
                 raise ValueError('poll() on a closed, unreaped Launch')
             try:
                 pid, status = os.waitpid(self.pid, os.WNOHANG)
             except ChildProcessError as exc:
-                self._lost = ChildProcessError(
-                    f'bwrap (pid {self.pid}) was reaped by something else in this process, so its exit status is '
-                    'lost: postern needs its own children, not a SIGCHLD set to SIG_IGN or a waitpid(-1) loop'
-                )
-                self._lost.__cause__ = exc
+                self._lost = True
                 self._release_exit_fd()
-                raise self._lost from exc
+                raise _reaped_elsewhere(self.pid) from exc
             if pid:
                 self._returncode = os.waitstatus_to_exitcode(status)
                 self._release_exit_fd()
@@ -281,8 +285,10 @@ def spawn(
     those before it execs bwrap.
 
     Raises:
-        OSError: If the spawn fails, or no pidfd can be opened on the child, which
-            is then killed and reaped first.
+        ChildProcessError: If something else in this process reaped the child
+            before a pidfd could be opened on it.
+        OSError: If the spawn fails, or no pidfd can be opened on the live child,
+            which is then killed and reaped first.
     """
     lowest = FIRST_INHERITED + len(inherit)
     with contextlib.ExitStack() as on_error:
@@ -319,8 +325,8 @@ def _hold(pid: int, *, stdout: int, stderr: int, args: collections.abc.Sequence[
     """
     try:
         pidfd = pidfd_open(pid)
-    except ProcessLookupError:
-        raise
+    except ProcessLookupError as exc:
+        raise _reaped_elsewhere(pid) from exc
     except BaseException:
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)

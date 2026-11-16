@@ -679,6 +679,7 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
         IsolationError: If the init cannot be held by a pidfd, and so could not be
             reliably stopped; this install carries no launcher, or it cannot be
             started or reports its own failure; or glibc's ``posix_spawn`` forks.
+        ChildProcessError: If something else in this process reaped bwrap.
     """
     _require_init_control()
     _require_spawn_without_fork()
@@ -708,6 +709,8 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
                 functools.partial(_process.spawn, launcher, argv, env=env, inherit=inherit),
                 _process.Launch.discard,
             )
+        except ChildProcessError:
+            raise  # the process's own child handling, not the platform's isolation
         except OSError as exc:
             raise IsolationError(f'cannot start {launcher}: {exc}') from exc
         finally:
@@ -1103,6 +1106,8 @@ class Sandbox:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no
                 guest init or launcher, the trivial launch fails, or the init or
                 the launcher was built from another postern version.
+            ChildProcessError: If something else in this process reaped a
+                launch's child.
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
@@ -1114,6 +1119,8 @@ class Sandbox:
         launcher = _launcher_path()
         try:
             launch = _process.spawn(launcher, [launcher, '--version'], env=bwrap_env())
+        except ChildProcessError:
+            raise  # the process's own child handling, not the platform's isolation
         except OSError as exc:
             raise IsolationError(f'cannot start {launcher}: {exc}') from exc
         with _process.Process(launch, resources=contextlib.ExitStack()) as process:
