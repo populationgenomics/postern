@@ -336,8 +336,10 @@ port below 1024 needs no capability in the guest: postern-listen binds it as the
 namespace's owner. The handler is a server for untrusted clients, and the control
 socket is its own: anything that can reach that path can hand it listeners, so its
 directory should admit only the worker. Like the launcher, postern-listen runs on
-the host as the worker and is never configurable; `verify()` checks its version
-when forwards are configured.
+the host as the worker and is never configurable;
+`verify()` checks its version when forwards are configured. Its trivial launch
+forwards the ports like any launch, so it proves the whole path at startup: each
+handler must be serving by then, and receives one handoff that ends at once.
 
 ## Stream hatch
 

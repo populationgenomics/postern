@@ -212,9 +212,15 @@ def test_a_guest_port_in_use_by_another_forward_is_refused_up_front(tmp_path):
         Sandbox(forwards=[PortForward(8080, tmp_path / 'a.sock'), PortForward(8080, tmp_path / 'b.sock')])
 
 
-def test_verify_checks_the_port_opener(echo):
+def test_verify_proves_the_forwarding_path(echo):
     handler = echo('files')
     Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)]).verify()
+    _wait_for(lambda: handler.ended == [8080])
+
+
+def test_verify_fails_while_a_handler_is_down(tmp_path):
+    with pytest.raises(ConnectionError, match=r'nobody\.sock'):
+        Sandbox(SandboxProfile(), forwards=[PortForward(8080, tmp_path / 'nobody.sock')]).verify()
 
 
 def _wait_for(condition: Callable[[], bool], timeout: float = 10) -> None:

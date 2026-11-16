@@ -1330,12 +1330,16 @@ class Sandbox:
         startup rather than on the first real request.
 
         The trivial launch is the init's own ``--version``, run inside the sandbox,
-        and its answer must be this postern's version, as must the launcher's.
+        and its answer must be this postern's version, as must the launcher's. With
+        ``forwards``, the port opener's must too, and the trivial launch forwards
+        the ports like any other: each handler must be serving, and receives one
+        handoff that ends at once.
 
         Raises:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no
-                guest init or launcher, the trivial launch fails, or the init or
-                the launcher was built from another postern version.
+                guest init or launcher, the trivial launch fails, or the init, the
+                launcher or the port opener was built from another postern version.
+            ConnectionError: If a forward's handler cannot be reached.
             ChildProcessError: If something else in this process reaped a
                 launch's child.
         """
