@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import pathlib
@@ -15,7 +16,7 @@ from collections.abc import Iterator
 import pytest
 
 import postern
-from postern import IsolationError, Sandbox, SandboxProfile, _sandbox, available, build_init
+from postern import IsolationError, Sandbox, SandboxProfile, _process, _sandbox, available, build_init
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
 requires_root = pytest.mark.skipif(os.geteuid() != 0, reason='a uid drop needs root')
@@ -86,10 +87,13 @@ def test_launcher_refuses_a_malformed_command_line(args):
 def test_launcher_reports_a_failed_exec_as_its_own_status():
     read, write = os.pipe()
     try:
-        os.dup2(write, 40)
-        result = _launcher('--close-from', '41', '--error-fd', '40', '--', '/nonexistent', pass_fds=(40,))
-        os.close(40)
-        os.close(write)
+        try:
+            os.dup2(write, 40)
+            result = _launcher('--close-from', '41', '--error-fd', '40', '--', '/nonexistent', pass_fds=(40,))
+        finally:
+            os.close(write)
+            with contextlib.suppress(OSError):
+                os.close(40)
         report = os.read(read, 4096)
     finally:
         os.close(read)
@@ -118,7 +122,15 @@ def test_a_foreign_reaper_is_named_rather_than_read_as_success(child_prelude):
     assert 'was reaped by something else in this process' in worker.stdout, worker.stderr
 
 
-@pytest.mark.parametrize(('version', 'refused'), [('glibc 2.17', True), ('glibc 2.23', True), ('glibc 2.24', False)])
+@pytest.mark.parametrize(
+    ('version', 'refused'),
+    [
+        ('glibc 2.17', True),
+        ('glibc 2.20-2014.11', True),
+        ('glibc 2.24', False),
+        ('glibc 2.36', False),
+    ],
+)
 def test_a_glibc_whose_posix_spawn_forks_is_refused(monkeypatch, version, refused):
     monkeypatch.setattr(_sandbox.os, 'confstr', lambda _name: version)
     if refused:
@@ -198,8 +210,8 @@ def test_host_uid_runs_bwrap_at_that_uid_with_no_groups(reachable_init):
 
 @pytest.mark.parametrize('host_uid', [None, pytest.param(65534, marks=requires_root)], ids=['no-drop', 'uid-drop'])
 def test_a_launch_runs_no_atfork_handler(child_prelude, reachable_init, host_uid):
-    # A handler that aborts the child of any real fork, as gRPC's can. The uid drop
-    # is what once forced a real fork; posix_spawn never runs the handler.
+    # A handler that aborts the child of any real fork, as gRPC's can. Popen forks
+    # for real when asked for a uid drop; posix_spawn never runs the handler.
     script = child_prelude + (
         'import ctypes, json, os\n'
         'from postern import Sandbox, SandboxProfile\n'
@@ -224,3 +236,44 @@ def test_verify_refuses_a_launcher_from_another_postern_version(monkeypatch, tmp
     monkeypatch.setattr(_sandbox, '_PACKAGED_LAUNCH', stale)
     with pytest.raises(IsolationError, match=r'launcher .* was built from postern 0\.0\.0-stale'):
         Sandbox().verify()
+
+
+def test_launcher_writes_nothing_to_an_error_fd_it_refuses():
+    # A malformed flag after --error-fd: the descriptor is not yet known to be one to write to.
+    read, write = os.pipe()
+    try:
+        try:
+            os.dup2(write, 40)
+            result = _launcher(
+                '--close-from', '3', '--error-fd', '40', '--bogus', '1', '--', '/bin/true', pass_fds=(40,)
+            )
+        finally:
+            os.close(write)
+            with contextlib.suppress(OSError):
+                os.close(40)
+        assert os.read(read, 4096) == b''
+    finally:
+        os.close(read)
+    assert result.returncode == 125
+
+
+def test_a_bwrap_reaped_elsewhere_is_never_waited_for_again(monkeypatch):
+    # Once its pid is free it may name another child, whose reap a second waitpid would steal.
+    launch = _process.spawn('/bin/true', ['true'], env={})
+    os.waitpid(launch.pid, 0)  # the foreign reaper
+    real = os.waitpid
+    calls = []
+
+    def counting(pid: int, options: int) -> tuple[int, int]:
+        calls.append(pid)
+        return real(pid, options)
+
+    monkeypatch.setattr(_process.os, 'waitpid', counting)
+    try:
+        for _ in range(2):
+            with pytest.raises(ChildProcessError, match='reaped by something else'):
+                launch.wait()
+        assert calls == [launch.pid]
+    finally:
+        launch.close_pipes()
+        launch.close()

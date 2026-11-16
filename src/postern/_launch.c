@@ -150,6 +150,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     long lowest = -1;
+    long requested_error_fd = -1;
     int have_uid = 0, have_gid = 0;
     uid_t uid = 0;
     gid_t gid = 0;
@@ -160,7 +161,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--close-from") == 0) {
             lowest = (long)parse_number(argv[i + 1], 1L << 30);
         } else if (strcmp(argv[i], "--error-fd") == 0) {
-            error_fd = (int)parse_number(argv[i + 1], 1L << 30);
+            requested_error_fd = (long)parse_number(argv[i + 1], 1L << 30);
         } else if (strcmp(argv[i], "--uid") == 0) {
             uid = (uid_t)parse_number(argv[i + 1], 0xfffffffeUL);
             have_uid = 1;
@@ -171,14 +172,11 @@ int main(int argc, char **argv) {
             usage();
         }
     }
-    /* The error descriptor must survive the close; refused, it is not written to. */
-    if (error_fd >= lowest) {
-        error_fd = -1;
+    /* Stdio stays open: bwrap needs it. A gid alone would leave root's uid. Until
+     * the error descriptor is known to sit below the close, nothing is written to it. */
+    if (i + 1 >= argc || lowest < 3 || requested_error_fd >= lowest || (have_gid && !have_uid))
         usage();
-    }
-    /* Stdio stays open: bwrap needs it. A gid alone would leave root's uid. */
-    if (i + 1 >= argc || lowest < 3 || (have_gid && !have_uid))
-        usage();
+    error_fd = (int)requested_error_fd;
 
     close_from((int)lowest);
     if (have_uid)

@@ -335,7 +335,7 @@ def test_a_failed_start_leaves_no_guest(sandbox, monkeypatch):
 
 
 def test_an_interrupted_start_leaves_no_guest(sandbox, monkeypatch):
-    # Ctrl-C while the caller waits on the launcher thread: the launch finishes
+    # Ctrl-C while the caller waits on the launch's thread: the launch finishes
     # there, and the result nobody received is discarded.
     real = _sandbox._hold_init
 
@@ -395,7 +395,7 @@ def test_a_start_failing_before_bwrap_stops_serving_the_hatches(tmp_path, monkey
 
 def test_a_slow_launch_does_not_hold_up_another(sandbox, monkeypatch):
     # One bwrap slow to report its init (a hung bind source, say) must not stall
-    # the launcher thread every other launch forks from.
+    # the thread every other launch spawns from.
     real = _sandbox._hold_init
     entered, release = threading.Event(), threading.Event()
 
@@ -627,8 +627,9 @@ def test_a_closed_launch_signals_nothing():
         finally:
             os.close(reused)
     finally:
-        os.kill(launch.pid, signal.SIGKILL)  # unreaped, so its pid still names it
-        launch.wait()
+        # Closed, the Launch no longer reaps; unreaped, the pid still names the stand-in.
+        os.kill(launch.pid, signal.SIGKILL)
+        os.waitpid(launch.pid, 0)
         launch.close_pipes()
         bystander.kill()
         bystander.wait()

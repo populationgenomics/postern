@@ -13,7 +13,7 @@ stdout and stderr readers invite draining one while the other's pipe fills and
 stalls the guest. A caller who wants one stream can write ``2>&1``.
 
 **Stopping.** bwrap does not forward signals, and it runs with SIGTERM blocked
-(inherited from the launcher thread, so that an early SIGTERM to the init is
+(inherited from the spawning thread, so that an early SIGTERM to the init is
 held rather than dropped): SIGTERM to bwrap does nothing. So
 :meth:`Process.terminate` signals the guest's *init* directly. bwrap reports the
 init's host pid on ``--info-fd``, and a pidfd is opened on it at start, so the
@@ -101,6 +101,9 @@ def pidfd_signal(pidfd: int, sig: int) -> None:
     send(pidfd, sig)
 
 
+# Where :func:`spawn` puts the first descriptor it is asked to pass on, above stdio.
+FIRST_INHERITED = 3
+
 # CPython ignores these at startup, and an ignored disposition survives exec:
 # Popen restores the default for its children, and so does :func:`spawn`.
 _RESTORED_SIGNALS = tuple(getattr(signal, name) for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ') if hasattr(signal, name))
@@ -130,9 +133,11 @@ class Launch:
         self._lock = threading.Lock()
         self._closed = False
         # Readable once bwrap exits; held, unlike bwrap_pidfd, until it is reaped.
-        self._exit_fd = os.dup(pidfd)
+        self._exit_fd: int | None = os.dup(pidfd)
         self._reap_lock = threading.Lock()
         self._returncode: int | None = None
+        # Set once waitpid finds bwrap gone: its pid may since name another process.
+        self._lost: ChildProcessError | None = None
 
     @property
     def returncode(self) -> int | None:
@@ -140,29 +145,46 @@ class Launch:
         return self.poll()
 
     def poll(self) -> int | None:
-        """Reap bwrap if it has exited, and return :attr:`returncode`."""
+        """Reap bwrap if it has exited, and return :attr:`returncode`.
+
+        Raises:
+            ChildProcessError: If something else in this process reaped bwrap.
+        """
         with self._reap_lock:
             return self._poll_locked()
 
     def _poll_locked(self) -> int | None:
+        if self._lost is not None:
+            raise self._lost
         if self._returncode is None:
+            if self._exit_fd is None:
+                raise ValueError('poll() on a closed, unreaped Launch')
             try:
                 pid, status = os.waitpid(self.pid, os.WNOHANG)
             except ChildProcessError as exc:
-                raise ChildProcessError(
+                self._lost = ChildProcessError(
                     f'bwrap (pid {self.pid}) was reaped by something else in this process, so its exit status is '
                     'lost: postern needs its own children, not a SIGCHLD set to SIG_IGN or a waitpid(-1) loop'
-                ) from exc
+                )
+                self._lost.__cause__ = exc
+                self._release_exit_fd()
+                raise self._lost from exc
             if pid:
                 self._returncode = os.waitstatus_to_exitcode(status)
-                os.close(self._exit_fd)
+                self._release_exit_fd()
         return self._returncode
+
+    def _release_exit_fd(self) -> None:
+        if self._exit_fd is not None:
+            os.close(self._exit_fd)
+            self._exit_fd = None
 
     def wait(self, timeout: float | None = None) -> int:
         """Wait for bwrap to exit, reap it, and return its status. Any number of threads can wait at once.
 
         Raises:
             subprocess.TimeoutExpired: If it is still running after ``timeout``.
+            ChildProcessError: If something else in this process reaped bwrap.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -171,7 +193,7 @@ class Launch:
                 if status is not None:
                     return status
                 # A descriptor of this waiter's own: another may reap and close _exit_fd meanwhile.
-                watch = os.dup(self._exit_fd)
+                watch = os.dup(typing.cast('int', self._exit_fd))
             try:
                 # poll, not select: a busy worker's descriptors run past select's 1024.
                 poller = select.poll()
@@ -215,7 +237,10 @@ class Launch:
                 os.close(fd)
 
     def close(self) -> None:
-        """Close both pidfds. Does not stop the run, and signals nothing afterwards."""
+        """Close the pidfds. Does not stop the run, and signals nothing afterwards.
+
+        Reap first: a bwrap still unreaped is left a zombie, with nothing to wait on.
+        """
         with self._lock:
             if self._closed:
                 return
@@ -224,13 +249,17 @@ class Launch:
                 os.close(self.init_pidfd)
                 self.init_pidfd = None
             os.close(self.bwrap_pidfd)
+        with self._reap_lock:
+            self._release_exit_fd()
 
     def discard(self) -> None:
         """Kill the run, reap bwrap and release everything: for a launch no :class:`Process` will own."""
         self.kill()
-        self.wait()
-        self.close_pipes()
-        self.close()
+        try:
+            self.wait()
+        finally:
+            self.close_pipes()
+            self.close()
 
 
 def spawn(
@@ -242,10 +271,10 @@ def spawn(
 ) -> Launch:
     """Start ``path`` with ``posix_spawn``: stdin on ``/dev/null``, stdout and stderr on new pipes.
 
-    Never a ``fork``: from glibc 2.24 (which the launch checks for), ``posix_spawn``
-    clones with ``CLONE_VM|CLONE_VFORK``, so no ``pthread_atfork`` handler runs, in
-    the parent or the child. Each of
-    ``inherit`` lands in the child at 3, 4, … in that order. The child also gets any
+    Never a ``fork``: from glibc 2.24, ``posix_spawn`` clones with
+    ``CLONE_VM|CLONE_VFORK``, so no ``pthread_atfork`` handler runs, in the parent
+    or the child; the caller checks for an older glibc. Each of ``inherit`` lands in
+    the child at :data:`FIRST_INHERITED` onwards, in order. The child also gets any
     descriptor a library opened without ``O_CLOEXEC``; ``postern-launch`` closes
     those before it execs bwrap.
 
@@ -253,38 +282,54 @@ def spawn(
         OSError: If the spawn fails, or no pidfd can be opened on the child, which
             is then killed and reaped first.
     """
-    lowest = 3 + len(inherit)
-    out_read, out_write = os.pipe()
-    err_read, err_write = os.pipe()
-    try:
-        moved: list[int] = []
-        try:
+    lowest = FIRST_INHERITED + len(inherit)
+    with contextlib.ExitStack() as on_error:
+        with contextlib.ExitStack() as childs_ends:
+            out_read, out_write = os.pipe()
+            on_error.callback(os.close, out_read)
+            childs_ends.callback(os.close, out_write)
+            err_read, err_write = os.pipe()
+            on_error.callback(os.close, err_read)
+            childs_ends.callback(os.close, err_write)
             # Every source above every target, so no dup2 overwrites a source a later one reads.
+            moved = []
             for fd in (out_write, err_write, *inherit):
                 moved.append(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, lowest))
+                childs_ends.callback(os.close, moved[-1])
             actions = [
                 (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
                 (os.POSIX_SPAWN_DUP2, moved[0], 1),
                 (os.POSIX_SPAWN_DUP2, moved[1], 2),
-                *((os.POSIX_SPAWN_DUP2, fd, 3 + index) for index, fd in enumerate(moved[2:])),
+                *((os.POSIX_SPAWN_DUP2, fd, FIRST_INHERITED + index) for index, fd in enumerate(moved[2:])),
             ]
             pid = os.posix_spawn(path, list(argv), dict(env), file_actions=actions, setsigdef=_RESTORED_SIGNALS)
-        finally:
-            for fd in (out_write, err_write, *moved):
-                os.close(fd)
-        pidfd: int | None = None
-        try:
-            pidfd = pidfd_open(pid)
-            return Launch(pid, pidfd, stdout=out_read, stderr=err_read, args=argv)
-        except BaseException:
-            if pidfd is not None:
-                os.close(pidfd)
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            raise
+        launch = _hold(pid, stdout=out_read, stderr=err_read, args=argv)
+        on_error.pop_all()  # the read ends are the Launch's now
+        return launch
+
+
+def _hold(pid: int, *, stdout: int, stderr: int, args: collections.abc.Sequence[str]) -> Launch:
+    """A :class:`Launch` on the just-spawned ``pid``, or the child killed and reaped and an error raised.
+
+    Until it is reaped the pid names the child, so ``os.kill`` cannot reach another
+    process; a pidfd that cannot be opened because the child is gone means
+    something else reaped it, and then the pid is left alone.
+    """
+    try:
+        pidfd = pidfd_open(pid)
+    except ProcessLookupError:
+        raise
     except BaseException:
-        os.close(out_read)
-        os.close(err_read)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        raise
+    try:
+        return Launch(pid, pidfd, stdout=stdout, stderr=stderr, args=args)
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            pidfd_signal(pidfd, signal.SIGKILL)
+        os.close(pidfd)
+        os.waitpid(pid, 0)
         raise
 
 
@@ -415,6 +460,7 @@ class Process:
 
         Raises:
             subprocess.TimeoutExpired: If it is still running after ``timeout``.
+            ChildProcessError: If something else in this process reaped bwrap.
         """
         return self._launch.wait(timeout)
 
@@ -503,11 +549,13 @@ class Process:
                 # Normally a no-op, the run having ended. Not if bwrap died on its own
                 # with the init still running, or close() itself was interrupted.
                 self._launch.kill()
-                self._launch.close()
-                self._resources.close()
-            # Last and unlocked: a foreign reaper's error cannot keep the rest open.
-            # Killed, bwrap exits at once; reaped, it leaves no zombie behind.
-            self._launch.wait()
+            try:
+                # Unlocked: killed, bwrap exits at once; reaped, it leaves no zombie.
+                self._launch.wait()
+            finally:
+                with self._lock:
+                    self._launch.close()
+                    self._resources.close()
         finally:
             self._released.set()
 
@@ -677,10 +725,12 @@ class AsyncProcess:
                     self.kill()
                     await self.wait()
         finally:
-            if self._process.returncode is None:
-                self._process.kill()
-            self._release_exit_fd()
-            await asyncio.shield(asyncio.to_thread(self._process.close))
+            try:
+                if self._process.returncode is None:
+                    self._process.kill()
+            finally:
+                self._release_exit_fd()
+                await asyncio.shield(asyncio.to_thread(self._process.close))
 
     async def __aenter__(self) -> typing_extensions.Self:
         return self

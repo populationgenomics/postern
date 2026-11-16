@@ -55,9 +55,10 @@ _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
 # Built into the Linux wheel by setup.py, or by `python -m postern.build_init --in-place`.
 _PACKAGED_INIT = pathlib.Path(__file__).with_name('_bin') / 'postern-init'
 _PACKAGED_LAUNCH = pathlib.Path(__file__).with_name('_bin') / 'postern-launch'
-# Where the launch puts the descriptors bwrap reads; postern-launch closes every one above.
-_INFO_SLOT = 3
-_SECCOMP_SLOT = 4
+# Where the launch puts the descriptors bwrap reads, in this order; postern-launch
+# closes every one above.
+_INFO_SLOT = _process.FIRST_INHERITED
+_SECCOMP_SLOT = _INFO_SLOT + 1
 # Where postern._stream_connect is bound for a hatch that sets guest_connector.
 GUEST_CONNECT = f'{_GUEST_DIR}/connect.py'
 _CONNECT_SRC = str(pathlib.Path(__file__).with_name('_stream_connect.py'))
@@ -174,8 +175,9 @@ class IsolationError(RuntimeError):
 
     Raised by :meth:`Sandbox.verify`, so a worker can refuse to serve rather than
     run untrusted code with weaker isolation than intended; by a launch with no
-    guest init to run; and by a launch that could not hold the guest's init by
-    pidfd, without which a stop could not be sure of reaching it.
+    guest init or launcher, whose launcher fails before bwrap runs, or on a glibc
+    whose ``posix_spawn`` forks; and by a launch that could not hold the guest's
+    init by pidfd, without which a stop could not be sure of reaching it.
     """
 
 
@@ -234,9 +236,10 @@ class SandboxProfile:
             that owns no host file is the tightest mapping. ``None`` (default) does
             not drop, because dropping requires the deploy to make every bind
             source — the workspace *and its parents*, the hatch socket's dir, the
-            rootfs, and the guest init (for the packaged one, the directories of
-            postern's install, which a ``0700`` home directory would hide) —
-            reachable by ``host_uid``. Ignored when already non-root.
+            rootfs, and the files postern binds from its own install (the packaged
+            init, ``run_python``'s shim, a stream hatch's connector), which a
+            ``0700`` home directory above a virtualenv would hide — reachable by
+            ``host_uid``. Ignored when already non-root.
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
             reuses ``guest_gid``, and ``None`` for that too keeps root's gid.
         init: Host path to a static guest init built by
@@ -477,7 +480,7 @@ class _Job(typing.Generic[_T]):
         return self.result()
 
 
-class _Launcher:
+class _Spawner:
     """Spawns every bwrap from one long-lived thread.
 
     bwrap's ``--die-with-parent`` is ``PR_SET_PDEATHSIG``, which fires when the
@@ -494,7 +497,7 @@ class _Launcher:
         self._thread: threading.Thread | None = None
 
     def call(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> _T:
-        """Run ``fn`` on the launcher thread and return its result, or raise its error.
+        """Run ``fn`` on the spawning thread and return its result, or raise its error.
 
         Args:
             fn: The spawn.
@@ -504,7 +507,7 @@ class _Launcher:
         job = _Job(fn, discard)
         with self._lock:
             if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._serve, name='postern-launcher', daemon=True)
+                self._thread = threading.Thread(target=self._serve, name='postern-spawner', daemon=True)
                 self._thread.start()
         self._queue.put(job.run)
         return job.result()
@@ -523,7 +526,7 @@ class _Launcher:
 
 # Process-wide, not per Sandbox: the thread must outlive every guest it launched,
 # and the only lifetime that does so is the worker process's.
-_launcher = _Launcher()
+_spawner = _Spawner()
 
 
 def _read_init_pid(info_fd: int) -> int | None:
@@ -674,7 +677,8 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
 
     Raises:
         IsolationError: If the init cannot be held by a pidfd, and so could not be
-            reliably stopped, or this install carries no launcher.
+            reliably stopped; this install carries no launcher, or it cannot be
+            started or reports its own failure; or glibc's ``posix_spawn`` forks.
     """
     _require_init_control()
     _require_spawn_without_fork()
@@ -689,7 +693,7 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
         argv = [
             launcher,
             '--close-from',
-            str(3 + len(inherit)),
+            str(_process.FIRST_INHERITED + len(inherit)),
             '--error-fd',
             str(_INFO_SLOT),
             *bwrap_credentials(profile, os.geteuid()),
@@ -700,10 +704,12 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
             *cmd[1:],
         ]
         try:
-            launch = _launcher.call(
+            launch = _spawner.call(
                 functools.partial(_process.spawn, launcher, argv, env=env, inherit=inherit),
                 _process.Launch.discard,
             )
+        except OSError as exc:
+            raise IsolationError(f'cannot start {launcher}: {exc}') from exc
         finally:
             os.close(info_write)
         try:
@@ -729,8 +735,9 @@ def _require_spawn_without_fork() -> None:
         version = os.confstr('CS_GNU_LIBC_VERSION')
     except (ValueError, OSError):
         return  # not glibc
-    name, _, number = (version or '').partition(' ')
-    if name == 'glibc' and tuple(int(part) for part in number.split('.')[:2]) < (2, 24):
+    # Vendors append to the number: 'glibc 2.20-2014.11'.
+    match = re.match(r'glibc (\d+)\.(\d+)', version or '')
+    if match is not None and (int(match[1]), int(match[2])) < (2, 24):
         raise IsolationError(f'{version} forks inside posix_spawn; postern needs glibc 2.24 or later')
 
 
@@ -885,7 +892,7 @@ class Sandbox:
             _discard_process,
         )
         try:
-            return job.in_thread('postern-launch')
+            return job.in_thread('postern-start')
         except BaseException:
             resources.close()
             raise
@@ -1101,19 +1108,27 @@ class Sandbox:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
         import postern  # noqa: PLC0415 — the package imports this module
 
-        # The launcher is postern's own and runs on the host, as every launch runs it.
+        # The launcher is postern's own, and runs on the host as every launch runs it.
+        _require_init_control()
+        _require_spawn_without_fork()
         launcher = _launcher_path()
-        launch = _process.spawn(launcher, [launcher, '--version'], env=bwrap_env())
+        try:
+            launch = _process.spawn(launcher, [launcher, '--version'], env=bwrap_env())
+        except OSError as exc:
+            raise IsolationError(f'cannot start {launcher}: {exc}') from exc
         with _process.Process(launch, resources=contextlib.ExitStack()) as process:
-            reported = process.communicate(timeout).stdout.strip()
+            answer = process.communicate(timeout)
+        if not answer.ok:
+            raise IsolationError(f'launcher {launcher} failed: {answer.stderr.strip() or answer.returncode}')
+        reported = answer.stdout.strip()
         if reported != postern.__version__:
             raise IsolationError(
-                f'launcher {launcher} was built from postern {reported or "nothing"}, not {postern.__version__}; '
+                f'launcher {launcher} was built from postern {reported}, not {postern.__version__}; '
                 'rebuild it with `python -m postern.build_init --in-place`'
             )
         # The init itself, inside the sandbox: it needs nothing from the rootfs (a
-        # rootfs need not carry Python), and the init is never executed
-        # on the host. The host only ever runs bwrap; running a deployer-supplied
+        # rootfs need not carry Python), and the init is never executed on the host,
+        # which runs only postern's own launcher and bwrap. Running a deployer-supplied
         # binary here, as the worker and with its environment, would hand anything
         # that could swap that file the worker's privileges.
         result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
