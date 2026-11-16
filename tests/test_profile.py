@@ -1,6 +1,8 @@
 import pathlib
 
-from postern._sandbox import SandboxProfile, build_base_argv, bwrap_credentials
+import pytest
+
+from postern._sandbox import Sandbox, SandboxProfile, build_base_argv, bwrap_credentials
 
 
 def test_hardened_flags_present():
@@ -79,6 +81,23 @@ def test_bwrap_credentials_opt_in_when_root():
 def test_bwrap_credentials_ignored_when_not_root():
     # Cannot setuid unless root; bwrap then runs at our (already non-root) uid.
     assert bwrap_credentials(SandboxProfile(host_uid=65534), euid=1000) == []
+
+
+@pytest.mark.parametrize(
+    'ids',
+    [
+        {'host_uid': 0},  # no drop at all
+        {'host_uid': -1},
+        {'host_uid': 2**32 - 1},  # (uid_t)-1: setresuid leaves the uid unchanged
+        {'host_uid': 65534, 'host_gid': -1},
+        {'host_uid': 65534, 'host_gid': 2**32 - 1},
+        {'host_uid': 65534, 'guest_gid': 2**32 - 1},  # the gid the drop falls back to
+    ],
+)
+def test_sandbox_refuses_a_uid_drop_that_would_not_drop(ids):
+    # At construction, at any euid: a root worker's launch would otherwise fail inside the launcher.
+    with pytest.raises(ValueError, match='host_uid'):
+        Sandbox(SandboxProfile(**ids))
 
 
 def test_bound_workspace(tmp_path):

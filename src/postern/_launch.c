@@ -10,7 +10,7 @@
  *   - close every descriptor from --close-from up, so bwrap and the guest
  *     inherit only the ones the worker put below it (stdio, the --info-fd pipe,
  *     the seccomp filter), whatever a library left without O_CLOEXEC;
- *   - with --uid, drop to that uid, and to --gid, with no supplementary groups,
+ *   - with --uid, drop to that non-root uid, and to --gid, with no supplementary groups,
  *     and confirm the drop cannot be undone;
  *   - exec bwrap.
  *
@@ -140,7 +140,7 @@ static void drop(uid_t uid, int have_gid, gid_t gid) {
         die("the gid drop did not take");
     if (getgroups(0, NULL) != 0)
         die("supplementary groups survived the drop");
-    if (uid != 0 && setuid(0) == 0)
+    if (setuid(0) == 0)
         die("the uid drop could be undone");
 }
 
@@ -164,6 +164,8 @@ int main(int argc, char **argv) {
             requested_error_fd = (long)parse_number(argv[i + 1], 1L << 30);
         } else if (strcmp(argv[i], "--uid") == 0) {
             uid = (uid_t)parse_number(argv[i + 1], 0xfffffffeUL);
+            if (uid == 0) /* a drop to root drops nothing */
+                usage();
             have_uid = 1;
         } else if (strcmp(argv[i], "--gid") == 0) {
             gid = (gid_t)parse_number(argv[i + 1], 0xfffffffeUL);

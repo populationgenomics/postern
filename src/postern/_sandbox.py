@@ -59,6 +59,8 @@ _PACKAGED_LAUNCH = pathlib.Path(__file__).with_name('_bin') / 'postern-launch'
 # closes every one above.
 _INFO_SLOT = _process.FIRST_INHERITED
 _SECCOMP_SLOT = _INFO_SLOT + 1
+# The largest uid or gid: one more is (uid_t)-1, which the set*id calls read as "unchanged".
+_MAX_ID = 0xFFFFFFFE
 # Where postern._stream_connect is bound for a hatch that sets guest_connector.
 GUEST_CONNECT = f'{_GUEST_DIR}/connect.py'
 _CONNECT_SRC = str(pathlib.Path(__file__).with_name('_stream_connect.py'))
@@ -239,7 +241,8 @@ class SandboxProfile:
             rootfs, and the files postern binds from its own install (the packaged
             init, ``run_python``'s shim, a stream hatch's connector), which a
             ``0700`` home directory above a virtualenv would hide — reachable by
-            ``host_uid``. Ignored when already non-root.
+            ``host_uid``. Ignored when already non-root, but must still be 1 to
+            4294967294, as the gid it pairs with must be 0 to 4294967294.
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
             reuses ``guest_gid``, and ``None`` for that too keeps root's gid.
         init: Host path to a static guest init built by
@@ -744,6 +747,23 @@ def _require_spawn_without_fork() -> None:
         raise IsolationError(f'{version} forks inside posix_spawn; postern needs glibc 2.24 or later')
 
 
+def _check_host_ids(profile: SandboxProfile) -> None:
+    """Raise unless ``profile``'s uid drop names a non-root uid and a valid gid, whatever the worker's euid.
+
+    Raises:
+        ValueError: If ``host_uid`` is set and not in 1 to 4294967294, or the gid it
+            pairs with (``host_gid``, else ``guest_gid``) not in 0 to 4294967294;
+            ``-1`` (4294967295) means "unchanged" to ``setresuid``.
+    """
+    if profile.host_uid is None:
+        return
+    if not 1 <= profile.host_uid <= _MAX_ID:
+        raise ValueError(f'SandboxProfile.host_uid must be a non-root uid, 1 to {_MAX_ID}, got {profile.host_uid!r}')
+    gid = profile.host_gid if profile.host_gid is not None else profile.guest_gid
+    if gid is not None and not 0 <= gid <= _MAX_ID:
+        raise ValueError(f'the gid host_uid drops to must be 0 to {_MAX_ID}, got {gid!r}')
+
+
 def _launcher_path() -> str:
     """The packaged ``postern-launch``.
 
@@ -803,6 +823,7 @@ class Sandbox:
         # Absolute, so the file bound in as PID 1 cannot depend on the worker's cwd.
         if self._profile.init is not None and not os.path.isabs(self._profile.init):
             raise ValueError(f'SandboxProfile.init must be an absolute path, got {os.fspath(self._profile.init)!r}')
+        _check_host_ids(self._profile)
         if self._profile.workspace is not None:
             self._workspace = pathlib.Path(self._profile.workspace)
             self._own_workspace = False

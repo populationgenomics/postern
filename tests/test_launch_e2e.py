@@ -71,6 +71,7 @@ def test_launcher_reports_its_version():
         ['--', '/bin/true'],
         ['--close-from', '2', '--', '/bin/true'],
         ['--close-from', '3', '--gid', '65534', '--', '/bin/true'],
+        ['--close-from', '3', '--uid', '0', '--', '/bin/true'],
         ['--close-from', '3', '--uid', '-1', '--', '/bin/true'],
         ['--close-from', '3', '--uid', '4294967295', '--', '/bin/true'],
         ['--close-from', '3', '--uid', '12x', '--', '/bin/true'],
