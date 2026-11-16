@@ -17,11 +17,14 @@ from postern import _sandbox, available, build_init
 def packaged_bin(tmp_path_factory: pytest.TempPathFactory) -> Iterator[pathlib.Path | None]:
     """The directory of the init and launcher every launch uses: the install's, else one built for the session.
 
-    An editable install has no ``_bin``, so where a sandbox can run this builds
-    both, as ``setup.py`` would, and points postern at them. With no compiler it
-    builds nothing, and each sandboxed test fails on the missing binaries.
+    A source checkout's ``_bin`` may be missing or older than its C sources, so
+    where a sandbox can run this builds both, as ``setup.py`` would, and points
+    postern at them. With no compiler it builds nothing, and each sandboxed test
+    fails on the missing binaries.
     """
-    if _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file():
+    checkout = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'postern'
+    from_wheel = pathlib.Path(postern.__file__).resolve().parent != checkout
+    if from_wheel and _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file():
         yield _sandbox._PACKAGED_INIT.parent
         return
     if not available() or shutil.which(os.environ.get('CC') or 'cc') is None:

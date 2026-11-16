@@ -1090,15 +1090,27 @@ class Sandbox:
         startup rather than on the first real request.
 
         The trivial launch is the init's own ``--version``, run inside the sandbox,
-        and its answer must be this postern's version.
+        and its answer must be this postern's version, as must the launcher's.
 
         Raises:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no
-                guest init, the trivial launch fails, or the init was built from
-                another postern version.
+                guest init or launcher, the trivial launch fails, or the init or
+                the launcher was built from another postern version.
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
+        import postern  # noqa: PLC0415 — the package imports this module
+
+        # The launcher is postern's own and runs on the host, as every launch runs it.
+        launcher = _launcher_path()
+        launch = _process.spawn(launcher, [launcher, '--version'], env=bwrap_env())
+        with _process.Process(launch, resources=contextlib.ExitStack()) as process:
+            reported = process.communicate(timeout).stdout.strip()
+        if reported != postern.__version__:
+            raise IsolationError(
+                f'launcher {launcher} was built from postern {reported or "nothing"}, not {postern.__version__}; '
+                'rebuild it with `python -m postern.build_init --in-place`'
+            )
         # The init itself, inside the sandbox: it needs nothing from the rootfs (a
         # rootfs need not carry Python), and the init is never executed
         # on the host. The host only ever runs bwrap; running a deployer-supplied
@@ -1107,8 +1119,6 @@ class Sandbox:
         result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
-        import postern  # noqa: PLC0415 — the package imports this module
-
         reported = result.stdout.strip()
         if reported != postern.__version__:
             raise IsolationError(

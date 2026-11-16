@@ -6,7 +6,7 @@ Fails unless each wheel is ``py3-none`` for a single architecture and carries
 ``postern/_bin/postern-init`` and ``postern/_bin/postern-launch``, each readable
 and executable by any uid, an ELF for that architecture with no ``PT_INTERP``
 (static, so it runs under any libc, as the manylinux and musllinux tags claim),
-and reporting the wheel's version. Runs the init on the host, which only CI
+and reporting the wheel's version. Runs both on the host, which for the init only CI
 does: at run time postern executes it inside the sandbox alone.
 """
 

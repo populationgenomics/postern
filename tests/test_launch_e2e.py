@@ -217,3 +217,10 @@ def test_a_launch_runs_no_atfork_handler(child_prelude, reachable_init, host_uid
     returncode, stderr, forked = json.loads(worker.stdout)
     assert forked == -6  # the handler is armed: a real fork's child dies of SIGABRT
     assert returncode == 0, stderr
+
+
+def test_verify_refuses_a_launcher_from_another_postern_version(monkeypatch, tmp_path):
+    stale = build_init.compile_binary(build_init.LAUNCH_SOURCE, tmp_path / 'postern-launch', version='0.0.0-stale')
+    monkeypatch.setattr(_sandbox, '_PACKAGED_LAUNCH', stale)
+    with pytest.raises(IsolationError, match=r'launcher .* was built from postern 0\.0\.0-stale'):
+        Sandbox().verify()

@@ -68,7 +68,7 @@ __attribute__((noreturn, format(printf, 1, 2))) static void die(const char *form
         for (const unsigned char *c = (const unsigned char *)message; *c; c++) {
             if (*c == '"' || *c == '\\')
                 n += (size_t)snprintf(json + n, sizeof json - n, "\\%c", *c);
-            else if (*c < 0x20)
+            else if (*c < 0x20 || *c >= 0x80) /* the latter so a truncated character cannot break the UTF-8 */
                 n += (size_t)snprintf(json + n, sizeof json - n, "\\u%04x", *c);
             else
                 json[n++] = (char)*c;
