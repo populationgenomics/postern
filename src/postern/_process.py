@@ -106,7 +106,7 @@ FIRST_INHERITED = 3
 
 # CPython ignores these at startup, and an ignored disposition survives exec:
 # Popen restores the default for its children, and so does :func:`spawn`.
-_RESTORED_SIGNALS = tuple(getattr(signal, name) for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ') if hasattr(signal, name))
+_RESTORED_SIGNALS = tuple(getattr(signal, name) for name in ('SIGPIPE', 'SIGXFSZ') if hasattr(signal, name))
 
 
 class Launch:
@@ -149,6 +149,7 @@ class Launch:
 
         Raises:
             ChildProcessError: If something else in this process reaped bwrap.
+            ValueError: If the launch was closed before bwrap was reaped.
         """
         with self._reap_lock:
             return self._poll_locked()
@@ -185,6 +186,7 @@ class Launch:
         Raises:
             subprocess.TimeoutExpired: If it is still running after ``timeout``.
             ChildProcessError: If something else in this process reaped bwrap.
+            ValueError: If the launch was closed before bwrap was reaped.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
