@@ -10,3 +10,5 @@ dist/
 attic/
 .claude/
 .DS_Store
+# Built by `python -m postern.build_init --in-place`.
+src/postern/_bin/

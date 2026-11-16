@@ -38,8 +38,8 @@ jobs:
       - run: uv run pytest -q
 
   wheel:
-    # The suite against the installed wheel rather than the source tree: the init a
-    # default profile launches is the one setup.py built into the wheel.
+    # The suite against the installed wheel rather than the source tree: the init
+    # and launcher a default profile uses are the ones setup.py built into the wheel.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -54,9 +54,9 @@ jobs:
         with:
           enable-cache: true
       # As in the pytest job: bubblewrap, user namespaces, and grpcio for the
-      # system interpreter the hatch e2e guests run against.
+      # system interpreter the hatch e2e guests run against; venv for the root run.
       - run: |
-          sudo apt-get update && sudo apt-get install -y bubblewrap python3-pip
+          sudo apt-get update && sudo apt-get install -y bubblewrap python3-pip python3-venv
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo /usr/bin/python3 -m pip install --break-system-packages --no-deps grpcio
       - run: tools/build_wheel.sh
@@ -64,9 +64,16 @@ jobs:
       - run: |
           uv venv --python 3.13
           uv pip install dist/*.whl pytest 'grpcio>=1.60'
-          # Else conftest would build an init and hide a lookup that misses the wheel's.
-          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file(), _sandbox._PACKAGED_INIT'
+          # Else conftest would build binaries and hide a lookup that misses the wheel's.
+          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file()'
           .venv/bin/python -m pytest -q
+      # The uid-drop tests need root, which the job's user is not. Not from .venv:
+      # /home/runner is 0750, and neither a uid-dropped process nor a root bwrap
+      # (which drops CAP_DAC_READ_SEARCH) can reach an install under it.
+      - run: |
+          sudo /usr/bin/python3 -m venv /opt/postern-root
+          sudo /opt/postern-root/bin/pip install -q dist/*.whl pytest
+          sudo /opt/postern-root/bin/python -m pytest -q -p no:cacheprovider tests/test_launch_e2e.py
 
   seccomp-drift:
     # The authoritative drift check: regenerate the blob from the syscall lists with

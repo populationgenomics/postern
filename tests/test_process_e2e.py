@@ -335,7 +335,7 @@ def test_a_failed_start_leaves_no_guest(sandbox, monkeypatch):
 
 
 def test_an_interrupted_start_leaves_no_guest(sandbox, monkeypatch):
-    # Ctrl-C while the caller waits on the launcher thread: the launch finishes
+    # Ctrl-C while the caller waits on the launch's thread: the launch finishes
     # there, and the result nobody received is discarded.
     real = _sandbox._hold_init
 
@@ -395,7 +395,7 @@ def test_a_start_failing_before_bwrap_stops_serving_the_hatches(tmp_path, monkey
 
 def test_a_slow_launch_does_not_hold_up_another(sandbox, monkeypatch):
     # One bwrap slow to report its init (a hung bind source, say) must not stall
-    # the launcher thread every other launch forks from.
+    # the thread every other launch spawns from.
     real = _sandbox._hold_init
     entered, release = threading.Event(), threading.Event()
 
@@ -469,16 +469,14 @@ def test_an_init_proc_cannot_vouch_for_fails_closed(sandbox, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which('unshare') is None, reason='requires unshare(1)')
-def test_a_proc_from_another_pid_namespace_fails_closed(tmp_path, packaged_init):
+def test_a_proc_from_another_pid_namespace_fails_closed(tmp_path, child_prelude):
     # The worker in a pid namespace of its own, still seeing its parent's /proc.
     marker = tmp_path / 'marker'
-    # Named outright: the conftest's patched default does not reach another interpreter.
-    init = None if packaged_init is None else str(packaged_init)
-    script = (
+    script = child_prelude + (
         'import sys\n'
-        'from postern import IsolationError, Sandbox, SandboxProfile\n'
+        'from postern import IsolationError, Sandbox\n'
         'try:\n'
-        f'    Sandbox(SandboxProfile(init={init!r})).start_bash("sleep 0.5; echo survived > {marker}")\n'
+        f'    Sandbox().start_bash("sleep 0.5; echo survived > {marker}")\n'
         'except IsolationError as exc:\n'
         '    sys.exit(f"refused: {exc}")\n'
     )
@@ -600,12 +598,11 @@ def test_close_kills_the_init_when_bwrap_has_already_exited():
     # A guest init can outlive bwrap only in the moment before it arms
     # --die-with-parent, too brief to arrange with a real one. Host processes
     # stand in for both, so the state is certain: "bwrap" gone, "init" running.
-    bwrap = subprocess.Popen(['true'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    launch = _process.spawn('/bin/true', ['true'], env={})
     init = subprocess.Popen(['sleep', '30'])
     try:
-        launch = _process.Launch(bwrap, _process.pidfd_open(bwrap.pid))
         launch.init_pidfd = _process.pidfd_open(init.pid)
-        bwrap.wait()
+        launch.wait()
         _process.Process(launch, resources=contextlib.ExitStack()).close()
         assert init.wait(timeout=2) == -signal.SIGKILL
     finally:
@@ -615,10 +612,9 @@ def test_close_kills_the_init_when_bwrap_has_already_exited():
 
 def test_a_closed_launch_signals_nothing():
     # Its pidfd's number, once closed, can name another process's pidfd.
-    bwrap = subprocess.Popen(['sleep', '30'])
+    launch = _process.spawn('/bin/sleep', ['sleep', '30'], env={})
     bystander = subprocess.Popen(['sleep', '30'])
     try:
-        launch = _process.Launch(bwrap, _process.pidfd_open(bwrap.pid))
         number = launch.bwrap_pidfd
         launch.close()
         reused = _process.pidfd_open(bystander.pid)
@@ -631,9 +627,12 @@ def test_a_closed_launch_signals_nothing():
         finally:
             os.close(reused)
     finally:
-        for process in (bwrap, bystander):
-            process.kill()
-            process.wait()
+        # Closed, the Launch no longer reaps; unreaped, the pid still names the stand-in.
+        os.kill(launch.pid, signal.SIGKILL)
+        os.waitpid(launch.pid, 0)
+        launch.close_pipes()
+        bystander.kill()
+        bystander.wait()
 
 
 def test_concurrent_closes_are_one_close(sandbox):

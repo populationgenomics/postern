@@ -33,7 +33,6 @@ import re
 import selectors
 import shutil
 import signal
-import subprocess
 import tempfile
 import threading
 import time
@@ -53,8 +52,15 @@ _GUEST_INIT = f'{_GUEST_DIR}/init'
 _GUEST_STUBS = f'{_GUEST_DIR}/stubs'
 _GUEST_WORKSPACE = '/workspace'
 _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
-# Built into the Linux wheel by setup.py; absent from a source checkout and from other platforms' wheels.
+# Built into the Linux wheel by setup.py, or by `python -m postern.build_init --in-place`.
 _PACKAGED_INIT = pathlib.Path(__file__).with_name('_bin') / 'postern-init'
+_PACKAGED_LAUNCH = pathlib.Path(__file__).with_name('_bin') / 'postern-launch'
+# Where the launch puts the descriptors bwrap reads, in this order; postern-launch
+# closes every one above.
+_INFO_SLOT = _process.FIRST_INHERITED
+_SECCOMP_SLOT = _INFO_SLOT + 1
+# The largest uid or gid: one more is (uid_t)-1, which the set*id calls read as "unchanged".
+_MAX_ID = 0xFFFFFFFE
 # Where postern._stream_connect is bound for a hatch that sets guest_connector.
 GUEST_CONNECT = f'{_GUEST_DIR}/connect.py'
 _CONNECT_SRC = str(pathlib.Path(__file__).with_name('_stream_connect.py'))
@@ -171,8 +177,9 @@ class IsolationError(RuntimeError):
 
     Raised by :meth:`Sandbox.verify`, so a worker can refuse to serve rather than
     run untrusted code with weaker isolation than intended; by a launch with no
-    guest init to run; and by a launch that could not hold the guest's init by
-    pidfd, without which a stop could not be sure of reaching it.
+    guest init or launcher, whose launcher fails before bwrap runs, or on a glibc
+    whose ``posix_spawn`` forks; and by a launch that could not hold the guest's
+    init by pidfd, without which a stop could not be sure of reaching it.
     """
 
 
@@ -231,14 +238,19 @@ class SandboxProfile:
             that owns no host file is the tightest mapping. ``None`` (default) does
             not drop, because dropping requires the deploy to make every bind
             source — the workspace *and its parents*, the hatch socket's dir, the
-            rootfs — reachable by ``host_uid``. Ignored when already non-root.
+            rootfs, and the files postern binds from its own install (the packaged
+            init, ``run_python``'s shim, a stream hatch's connector), which a
+            ``0700`` home directory above a virtualenv would hide — reachable by
+            ``host_uid``. Ignored when already non-root, but must still be 1 to
+            4294967294, as the gid it pairs with must be 0 to 4294967294.
         host_gid: the real gid bwrap runs as, paired with ``host_uid``. ``None``
-            reuses ``guest_gid``.
+            reuses ``guest_gid``, and ``None`` for that too keeps root's gid.
         init: Host path to a static guest init built by
             ``python -m postern.build_init``, PID 1 of every run. ``None``
             (default) uses the one the Linux wheel carries; a launch raises
-            :class:`IsolationError` when there is none (a source checkout, or a
-            non-Linux install). :meth:`Sandbox.run` and :meth:`Sandbox.run_bash`
+            :class:`IsolationError` when there is none (an editable install
+            before ``python -m postern.build_init --in-place``, or a non-Linux
+            install). :meth:`Sandbox.run` and :meth:`Sandbox.run_bash`
             need no interpreter in the sandbox; :meth:`Sandbox.run_python` execs
             ``python`` on the shim as the init's child. It is bound in read-only;
             being static, it needs nothing from ``rootfs``. It is only ever
@@ -296,32 +308,32 @@ def bwrap_env() -> dict[str, str]:
     return {'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}
 
 
-def bwrap_credentials(profile: SandboxProfile, euid: int) -> dict[str, typing.Any]:
-    """`Popen` uid/gid kwargs to run bwrap at a non-root real uid (opt-in).
+def bwrap_credentials(profile: SandboxProfile, euid: int) -> list[str]:
+    """``postern-launch`` flags to run bwrap at a non-root real uid (opt-in).
 
     bwrap maps the guest's ``--uid`` onto its own real uid, so a root bwrap gives
     the guest kernel uid 0, which owns root's files by DAC. A non-root bwrap makes
     a re-exposed root-owned surface unwritable by ownership as well as by the
-    ``/proc/sys`` mask. ``extra_groups=[]`` drops root's supplementary groups too.
+    ``/proc/sys`` mask. The launcher drops root's supplementary groups too.
 
     Args:
         profile: The profile whose ``host_uid``/``host_gid`` decide the drop.
         euid: The worker's effective uid; a drop is only possible from 0.
 
     Returns:
-        The kwargs to splat into `Popen`, or ``{}`` for no drop. Empty unless
-        ``host_uid`` is set and ``euid`` is 0, because an unprivileged bwrap must
-        still be able to reach every bind source — the workspace *and its
-        parents*, the hatch socket's directory, the rootfs — or the launch fails
-        with ``Permission denied``.
+        ``--uid``, and ``--gid`` when there is one, or ``[]`` for no drop. Empty
+        unless ``host_uid`` is set and ``euid`` is 0, because an unprivileged
+        bwrap must still be able to reach every bind source — the workspace *and
+        its parents*, the hatch socket's directory, the rootfs, the init — or the
+        launch fails with ``Permission denied``.
     """
     if euid != 0 or profile.host_uid is None:
-        return {}
-    creds: dict[str, typing.Any] = {'user': profile.host_uid, 'extra_groups': []}
+        return []
+    flags = ['--uid', str(profile.host_uid)]
     gid = profile.host_gid if profile.host_gid is not None else profile.guest_gid
     if gid is not None:
-        creds['group'] = gid
-    return creds
+        flags += ['--gid', str(gid)]
+    return flags
 
 
 def build_base_argv(profile: SandboxProfile, seccomp_fd: int | None) -> list[str]:
@@ -471,14 +483,14 @@ class _Job(typing.Generic[_T]):
         return self.result()
 
 
-class _Launcher:
-    """Forks every bwrap from one long-lived thread.
+class _Spawner:
+    """Spawns every bwrap from one long-lived thread.
 
     bwrap's ``--die-with-parent`` is ``PR_SET_PDEATHSIG``, which fires when the
-    *thread* that forked bwrap exits, not the process. Forked from a caller or
+    *thread* that created bwrap exits, not the process. Spawned from a caller or
     pool thread, a guest would die when that thread finished.
 
-    Only the fork belongs here, and whatever must follow it before anything else
+    Only the spawn belongs here, and whatever must follow it before anything else
     can touch the child: one launch waiting on bwrap would hold up every other.
     """
 
@@ -488,17 +500,17 @@ class _Launcher:
         self._thread: threading.Thread | None = None
 
     def call(self, fn: collections.abc.Callable[[], _T], discard: collections.abc.Callable[[_T], None]) -> _T:
-        """Run ``fn`` on the launcher thread and return its result, or raise its error.
+        """Run ``fn`` on the spawning thread and return its result, or raise its error.
 
         Args:
-            fn: The fork.
+            fn: The spawn.
             discard: Releases ``fn``'s result if the caller is interrupted before
                 receiving it.
         """
         job = _Job(fn, discard)
         with self._lock:
             if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._serve, name='postern-launcher', daemon=True)
+                self._thread = threading.Thread(target=self._serve, name='postern-spawner', daemon=True)
                 self._thread.start()
         self._queue.put(job.run)
         return job.result()
@@ -517,7 +529,7 @@ class _Launcher:
 
 # Process-wide, not per Sandbox: the thread must outlive every guest it launched,
 # and the only lifetime that does so is the worker process's.
-_launcher = _Launcher()
+_spawner = _Spawner()
 
 
 def _read_init_pid(info_fd: int) -> int | None:
@@ -531,7 +543,8 @@ def _read_init_pid(info_fd: int) -> int | None:
         does only when it fails before starting the guest.
 
     Raises:
-        IsolationError: If the report is malformed or does not arrive in time.
+        IsolationError: If postern-launch reports its own failure there, before
+            bwrap ran, or the report is malformed or does not arrive in time.
     """
     deadline = time.monotonic() + _INFO_TIMEOUT_S
     buffer = b''
@@ -550,6 +563,8 @@ def _read_init_pid(info_fd: int) -> int | None:
                 report = json.loads(buffer)
             except ValueError:
                 continue  # not complete yet
+            if isinstance(report, dict) and isinstance(report.get('postern-launch'), str):
+                raise IsolationError(f'postern-launch: {report["postern-launch"]}')
             pid = report.get('child-pid') if isinstance(report, dict) else None
             if not isinstance(pid, int):
                 raise IsolationError(f'bwrap --info-fd report has no child-pid: {buffer!r}')
@@ -652,36 +667,59 @@ def _require_init_control() -> None:
         )
 
 
-def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
+def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -> _process.Launch:
     """Start bwrap and take hold of the guest's init. Not on the caller's thread: see :class:`_Job`.
 
-    ``cmd`` is the bwrap command line, with ``cmd[0]`` bwrap itself; ``--info-fd``
-    is added here. On any failure, whatever was started is killed before this
-    raises — except an init that could not be held, which only killing bwrap can
-    reach: one already past ``--die-with-parent`` dies with it, one not yet past it
-    does not. Only descriptor exhaustion gets that far, with pidfds known to work.
+    ``cmd`` is the bwrap command line, with ``cmd[0]`` bwrap itself and any
+    ``--seccomp`` naming :data:`_SECCOMP_SLOT`, where ``seccomp_fd`` lands;
+    ``--info-fd`` is added here. On any failure, whatever was started is killed
+    before this raises — except an init that could not be held, which only killing
+    bwrap can reach: one already past ``--die-with-parent`` dies with it, one not
+    yet past it does not. Only descriptor exhaustion gets that far, with pidfds
+    known to work.
 
     Raises:
         IsolationError: If the init cannot be held by a pidfd, and so could not be
-            reliably stopped.
+            reliably stopped; this install carries no launcher, or it cannot be
+            started or reports its own failure; or glibc's ``posix_spawn`` forks.
+        ChildProcessError: If something else in this process reaped bwrap.
     """
     _require_init_control()
+    _require_spawn_without_fork()
+    launcher = _launcher_path()
+    env = bwrap_env()
+    bwrap = shutil.which(cmd[0], path=env['PATH'])
+    if bwrap is None:
+        raise RuntimeError(f'{cmd[0]} not found on PATH ({env["PATH"]})')
     info_read, info_write = os.pipe()
     try:
+        inherit = (info_write,) if seccomp_fd is None else (info_write, seccomp_fd)
+        argv = [
+            launcher,
+            '--close-from',
+            str(_process.FIRST_INHERITED + len(inherit)),
+            '--error-fd',
+            str(_INFO_SLOT),
+            *bwrap_credentials(profile, os.geteuid()),
+            '--',
+            bwrap,
+            '--info-fd',
+            str(_INFO_SLOT),
+            *cmd[1:],
+        ]
         try:
-            launch = _launcher.call(
-                functools.partial(
-                    _fork_bwrap,
-                    [cmd[0], '--info-fd', str(info_write), *cmd[1:]],
-                    pass_fds=(*pass_fds, info_write),
-                    profile=profile,
-                ),
+            launch = _spawner.call(
+                functools.partial(_process.spawn, launcher, argv, env=env, inherit=inherit),
                 _process.Launch.discard,
             )
+        except ChildProcessError:
+            raise  # the process's own child handling, not the platform's isolation
+        except OSError as exc:
+            raise IsolationError(f'cannot start {launcher}: {exc}') from exc
         finally:
             os.close(info_write)
         try:
-            launch.init_pidfd = _hold_init(info_read, launch.popen.pid)
+            launch.init_pidfd = _hold_init(info_read, launch.pid)
         except BaseException:
             launch.discard()
             raise
@@ -690,37 +728,58 @@ def _spawn(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile
         os.close(info_read)
 
 
-def _fork_bwrap(cmd: list[str], *, pass_fds: tuple[int, ...], profile: SandboxProfile) -> _process.Launch:
-    """Fork bwrap and open its pidfd, before anything can reap it. On the launcher thread."""
-    # Bytes, decoded by Process. Cast because the credentials splat is Any,
-    # which lets the type checker pick Popen's text-mode overload.
-    popen = typing.cast(
-        'subprocess.Popen[bytes]',
-        subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            # Scrub bwrap's own environment: it is PID 1 in the guest's
-            # namespace at the guest uid, so an inherited secret would be
-            # readable from inside via /proc/1/environ (see bwrap_env).
-            env=bwrap_env(),
-            pass_fds=pass_fds,
-            # Run bwrap at a non-root real uid when we are root, so the
-            # guest's kernel uid (which bwrap maps --uid onto) is non-root and
-            # owns none of root's files (see bwrap_credentials).
-            **bwrap_credentials(profile, os.geteuid()),
-        ),
-    )
+def _require_spawn_without_fork() -> None:
+    """Raise unless ``posix_spawn`` here never forks, so runs no ``pthread_atfork`` handler.
+
+    glibc's clones with ``CLONE_VM|CLONE_VFORK`` from 2.24; before that it forks
+    whenever it has file actions, which every launch does. musl's never forks.
+
+    Raises:
+        IsolationError: On glibc older than 2.24.
+    """
     try:
-        # Nothing has polled bwrap, so it is unreaped and its pid still names it.
-        return _process.Launch(popen, _process.pidfd_open(popen.pid))
-    except BaseException:
-        # Without a pidfd on bwrap the init cannot be held either; killing bwrap
-        # is the most there is to do. Popen's exit reaps it and closes the pipes.
-        with popen:
-            popen.kill()
-        raise
+        version = os.confstr('CS_GNU_LIBC_VERSION')
+    except (ValueError, OSError):
+        return  # not glibc
+    # Vendors append to the number: 'glibc 2.20-2014.11'.
+    match = re.match(r'glibc (\d+)\.(\d+)', version or '')
+    if match is not None and (int(match[1]), int(match[2])) < (2, 24):
+        raise IsolationError(f'{version} forks inside posix_spawn; postern needs glibc 2.24 or later')
+
+
+def _check_host_ids(profile: SandboxProfile) -> None:
+    """Raise unless ``profile``'s uid drop names a non-root uid and a valid gid, whatever the worker's euid.
+
+    Raises:
+        ValueError: If ``host_uid`` is set and not in 1 to 4294967294, or the gid it
+            pairs with (``host_gid``, else ``guest_gid``) not in 0 to 4294967294;
+            ``-1`` (4294967295) means "unchanged" to ``setresuid``.
+    """
+    if profile.host_uid is None:
+        return
+    if not 1 <= profile.host_uid <= _MAX_ID:
+        raise ValueError(f'SandboxProfile.host_uid must be a non-root uid, 1 to {_MAX_ID}, got {profile.host_uid!r}')
+    gid = profile.host_gid if profile.host_gid is not None else profile.guest_gid
+    if gid is not None and not 0 <= gid <= _MAX_ID:
+        raise ValueError(f'the gid host_uid drops to must be 0 to {_MAX_ID}, got {gid!r}')
+
+
+def _launcher_path() -> str:
+    """The packaged ``postern-launch``.
+
+    Never a configurable path, unlike the init: it runs on the host as the worker,
+    root included, so a path a deployer named would hand that to whoever could
+    replace the file.
+
+    Raises:
+        IsolationError: If this install carries none.
+    """
+    if not _PACKAGED_LAUNCH.is_file():
+        raise IsolationError(
+            f'this postern install carries no bwrap launcher ({_PACKAGED_LAUNCH} is missing), as an editable '
+            'install or non-Linux one does not: build one with `python -m postern.build_init --in-place`'
+        )
+    return str(_PACKAGED_LAUNCH)
 
 
 def _discard_process(process: _process.Process) -> None:
@@ -764,6 +823,7 @@ class Sandbox:
         # Absolute, so the file bound in as PID 1 cannot depend on the worker's cwd.
         if self._profile.init is not None and not os.path.isabs(self._profile.init):
             raise ValueError(f'SandboxProfile.init must be an absolute path, got {os.fspath(self._profile.init)!r}')
+        _check_host_ids(self._profile)
         if self._profile.workspace is not None:
             self._workspace = pathlib.Path(self._profile.workspace)
             self._own_workspace = False
@@ -856,7 +916,7 @@ class Sandbox:
             _discard_process,
         )
         try:
-            return job.in_thread('postern-launch')
+            return job.in_thread('postern-start')
         except BaseException:
             resources.close()
             raise
@@ -879,15 +939,15 @@ class Sandbox:
             with contextlib.suppress(OSError):
                 self._workspace.chmod(0o1777)
         seccomp = _seccomp.load_filter() if self._profile.seccomp else None
-        fd = seccomp.fileno() if seccomp is not None else None
         launch: _process.Launch | None = None
         try:
-            cmd = build_base_argv(dataclasses.replace(self._profile, workspace=self._workspace), fd)
+            profile = dataclasses.replace(self._profile, workspace=self._workspace)
+            cmd = build_base_argv(profile, None if seccomp is None else _SECCOMP_SLOT)
             for key, val in (setenv or {}).items():
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            launch = _spawn(cmd, pass_fds=() if fd is None else (fd,), profile=self._profile)
+            launch = _spawn(cmd, seccomp_fd=None if seccomp is None else seccomp.fileno(), profile=self._profile)
             if seccomp is not None:
                 seccomp.close()
             return _process.Process(launch, resources=resources)
@@ -909,8 +969,7 @@ class Sandbox:
         if not _PACKAGED_INIT.is_file():
             raise IsolationError(
                 f'this postern install carries no guest init ({_PACKAGED_INIT} is missing), as an editable install or '
-                'non-Linux one does not: build one with `python -m postern.build_init` and name it in '
-                'SandboxProfile(init=...)'
+                'non-Linux one does not: build one with `python -m postern.build_init --in-place`'
             )
         return str(_PACKAGED_INIT)
 
@@ -1062,25 +1121,47 @@ class Sandbox:
         startup rather than on the first real request.
 
         The trivial launch is the init's own ``--version``, run inside the sandbox,
-        and its answer must be this postern's version.
+        and its answer must be this postern's version, as must the launcher's.
 
         Raises:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no
-                guest init, the trivial launch fails, or the init was built from
-                another postern version.
+                guest init or launcher, the trivial launch fails, or the init or
+                the launcher was built from another postern version.
+            ChildProcessError: If something else in this process reaped a
+                launch's child.
         """
         if not self._profile.seccomp:
             raise IsolationError('seccomp is disabled; refusing to treat this as a hardened sandbox')
+        import postern  # noqa: PLC0415 — the package imports this module
+
+        # The launcher is postern's own, and runs on the host as every launch runs it.
+        _require_init_control()
+        _require_spawn_without_fork()
+        launcher = _launcher_path()
+        try:
+            launch = _process.spawn(launcher, [launcher, '--version'], env=bwrap_env())
+        except ChildProcessError:
+            raise  # the process's own child handling, not the platform's isolation
+        except OSError as exc:
+            raise IsolationError(f'cannot start {launcher}: {exc}') from exc
+        with _process.Process(launch, resources=contextlib.ExitStack()) as process:
+            answer = process.communicate(timeout)
+        if not answer.ok:
+            raise IsolationError(f'launcher {launcher} failed: {answer.stderr.strip() or answer.returncode}')
+        reported = answer.stdout.strip()
+        if reported != postern.__version__:
+            raise IsolationError(
+                f'launcher {launcher} was built from postern {reported}, not {postern.__version__}; '
+                'rebuild it with `python -m postern.build_init --in-place`'
+            )
         # The init itself, inside the sandbox: it needs nothing from the rootfs (a
-        # rootfs need not carry Python), and the init is never executed
-        # on the host. The host only ever runs bwrap; running a deployer-supplied
+        # rootfs need not carry Python), and the init is never executed on the host,
+        # which runs only postern's own launcher and bwrap. Running a deployer-supplied
         # binary here, as the worker and with its environment, would hand anything
         # that could swap that file the worker's privileges.
         result = self.run([_GUEST_INIT, '--version'], timeout=timeout)
         if not result.ok:
             raise IsolationError(f'sandbox failed to launch: {result.stderr.strip() or result.returncode}')
-        import postern  # noqa: PLC0415 — the package imports this module
-
         reported = result.stdout.strip()
         if reported != postern.__version__:
             raise IsolationError(
