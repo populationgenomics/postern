@@ -4,9 +4,9 @@
 #
 #   tools/build_wheel.sh
 #
-# setup.py tags the wheel linux_<arch>, which only a local installer accepts. The
-# init is the wheel's one native file and is statically linked, so it runs under
-# any libc: the wheel can claim manylinux and musllinux.
+# setup.py tags the wheel linux_<arch>, which only a local installer accepts. Its
+# native files, the init and the launcher, are statically linked, so they run
+# under any libc: the wheel can claim manylinux and musllinux.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

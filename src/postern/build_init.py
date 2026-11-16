@@ -11,9 +11,11 @@ The init alone can also go anywhere, for a profile to name:
     python -m postern.build_init /opt/postern-init
 
 then ``SandboxProfile(init='/opt/postern-init')``. The launcher has no such
-option: it runs on the host as root, so postern runs only its own.
+option: it runs on the host as the worker, root included, so postern runs only
+its own.
 
-Both are static, so they need nothing from the rootfs they run in.
+Both are static: the init needs nothing from the guest's rootfs, and neither
+needs a particular libc on the host.
 
 Usage: ``python -m postern.build_init (--in-place | OUTPUT) [--cc CC]``
 (``CC`` defaults to ``$CC``, then ``cc``).
@@ -114,6 +116,9 @@ def build(output: str | os.PathLike[str], *, cc: str | None = None) -> pathlib.P
 
 def build_in_place(*, cc: str | None = None) -> pathlib.Path:
     """Compile both binaries into this package's ``_bin``, where postern looks for them.
+
+    Args:
+        cc: As :func:`compile_binary`.
 
     Returns:
         The ``_bin`` directory.
