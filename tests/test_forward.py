@@ -106,6 +106,25 @@ def test_closing_the_receiver_removes_its_socket(tmp_path: pathlib.Path):
     assert not path.exists()
 
 
+def test_closing_a_receiver_ends_a_receive_waiting_on_it(tmp_path: pathlib.Path):
+    receiver = Receiver(tmp_path / 'h.sock')
+    raised: list[BaseException] = []
+
+    def receive() -> None:
+        try:
+            receiver.receive()
+        except OSError as exc:
+            raised.append(exc)
+
+    waiter = threading.Thread(target=receive)
+    waiter.start()
+    time.sleep(0.2)
+    receiver.close()
+    waiter.join(5)
+    assert not waiter.is_alive()
+    assert len(raised) == 1
+
+
 @pytest.mark.parametrize('extra', [b'more', b''], ids=['bytes', 'empty-message'])
 def test_a_handoff_with_a_message_past_its_frame_is_refused(tmp_path: pathlib.Path, extra: bytes):
     with (

@@ -311,8 +311,11 @@ class Receiver:
             return control
 
     def close(self) -> None:
-        """Stop listening and remove the socket file. Idempotent."""
+        """Stop listening and remove the socket file, ending a :meth:`receive` waiting here. Idempotent."""
         if self._socket.fileno() >= 0:
+            # close() does not wake a blocked accept(), which keeps the descriptor number it reserved; shutdown does.
+            with contextlib.suppress(OSError):
+                self._socket.shutdown(socket.SHUT_RDWR)
             self._socket.close()
             os.unlink(self.path)
 

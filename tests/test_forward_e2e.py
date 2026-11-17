@@ -89,8 +89,8 @@ def echo(tmp_path: pathlib.Path) -> Iterator[Callable[[str], _Echo]]:
     yield make
     for handler in handlers:
         handler.receiver.close()
-        # A handler thread outliving its test closes descriptors under the next one's feet.
-        for serving in handler.serving:
+        # A handler thread outliving its test holds or closes descriptor numbers under the next one's feet.
+        for serving in [handler.receiving, *handler.serving]:
             serving.join(10)
             assert not serving.is_alive(), 'a handoff outlived its launch'
 
