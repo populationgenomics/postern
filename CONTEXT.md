@@ -6,14 +6,14 @@ adapter) for the shape — e.g. "the **Hatch** seam", not "the gRPC service".
 
 The founding metaphor: a *postern* is the small guarded gate through an
 otherwise sealed wall. Guest code runs behind a sealed wall (no network, no
-filesystem, no capabilities) and reaches the outside world only through the one
-gate the host opens.
+filesystem, no capabilities) and reaches the outside world only through the
+gates the host opens.
 
 ## Core terms
 
 - **Guest** — the untrusted, host-supplied Python code run inside the sandbox.
   It is the thing the wall exists to contain. It sees only `/workspace`, a
-  read-only base system, and the hatch; nothing of the host.
+  read-only base system, its hatches and its forwarded ports; nothing of the host.
 
 - **Sandbox** — the sealed wall. One bubblewrap-launched process with the
   hardened profile: empty network namespace (no egress), surgical read-only
@@ -27,7 +27,8 @@ gate the host opens.
   a prepared environment. A profile is a value — no side effects until a Sandbox
   runs it.
 
-- **Hatch** — the gate: the guest's *only* channel to the outside. A `Protocol`
+- **Hatch** — a gate reached as a Unix socket, one of the guest's two kinds of
+  channel to the outside (the other is a **PortForward**). A `Protocol`
   (`socket_path`, `accepting()`) the Sandbox binds in and nothing else. The
   security boundary is not a permission flag but *what the hatch exposes*. Two
   adapters: `GrpcHatch` and `StreamHatch`.
@@ -42,6 +43,15 @@ gate the host opens.
   resource; per accepted connection a handler decides whether its bytes are
   spliced to a host-side subprocess's stdio. Named, so a sandbox carries several
   (`$POSTERN_HATCH_<NAME>`). Stdlib-only.
+
+- **PortForward** — a TCP port on the guest's loopback served by a **handler**, a
+  host process the caller runs. Per launch postern opens the port inside the
+  guest's network namespace from the host (the **port opener**, `postern-listen`,
+  `_listen.c`) and hands the listening socket to the handler over its **control
+  socket** (`Receiver`). The handler accepts on it directly, so no byte passes
+  through postern or the guest; the launch's end reaches the handler as its control
+  connection closing (`Handoff`). For tools that speak TCP and cannot dial a Unix
+  socket. Stdlib-only.
 
 - **Allowlist** — the capability grant. The exact `/package.Service/Method`
   names the guest may call through the hatch; everything else is
@@ -89,7 +99,7 @@ gate the host opens.
   `pthread_atfork` handler runs. It closes the descriptors bwrap should not
   inherit, drops to `host_uid`/`host_gid` by number when asked, and execs bwrap.
   Always the one installed with postern, never configurable: it runs on the host
-  as the worker.
+  as the worker. It also starts the port opener, at bwrap's uid.
 
 - **Process** — a run in progress, from `Sandbox.start*` (`AsyncProcess` from
   `astart*`, for asyncio). Its output is one merged stream of

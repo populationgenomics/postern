@@ -65,7 +65,7 @@ jobs:
           uv venv --python 3.13
           uv pip install dist/*.whl pytest 'grpcio>=1.60'
           # Else conftest would build binaries and hide a lookup that misses the wheel's.
-          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file()'
+          .venv/bin/python -c 'from postern import _sandbox; assert _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file() and _sandbox._PACKAGED_LISTEN.is_file()'
           .venv/bin/python -m pytest -q
       # The uid-drop tests need root, which the job's user is not. Not from .venv:
       # /home/runner is 0750, and neither a uid-dropped process nor a root bwrap
@@ -73,7 +73,7 @@ jobs:
       - run: |
           sudo /usr/bin/python3 -m venv /opt/postern-root
           sudo /opt/postern-root/bin/pip install -q dist/*.whl pytest
-          sudo /opt/postern-root/bin/python -m pytest -q -p no:cacheprovider tests/test_launch_e2e.py
+          sudo /opt/postern-root/bin/python -m pytest -q -p no:cacheprovider tests/test_launch_e2e.py tests/test_forward_e2e.py
 
   seccomp-drift:
     # The authoritative drift check: regenerate the blob from the syscall lists with

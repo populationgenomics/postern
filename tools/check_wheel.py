@@ -1,12 +1,12 @@
-"""Check built Linux wheels carry a working guest init and launcher for the platform they claim.
+"""Check built Linux wheels carry working static binaries for the platform they claim.
 
     python tools/check_wheel.py dist/postern-X.Y.Z-py3-none-manylinux_2_17_x86_64....whl ...
 
 Fails unless each wheel is ``py3-none`` for a single architecture and carries
-``postern/_bin/postern-init`` and ``postern/_bin/postern-launch``, each readable
+``postern/_bin/postern-init``, ``postern-launch`` and ``postern-listen``, each readable
 and executable by any uid, an ELF for that architecture with no ``PT_INTERP``
 (static, so it runs under any libc, as the manylinux and musllinux tags claim),
-and reporting the wheel's version. Runs both on the host, which for the init only CI
+and reporting the wheel's version. Runs each on the host, which for the init only CI
 does: at run time postern executes it inside the sandbox alone.
 """
 
@@ -21,7 +21,7 @@ import sys
 import tempfile
 import zipfile
 
-_MEMBERS = ('postern/_bin/postern-init', 'postern/_bin/postern-launch')
+_MEMBERS = ('postern/_bin/postern-init', 'postern/_bin/postern-launch', 'postern/_bin/postern-listen')
 _PLATFORM = re.compile(r'(?:linux|manylinux2014|manylinux_\d+_\d+|musllinux_\d+_\d+)_(?P<arch>\w+)')
 # Wheel architecture → (ELF class, e_machine).
 _ELF = {'x86_64': (2, 62), 'aarch64': (2, 183), 'i686': (1, 3), 'armv7l': (1, 40)}

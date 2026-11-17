@@ -5,7 +5,7 @@
 #   tools/build_wheel.sh
 #
 # setup.py tags the wheel linux_<arch>, which only a local installer accepts. Its
-# native files, the init and the launcher, are statically linked, so they run
+# native files, the init, the launcher and the port opener, are statically linked, so they run
 # under any libc: the wheel can claim manylinux and musllinux.
 set -euo pipefail
 

@@ -25,6 +25,7 @@ the same pidfd, and the kernel kills everything in its PID namespace with it.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import collections.abc
 import contextlib
@@ -35,6 +36,7 @@ import os
 import select
 import selectors
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -99,6 +101,28 @@ def pidfd_signal(pidfd: int, sig: int) -> None:
     if send is None:
         raise OSError(errno.ENOSYS, 'pidfd_send_signal is unavailable on this platform')
     send(pidfd, sig)
+
+
+def recv_fds(channel: socket.socket, bufsize: int, maxfds: int) -> tuple[bytes, list[int], bool]:
+    """Receive one message and the descriptors it carries, close-on-exec where the platform can.
+
+    Returns:
+        The message, the descriptors (the caller's to close), and whether any were
+        cut off: descriptors past ``maxfds``, which the kernel then closes, or on a
+        datagram socket message bytes past ``bufsize``. On a stream socket those
+        bytes stay queued.
+    """
+    fds = array.array('i')
+    # Linux's: received without it, a descriptor would leak into whatever another thread spawns next.
+    flags = typing.cast('int', getattr(socket, 'MSG_CMSG_CLOEXEC', 0))
+    message, ancillary, msg_flags, _ = channel.recvmsg(bufsize, socket.CMSG_SPACE(maxfds * fds.itemsize), flags)
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds.frombytes(data[: len(data) - len(data) % fds.itemsize])
+    if not flags:
+        for fd in fds:
+            os.set_inheritable(fd, False)
+    return message, list(fds), bool(msg_flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC))
 
 
 def _reaped_elsewhere(pid: int) -> ChildProcessError:

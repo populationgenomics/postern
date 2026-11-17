@@ -1,12 +1,12 @@
-"""Build hooks: compile the static guest init and bwrap launcher into the Linux wheel.
+"""Build hooks: compile postern's static binaries into the Linux wheel.
 
 Everything declarative lives in ``pyproject.toml``. This file adds the one step
-setuptools cannot express there: on Linux, ``build_py`` compiles ``_init.c`` and
-``_launch.c`` into ``postern/_bin/``, and the wheel is tagged for the platform it
+setuptools cannot express there: on Linux, ``build_py`` compiles ``_init.c``,
+``_launch.c`` and ``_listen.c`` into ``postern/_bin/``, and the wheel is tagged for the platform it
 was built on, ``linux_<arch>``, which any local installer accepts. The binaries
 are static, so they depend on no libc at run time; ``tools/build_wheel.sh``
 retags a release wheel for manylinux and musllinux on that basis. Elsewhere the
-wheel is pure and carries neither: a sandbox runs only on Linux.
+wheel is pure and carries none: a sandbox runs only on Linux.
 """
 
 from __future__ import annotations

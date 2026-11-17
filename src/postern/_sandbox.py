@@ -6,8 +6,9 @@ base system directories plus one writable workspace, `--cap-drop ALL`,
 `--new-session` and a seccomp denylist. Every entrypoint runs under the guest's
 init, PID 1 of its namespace: the static C init the Linux wheel carries (or the
 one ``SandboxProfile.init`` names), which adds the ``RLIMIT_NPROC`` fork-bomb
-backstop and reaps the guest's orphans. The guest's only channel to the outside is
-whatever `Hatch` the caller binds in.
+backstop and reaps the guest's orphans. The guest's only channels to the outside are
+the `Hatch` sockets the caller binds in and the `postern.forward.PortForward`
+ports it serves from the host.
 
 The base system directories come from the host by default, or from a curated
 ``rootfs`` directory assembled at image-build time, which hides the host userland
@@ -33,12 +34,13 @@ import re
 import selectors
 import shutil
 import signal
+import socket
 import tempfile
 import threading
 import time
 import typing
 
-from postern import _process, _seccomp, _workspace
+from postern import _process, _seccomp, _workspace, forward
 
 if typing.TYPE_CHECKING:
     # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
@@ -55,6 +57,7 @@ _SHIM_SRC = str(pathlib.Path(__file__).with_name('_guest.py'))
 # Built into the Linux wheel by setup.py, or by `python -m postern.build_init --in-place`.
 _PACKAGED_INIT = pathlib.Path(__file__).with_name('_bin') / 'postern-init'
 _PACKAGED_LAUNCH = pathlib.Path(__file__).with_name('_bin') / 'postern-launch'
+_PACKAGED_LISTEN = pathlib.Path(__file__).with_name('_bin') / 'postern-listen'
 # Where the launch puts the descriptors bwrap reads, in this order; postern-launch
 # closes every one above.
 _INFO_SLOT = _process.FIRST_INHERITED
@@ -421,6 +424,13 @@ _T = typing.TypeVar('_T')
 # it has cloned the guest, within milliseconds; one that fails first closes the
 # pipe, so this bounds only a bwrap that hangs.
 _INFO_TIMEOUT_S = 30.0
+# How long postern-listen may take to open a launch's ports, and the handlers to
+# take all of them: each is a few syscalls, so these bound only a hung process.
+_LISTEN_TIMEOUT_S = 10.0
+_HANDOFF_TIMEOUT_S = 10.0
+# What postern-listen sends at most, as its MAX_PORTS; and its status for a guest that has exited, as its EXIT_GONE.
+_MAX_FORWARDS = 64
+_LISTEN_GUEST_GONE = 3
 
 
 class _Job(typing.Generic[_T]):
@@ -586,8 +596,8 @@ def _status_field(pid: int | str, field: str) -> int:
     raise IsolationError(f'/proc/{pid}/status has no {field} line')
 
 
-def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
-    """A pidfd on the guest init bwrap reports on ``info_fd``, or None if no init is running.
+def _hold_init(info_fd: int, bwrap_pid: int) -> tuple[int, int] | None:
+    """The ``(pid, pidfd)`` of the guest init bwrap reports on ``info_fd``, or None if no init is running.
 
     The pid is checked to name bwrap's child once the pidfd is open: bwrap reaps
     the init before it exits itself, so by the time the pid is read it may have
@@ -598,7 +608,8 @@ def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
     vouch for, and fails closed.
 
     Returns:
-        The pidfd, or None if bwrap started no init or it has already exited.
+        The pid and a pidfd on it, or None if bwrap started no init or it has
+        already exited.
 
     Raises:
         IsolationError: If bwrap's report is unusable, the pidfd cannot be opened,
@@ -619,8 +630,10 @@ def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
     try:
         try:
             parent: int | None = _status_field(pid, 'PPid')
-        except FileNotFoundError:
-            parent = None  # hidden from this /proc (hidepid), or the init has exited
+        except (FileNotFoundError, ProcessLookupError):
+            # Hidden from this /proc (hidepid), or the init has exited: ESRCH if
+            # bwrap reaped it between the open and the read.
+            parent = None
         try:
             _process.pidfd_signal(pidfd, 0)
         except ProcessLookupError:
@@ -636,7 +649,7 @@ def _hold_init(info_fd: int, bwrap_pid: int) -> int | None:
     except BaseException:
         os.close(pidfd)
         raise
-    return pidfd
+    return pid, pidfd
 
 
 def _require_init_control() -> None:
@@ -667,22 +680,32 @@ def _require_init_control() -> None:
         )
 
 
-def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -> _process.Launch:
+def _spawn(
+    cmd: list[str],
+    *,
+    seccomp_fd: int | None,
+    profile: SandboxProfile,
+    forwards: collections.abc.Sequence[forward.PortForward],
+    resources: contextlib.ExitStack,
+) -> _process.Launch:
     """Start bwrap and take hold of the guest's init. Not on the caller's thread: see :class:`_Job`.
 
     ``cmd`` is the bwrap command line, with ``cmd[0]`` bwrap itself and any
     ``--seccomp`` naming :data:`_SECCOMP_SLOT`, where ``seccomp_fd`` lands;
-    ``--info-fd`` is added here. On any failure, whatever was started is killed
-    before this raises — except an init that could not be held, which only killing
-    bwrap can reach: one already past ``--die-with-parent`` dies with it, one not
-    yet past it does not. Only descriptor exhaustion gets that far, with pidfds
-    known to work.
+    ``--info-fd`` is added here. With ``forwards``, so is ``--block-fd``: the guest
+    is held before its init until :func:`_forward_ports` has handed each port's
+    listener to its handler, whose control connections go on ``resources``. On any
+    failure, whatever was started is killed before this raises — except an init
+    that could not be held, which only killing bwrap can reach: one already past
+    ``--die-with-parent`` dies with it, one not yet past it does not. Only
+    descriptor exhaustion gets that far, with pidfds known to work.
 
     Raises:
         IsolationError: If the init cannot be held by a pidfd, and so could not be
             reliably stopped; this install carries no launcher, or it cannot be
             started or reports its own failure; or glibc's ``posix_spawn`` forks.
         ChildProcessError: If something else in this process reaped bwrap.
+        ConnectionError: If a forward's handler cannot be reached.
     """
     _require_init_control()
     _require_spawn_without_fork()
@@ -692,8 +715,9 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
     if bwrap is None:
         raise RuntimeError(f'{cmd[0]} not found on PATH ({env["PATH"]})')
     info_read, info_write = os.pipe()
+    block_read, block_write = os.pipe() if forwards else (None, None)
     try:
-        inherit = (info_write,) if seccomp_fd is None else (info_write, seccomp_fd)
+        inherit = [fd for fd in (info_write, seccomp_fd, block_read) if fd is not None]
         argv = [
             launcher,
             '--close-from',
@@ -705,6 +729,7 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
             bwrap,
             '--info-fd',
             str(_INFO_SLOT),
+            *([] if block_read is None else ['--block-fd', str(_process.FIRST_INHERITED + len(inherit) - 1)]),
             *cmd[1:],
         ]
         try:
@@ -718,14 +743,133 @@ def _spawn(cmd: list[str], *, seccomp_fd: int | None, profile: SandboxProfile) -
             raise IsolationError(f'cannot start {launcher}: {exc}') from exc
         finally:
             os.close(info_write)
+            if block_read is not None:
+                os.close(block_read)
         try:
-            launch.init_pidfd = _hold_init(info_read, launch.pid)
+            held = _hold_init(info_read, launch.pid)
+            if held is not None:
+                pid, launch.init_pidfd = held
+                if block_write is not None and _forward_ports(
+                    pid, launch.init_pidfd, forwards, profile=profile, resources=resources
+                ):
+                    with contextlib.suppress(BrokenPipeError):  # the guest died during setup: bwrap reports why
+                        os.write(block_write, b'x')
         except BaseException:
+            # Before the block pipe closes: bwrap reads its end of file as a release.
             launch.discard()
             raise
         return launch
     finally:
         os.close(info_read)
+        if block_write is not None:
+            os.close(block_write)
+
+
+def _forward_ports(
+    pid: int,
+    pidfd: int,
+    forwards: collections.abc.Sequence[forward.PortForward],
+    *,
+    profile: SandboxProfile,
+    resources: contextlib.ExitStack,
+) -> bool:
+    """Open each forward's port in the guest's network namespace and hand its listener to the handler.
+
+    Returns:
+        False if the guest died in bwrap's setup first, which then reports why as
+        a launch with no forwards does; True once every handler has its listener.
+
+    Raises:
+        IsolationError: If postern-listen fails.
+        ConnectionError: If a handler cannot be reached within the handoffs' shared deadline.
+    """
+    listeners = _open_ports(pid, pidfd, [f.guest_port for f in forwards], profile=profile)
+    if listeners is None:
+        return False
+    deadline = time.monotonic() + _HANDOFF_TIMEOUT_S
+    with contextlib.ExitStack() as owned:
+        for listener in listeners:
+            owned.enter_context(listener)
+        for each, listener in zip(forwards, listeners, strict=True):
+            remaining = max(0.001, deadline - time.monotonic())
+            control = forward.hand_over(each, listener, timeout=remaining)
+            resources.callback(control.close)
+    return True
+
+
+def _open_ports(
+    pid: int, pidfd: int, ports: collections.abc.Sequence[int], *, profile: SandboxProfile
+) -> list[socket.socket] | None:
+    """Run postern-listen to open ``ports`` in the network namespace of the guest ``pid``, and take its listeners.
+
+    Through postern-launch, so at bwrap's uid: ``/proc/<pid>/ns`` is ptrace-gated,
+    and only that uid owns the guest without ``CAP_SYS_PTRACE``.
+
+    Returns:
+        The listeners, in ``ports`` order, or None if the guest has exited.
+
+    Raises:
+        IsolationError: If postern-listen is missing, fails, or sends back other than one listener per port.
+    """
+    listen = _listen_path()
+    launcher = _launcher_path()
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with ours:
+        with theirs:
+            argv = [
+                launcher,
+                '--close-from',
+                str(_process.FIRST_INHERITED + 2),
+                *bwrap_credentials(profile, os.geteuid()),
+                '--',
+                listen,
+                '--pid',
+                str(pid),
+                '--pidfd',
+                str(_process.FIRST_INHERITED),
+                '--send',
+                str(_process.FIRST_INHERITED + 1),
+                *(arg for port in ports for arg in ('--port', str(port))),
+            ]
+            try:
+                launch = _process.spawn(launcher, argv, env=bwrap_env(), inherit=(pidfd, theirs.fileno()))
+            except OSError as exc:
+                raise IsolationError(f'cannot start {listen}: {exc}') from exc
+        with _process.Process(launch, resources=contextlib.ExitStack()) as process:
+            result = process.communicate(_LISTEN_TIMEOUT_S)
+        if result.returncode == _LISTEN_GUEST_GONE:
+            return None
+        if not result.ok:
+            raise IsolationError(f'{listen} failed: {result.stderr.strip() or result.returncode}')
+        return _receive_listeners(ours, len(ports))
+
+
+def _receive_listeners(channel: socket.socket, count: int) -> list[socket.socket]:
+    """The ``count`` listeners postern-listen sent on ``channel``, which it has finished writing to.
+
+    Raises:
+        IsolationError: If it sent other than ``count``.
+    """
+    channel.setblocking(False)
+    try:
+        _, fds, cut = _process.recv_fds(channel, 1, count)
+    except BlockingIOError:
+        fds, cut = [], False
+    listeners: list[socket.socket] = []
+    try:
+        for fd in fds:
+            listeners.append(socket.socket(fileno=fd))
+    except BaseException:
+        for fd in fds[len(listeners) :]:
+            os.close(fd)
+        for listener in listeners:
+            listener.close()
+        raise
+    if len(listeners) != count or cut:
+        for listener in listeners:
+            listener.close()
+        raise IsolationError(f'postern-listen sent {len(listeners)} listeners for {count} ports')
+    return listeners
 
 
 def _require_spawn_without_fork() -> None:
@@ -782,6 +926,64 @@ def _launcher_path() -> str:
     return str(_PACKAGED_LAUNCH)
 
 
+def _verify_listen(timeout: float) -> None:
+    """Raise unless the packaged postern-listen runs here and was built from this postern.
+
+    Raises:
+        IsolationError: If it is missing, fails, or reports another version.
+    """
+    import postern  # noqa: PLC0415 — the package imports this module
+
+    listen = _listen_path()
+    try:
+        launch = _process.spawn(listen, [listen, '--version'], env=bwrap_env())
+    except OSError as exc:
+        raise IsolationError(f'cannot start {listen}: {exc}') from exc
+    with _process.Process(launch, resources=contextlib.ExitStack()) as process:
+        answer = process.communicate(timeout)
+    if not answer.ok:
+        raise IsolationError(f'port opener {listen} failed: {answer.stderr.strip() or answer.returncode}')
+    if answer.stdout.strip() != postern.__version__:
+        raise IsolationError(
+            f'port opener {listen} was built from postern {answer.stdout.strip()}, not {postern.__version__}; '
+            'rebuild it with `python -m postern.build_init --in-place`'
+        )
+
+
+def _listen_path() -> str:
+    """The packaged ``postern-listen``; never configurable, for the launcher's reason.
+
+    Raises:
+        IsolationError: If this install carries none.
+    """
+    if not _PACKAGED_LISTEN.is_file():
+        raise IsolationError(
+            f'this postern install carries no port opener ({_PACKAGED_LISTEN} is missing), as an editable '
+            'install or non-Linux one does not: build one with `python -m postern.build_init --in-place`'
+        )
+    return str(_PACKAGED_LISTEN)
+
+
+def _checked_forwards(forwards: collections.abc.Sequence[forward.PortForward]) -> list[forward.PortForward]:
+    """``forwards`` as a list, once each guest port appears at most once and there are not too many.
+
+    Raises:
+        TypeError: If an entry is not a `PortForward`.
+        ValueError: On a guest port named twice, or more than postern-listen opens.
+    """
+    checked = list(forwards)
+    for each in checked:
+        if not isinstance(each, forward.PortForward):
+            raise TypeError(f'forwards takes PortForward entries, got {each!r}')
+    if len(checked) > _MAX_FORWARDS:
+        raise ValueError(f'at most {_MAX_FORWARDS} forwards, got {len(checked)}')
+    ports = [each.guest_port for each in checked]
+    twice = sorted({port for port in ports if ports.count(port) > 1})
+    if twice:
+        raise ValueError(f'forwards name guest ports more than once: {twice}')
+    return checked
+
+
 def _discard_process(process: _process.Process) -> None:
     process.kill()
     process.close()
@@ -804,6 +1006,10 @@ class Sandbox:
     ``hatch`` takes one hatch or a sequence, and defaults to none (no channel is
     opened). At most one *unnamed* hatch, since that one owns a fixed guest socket
     path and environment variable.
+
+    ``forwards`` lists the TCP ports served in the guest by handlers on the host
+    (:mod:`postern.forward`). Every launch opens each port from the host and hands
+    its listener to the handler before the guest starts.
     """
 
     def __init__(
@@ -811,6 +1017,7 @@ class Sandbox:
         profile: SandboxProfile | None = None,
         *,
         hatch: Hatch | collections.abc.Sequence[Hatch] | None = None,
+        forwards: collections.abc.Sequence[forward.PortForward] = (),
     ) -> None:
         self._profile = profile or SandboxProfile()
         if hatch is None:
@@ -820,6 +1027,7 @@ class Sandbox:
         else:
             self._hatches = [typing.cast('Hatch', hatch)]
         self._check_hatches()
+        self._forwards = _checked_forwards(forwards)
         # Absolute, so the file bound in as PID 1 cannot depend on the worker's cwd.
         if self._profile.init is not None and not os.path.isabs(self._profile.init):
             raise ValueError(f'SandboxProfile.init must be an absolute path, got {os.fspath(self._profile.init)!r}')
@@ -947,7 +1155,13 @@ class Sandbox:
                 cmd += ['--setenv', key, val]
             cmd += extra_binds or []
             cmd += ['--', *argv]
-            launch = _spawn(cmd, seccomp_fd=None if seccomp is None else seccomp.fileno(), profile=self._profile)
+            launch = _spawn(
+                cmd,
+                seccomp_fd=None if seccomp is None else seccomp.fileno(),
+                profile=self._profile,
+                forwards=self._forwards,
+                resources=resources,
+            )
             if seccomp is not None:
                 seccomp.close()
             return _process.Process(launch, resources=resources)
@@ -1121,12 +1335,16 @@ class Sandbox:
         startup rather than on the first real request.
 
         The trivial launch is the init's own ``--version``, run inside the sandbox,
-        and its answer must be this postern's version, as must the launcher's.
+        and its answer must be this postern's version, as must the launcher's. With
+        ``forwards``, the port opener's must too, and the trivial launch forwards
+        the ports like any other: each handler's control socket must take a
+        connection, and the handler receives one handoff that ends at once.
 
         Raises:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no
-                guest init or launcher, the trivial launch fails, or the init or
-                the launcher was built from another postern version.
+                guest init or launcher, the trivial launch fails, or the init, the
+                launcher or the port opener was built from another postern version.
+            ConnectionError: If a forward's handler cannot be reached.
             ChildProcessError: If something else in this process reaped a
                 launch's child.
         """
@@ -1154,6 +1372,8 @@ class Sandbox:
                 f'launcher {launcher} was built from postern {reported}, not {postern.__version__}; '
                 'rebuild it with `python -m postern.build_init --in-place`'
             )
+        if self._forwards:
+            _verify_listen(timeout)
         # The init itself, inside the sandbox: it needs nothing from the rootfs (a
         # rootfs need not carry Python), and the init is never executed on the host,
         # which runs only postern's own launcher and bwrap. Running a deployer-supplied

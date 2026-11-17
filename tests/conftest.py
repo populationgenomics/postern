@@ -1,4 +1,4 @@
-"""Session setup: give a source checkout the guest init and launcher a Linux wheel carries."""
+"""Session setup: give a source checkout the static binaries a Linux wheel carries."""
 
 from __future__ import annotations
 
@@ -15,16 +15,17 @@ from postern import _sandbox, available, build_init
 
 @pytest.fixture(scope='session', autouse=True)
 def packaged_bin(tmp_path_factory: pytest.TempPathFactory) -> Iterator[pathlib.Path | None]:
-    """The directory of the init and launcher every launch uses: the install's, else one built for the session.
+    """The directory of the static binaries every launch uses: the install's, else one built for the session.
 
     A source checkout's ``_bin`` may be missing or older than its C sources, so
-    where a sandbox can run this builds both, as ``setup.py`` would, and points
+    where a sandbox can run this builds them, as ``setup.py`` would, and points
     postern at them. With no compiler it builds nothing, and each sandboxed test
     fails on the missing binaries.
     """
     checkout = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'postern'
     from_wheel = pathlib.Path(postern.__file__).resolve().parent != checkout
-    if from_wheel and _sandbox._PACKAGED_INIT.is_file() and _sandbox._PACKAGED_LAUNCH.is_file():
+    packaged = (_sandbox._PACKAGED_INIT, _sandbox._PACKAGED_LAUNCH, _sandbox._PACKAGED_LISTEN)
+    if from_wheel and all(path.is_file() for path in packaged):
         yield _sandbox._PACKAGED_INIT.parent
         return
     if not available() or shutil.which(os.environ.get('CC') or 'cc') is None:
@@ -34,6 +35,7 @@ def packaged_bin(tmp_path_factory: pytest.TempPathFactory) -> Iterator[pathlib.P
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(_sandbox, '_PACKAGED_INIT', built / 'postern-init')
         patch.setattr(_sandbox, '_PACKAGED_LAUNCH', built / 'postern-launch')
+        patch.setattr(_sandbox, '_PACKAGED_LISTEN', built / 'postern-listen')
         yield built
 
 
@@ -47,4 +49,5 @@ def child_prelude(packaged_bin: pathlib.Path | None) -> str:
         'from postern import _sandbox\n'
         f'_sandbox._PACKAGED_INIT = pathlib.Path({str(packaged_bin / "postern-init")!r})\n'
         f'_sandbox._PACKAGED_LAUNCH = pathlib.Path({str(packaged_bin / "postern-launch")!r})\n'
+        f'_sandbox._PACKAGED_LISTEN = pathlib.Path({str(packaged_bin / "postern-listen")!r})\n'
     )

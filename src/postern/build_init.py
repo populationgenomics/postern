@@ -1,7 +1,7 @@
-r"""Build postern's static binaries: the guest init and the bwrap launcher.
+r"""Build postern's static binaries: the guest init, the bwrap launcher and the port opener.
 
-A Linux install already carries both, built by ``setup.py`` through
-:func:`compile_binaries`. An editable install or source checkout carries neither;
+A Linux install already carries all three, built by ``setup.py`` through
+:func:`compile_binaries`. An editable install or source checkout carries none;
 build them into the package, where postern looks for them:
 
     python -m postern.build_init --in-place
@@ -11,11 +11,11 @@ The init alone can also go anywhere, for a profile to name:
     python -m postern.build_init /opt/postern-init
 
 then ``SandboxProfile(init='/opt/postern-init')``. The launcher has no such
-option: it runs on the host as the worker, root included, so postern runs only
-its own.
+option, nor has the port opener: both run on the host as the worker, root
+included, so postern runs only its own.
 
-Both are static: the init needs nothing from the guest's rootfs, and neither
-needs a particular libc on the host.
+All are static: the init needs nothing from the guest's rootfs, and none needs a
+particular libc on the host.
 
 Usage: ``python -m postern.build_init (--in-place | OUTPUT) [--cc CC]``
 (``CC`` defaults to ``$CC``, then ``cc``).
@@ -31,8 +31,9 @@ import subprocess
 
 INIT_SOURCE = pathlib.Path(__file__).with_name('_init.c')
 LAUNCH_SOURCE = pathlib.Path(__file__).with_name('_launch.c')
+LISTEN_SOURCE = pathlib.Path(__file__).with_name('_listen.c')
 # Each binary's file name in a package's ``_bin`` directory, by source.
-BINARIES = {INIT_SOURCE: 'postern-init', LAUNCH_SOURCE: 'postern-launch'}
+BINARIES = {INIT_SOURCE: 'postern-init', LAUNCH_SOURCE: 'postern-launch', LISTEN_SOURCE: 'postern-listen'}
 
 
 def compile_binary(
@@ -44,7 +45,7 @@ def compile_binary(
     and build the binaries into a wheel before postern is installed.
 
     Args:
-        source: The C source, :data:`INIT_SOURCE` or :data:`LAUNCH_SOURCE`.
+        source: The C source, one of :data:`BINARIES`.
         output: Where to write the binary.
         version: What the binary's ``--version`` prints, which
             :meth:`~postern.Sandbox.verify` compares with the installed postern.
@@ -78,7 +79,7 @@ def compile_binary(
 
 
 def compile_binaries(directory: str | os.PathLike[str], *, version: str, cc: str | None = None) -> pathlib.Path:
-    """Compile the init and the launcher into ``directory``, a package's ``_bin``.
+    """Compile every one of :data:`BINARIES` into ``directory``, a package's ``_bin``.
 
     Args:
         directory: Created if missing, and made mode 0755 either way.
@@ -116,7 +117,7 @@ def build(output: str | os.PathLike[str], *, cc: str | None = None) -> pathlib.P
 
 
 def build_in_place(*, cc: str | None = None) -> pathlib.Path:
-    """Compile both binaries into this package's ``_bin``, where postern looks for them.
+    """Compile every binary into this package's ``_bin``, where postern looks for them.
 
     Args:
         cc: As :func:`compile_binary`.
@@ -139,11 +140,12 @@ def _installed_version() -> str:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog='python -m postern.build_init', description="Build postern's static guest init and bwrap launcher."
+        prog='python -m postern.build_init',
+        description="Build postern's static guest init, bwrap launcher and port opener.",
     )
     where = parser.add_mutually_exclusive_group(required=True)
     where.add_argument('output', nargs='?', help='where to write the init alone')
-    where.add_argument('--in-place', action='store_true', help="build both into this package's _bin")
+    where.add_argument('--in-place', action='store_true', help="build every binary into this package's _bin")
     parser.add_argument('--cc', help='the C compiler (default: $CC, then cc)')
     args = parser.parse_args(argv)
     print(build_in_place(cc=args.cc) if args.in_place else build(args.output, cc=args.cc))
