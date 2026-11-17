@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import array
+import asyncio
 import pathlib
 import socket
 import stat
 import threading
 import time
+from collections.abc import Awaitable, Callable
 
 import pytest
 
 from postern import Sandbox, forward
-from postern.forward import HandoffError, PortForward, Receiver, hand_over
+from postern.forward import Handoff, HandoffError, PortForward, Receiver, hand_over
 
 
 @pytest.mark.parametrize('port', [0, 65536, -1])
@@ -142,3 +144,45 @@ def test_closing_a_handoff_ends_an_accept_waiting_on_it(tmp_path: pathlib.Path):
         control.close()
         assert not waiter.is_alive()
         assert result == [None]
+
+
+async def _serve_in_a_loop(
+    handoff: Handoff, handle: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
+) -> None:
+    # The event-loop pattern the README shows: the listener into asyncio's server,
+    # the control connection's end of stream as the launch's end.
+    loop = asyncio.get_running_loop()
+    ended = loop.create_future()
+    loop.add_reader(handoff.control, lambda: ended.done() or ended.set_result(None))
+    server = await asyncio.start_server(handle, sock=handoff.listener)
+    try:
+        await ended
+    finally:
+        loop.remove_reader(handoff.control)
+        server.close()
+        await server.wait_closed()
+        handoff.close()
+
+
+def test_a_handoff_serves_from_an_event_loop(tmp_path: pathlib.Path):
+    async def echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.write(b'echo:' + await reader.read(64))
+        await writer.drain()
+        writer.close()
+
+    async def main() -> bytes:
+        with Receiver(tmp_path / 'h.sock') as receiver, socket.create_server(('127.0.0.1', 0)) as listener:
+            port = listener.getsockname()[1]
+            control = hand_over(PortForward(8080, receiver.path), listener, timeout=5)
+            handoff = await asyncio.to_thread(receiver.receive)
+            serving = asyncio.create_task(_serve_in_a_loop(handoff, echo))
+            reader, writer = await asyncio.open_connection('127.0.0.1', port)
+            writer.write(b'hi')
+            writer.write_eof()
+            reply = await reader.read()
+            writer.close()
+            control.close()  # the launch ends
+            await asyncio.wait_for(serving, 5)
+            return reply
+
+    assert asyncio.run(main()) == b'echo:hi'

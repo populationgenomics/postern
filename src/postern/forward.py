@@ -36,6 +36,12 @@ connection, which it does when the run is closed. A guest's namespace going away
 does not close a socket in it, so without that signal a handler would hold every
 launch's listener for good.
 
+`Handoff.accept` is for a handler with a thread per launch: it polls the listener
+and the control connection, and accepts from the listener once a connection waits
+there. A handler on an event loop uses neither: it registers `Handoff.listener`
+with its loop to accept connections, and `Handoff.control` to learn the launch
+has ended (end of stream), then closes the handoff.
+
 Trust model
 -----------
 Every byte on an accepted connection is the guest's: the handler is a server for
@@ -123,9 +129,11 @@ class Handoff:
 
     Attributes:
         guest_port: The port the guest connects to.
-        listener: The listening socket, in the guest's network namespace.
-        control: The launch's control connection. It turns readable, at end of
-            stream, when the launch ends; an event loop can watch it for that.
+        listener: The listening socket, in the guest's network namespace,
+            non-blocking. Readable when a guest connection waits to be accepted.
+        control: The launch's control connection. Readable, at end of stream, when
+            the launch ends. An event loop watches it for that, and the listener
+            for connections, in place of :meth:`accept`.
     """
 
     def __init__(self, guest_port: int, listener: socket.socket, control: socket.socket) -> None:
@@ -138,7 +146,12 @@ class Handoff:
         self._closing = False
 
     def accept(self) -> socket.socket | None:
-        """Wait for the guest's next connection.
+        """Wait for the guest's next connection, for a handler with a thread per launch.
+
+        Polls the listener and the control connection, and accepts from the
+        listener once a connection waits there. A connection lost between the poll
+        and the accept, taken by another thread or reset by the guest, is waited
+        past, as is this process running out of descriptors.
 
         Returns:
             The connection, blocking. None once the launch has ended, or the
