@@ -50,8 +50,10 @@ gates the host opens.
   `_listen.c`) and hands the listening socket to the handler over its **control
   socket** (`Receiver`). The handler accepts on it directly, so no byte passes
   through postern or the guest; the launch's end reaches the handler as its control
-  connection closing (`Handoff`). For tools that speak TCP and cannot dial a Unix
-  socket. Stdlib-only.
+  connection closing (`Handoff`). A launch can carry a **launch token**, which
+  the caller chooses and every handler receives with that launch's listener: a
+  name for the launch, not a credential. For tools that speak TCP and cannot dial
+  a Unix socket. Stdlib-only.
 
 - **Allowlist** — the capability grant. The exact `/package.Service/Method`
   names the guest may call through the hatch; everything else is

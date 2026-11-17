@@ -109,8 +109,8 @@ def recv_fds(channel: socket.socket, bufsize: int, maxfds: int) -> tuple[bytes, 
     Returns:
         The message, the descriptors (the caller's to close), and whether any were
         cut off: descriptors past ``maxfds``, which the kernel then closes, or on a
-        datagram socket message bytes past ``bufsize``. On a stream socket those
-        bytes stay queued.
+        datagram or seqpacket socket message bytes past ``bufsize``. On a stream
+        socket those bytes stay queued.
     """
     fds = array.array('i')
     # Linux's: received without it, a descriptor would leak into whatever another thread spawns next.

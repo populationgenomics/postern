@@ -6,6 +6,7 @@ behind a `Receiver`; in production it is any process with a control socket.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import os
 import pathlib
@@ -48,8 +49,9 @@ class _Echo:
         self.tag = tag
         self.handoffs: list[Handoff] = []
         self.ended: list[int] = []
-        self._thread = threading.Thread(target=self._receive, daemon=True)
-        self._thread.start()
+        self.serving: list[threading.Thread] = []
+        self.receiving = threading.Thread(target=self._receive, daemon=True)
+        self.receiving.start()
 
     def _receive(self) -> None:
         while True:
@@ -60,7 +62,9 @@ class _Echo:
             except OSError:
                 return  # the receiver was closed
             self.handoffs.append(handoff)
-            threading.Thread(target=self._serve, args=(handoff,), daemon=True).start()
+            serving = threading.Thread(target=self._serve, args=(handoff,), daemon=True)
+            self.serving.append(serving)
+            serving.start()
 
     def _serve(self, handoff: Handoff) -> None:
         with handoff:
@@ -70,7 +74,16 @@ class _Echo:
                     while chunk := conn.recv(4096):
                         data += chunk
                     conn.sendall(f'{self.tag}:'.encode() + data)
-            self.ended.append(handoff.guest_port)
+        self.ended.append(handoff.guest_port)  # closed: its descriptors are free
+
+    def close(self) -> None:
+        """Close the receiver, and wait out every thread that holds or closes descriptor numbers."""
+        self.receiver.close()
+        self.receiving.join(10)
+        assert not self.receiving.is_alive(), 'the receiver outlived its close'
+        for serving in self.serving:  # complete: receiving, which appends to it, has ended
+            serving.join(10)
+            assert not serving.is_alive(), 'a handoff outlived its launch'
 
 
 @pytest.fixture
@@ -83,8 +96,9 @@ def echo(tmp_path: pathlib.Path) -> Iterator[Callable[[str], _Echo]]:
         return handler
 
     yield make
+    # A handler thread outliving its test holds or closes descriptor numbers under the next one's feet.
     for handler in handlers:
-        handler.receiver.close()
+        handler.close()
 
 
 def _client(*ports: int) -> list[str]:
@@ -118,6 +132,55 @@ def test_each_launch_hands_over_its_own_listener_and_ends_it(echo):
     first, second = (handoff.listener for handoff in handler.handoffs)
     assert first is not second
     _wait_for(lambda: handler.ended == [8080, 8080])
+
+
+def _exited_ok(process) -> bool:
+    with process:
+        return process.communicate(30).ok
+
+
+def _aexited_ok(starting) -> bool:
+    async def main():
+        async with await starting as process:
+            return (await process.communicate(30)).ok
+
+    return asyncio.run(main())
+
+
+_LAUNCHES = {
+    'run': lambda s, t: s.run(['true'], timeout=30, launch_token=t).ok,
+    'run_bash': lambda s, t: s.run_bash('true', timeout=30, launch_token=t).ok,
+    'run_python': lambda s, t: s.run_python('pass', timeout=30, launch_token=t).ok,
+    'start': lambda s, t: _exited_ok(s.start(['true'], launch_token=t)),
+    'start_bash': lambda s, t: _exited_ok(s.start_bash('true', launch_token=t)),
+    'start_python': lambda s, t: _exited_ok(s.start_python('pass', launch_token=t)),
+    'astart': lambda s, t: _aexited_ok(s.astart(['true'], launch_token=t)),
+    'astart_bash': lambda s, t: _aexited_ok(s.astart_bash('true', launch_token=t)),
+    'astart_python': lambda s, t: _aexited_ok(s.astart_python('pass', launch_token=t)),
+}
+
+
+@pytest.mark.parametrize('method', list(_LAUNCHES))
+def test_a_launch_hands_its_handler_the_token_the_caller_gave_it(echo, method):
+    handler = echo('files')
+    with Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)]) as sandbox:
+        assert _LAUNCHES[method](sandbox, b'launch-17')
+    _wait_for(lambda: handler.ended == [8080])  # the handler takes the handoff on a thread of its own
+    assert [handoff.token for handoff in handler.handoffs] == [b'launch-17']
+
+
+def test_a_sandbox_without_forwards_runs_a_launch_given_a_token():
+    with Sandbox(SandboxProfile()) as sandbox:
+        assert sandbox.run(['true'], timeout=30, launch_token=b'launch-17').ok
+
+
+def test_successive_launches_each_carry_their_own_token(echo):
+    handler = echo('files')
+    with Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)]) as sandbox:
+        assert sandbox.run(_client(8080), timeout=30, launch_token=b'first').ok
+        assert sandbox.run(_client(8080), timeout=30).ok
+    _wait_for(lambda: handler.ended == [8080, 8080])
+    assert [handoff.token for handoff in handler.handoffs] == [b'first', b'']
 
 
 def test_a_port_busy_on_the_host_is_free_in_the_guest(echo):
