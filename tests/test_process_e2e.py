@@ -681,3 +681,22 @@ def test_launch_thread_keeps_bwrap_alive_when_spawner_thread_exits(sandbox):
         assert (sandbox.workspace / 'marker').read_text() == 'ok\n'
     finally:
         proc.close()
+
+
+def test_an_init_reaped_while_its_status_is_read_means_no_init(monkeypatch):
+    # bwrap reaps a guest that dies in setup; between opening /proc/<pid>/status
+    # and reading it, that read fails with ESRCH rather than ENOENT.
+    child = subprocess.Popen(['true'])
+
+    def reaped_mid_read(_pid: int | str, _field: str) -> int:
+        child.wait()
+        raise ProcessLookupError(3, 'No such process')
+
+    monkeypatch.setattr(_sandbox, '_status_field', reaped_mid_read)
+    read, write = os.pipe()
+    try:
+        os.write(write, b'{"child-pid": %d}' % child.pid)
+        assert _sandbox._hold_init(read, os.getpid()) is None
+    finally:
+        os.close(read)
+        os.close(write)

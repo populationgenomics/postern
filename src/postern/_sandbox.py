@@ -630,8 +630,10 @@ def _hold_init(info_fd: int, bwrap_pid: int) -> tuple[int, int] | None:
     try:
         try:
             parent: int | None = _status_field(pid, 'PPid')
-        except FileNotFoundError:
-            parent = None  # hidden from this /proc (hidepid), or the init has exited
+        except (FileNotFoundError, ProcessLookupError):
+            # Hidden from this /proc (hidepid), or the init has exited: ESRCH if
+            # bwrap reaped it between the open and the read.
+            parent = None
         try:
             _process.pidfd_signal(pidfd, 0)
         except ProcessLookupError:
