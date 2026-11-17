@@ -331,9 +331,35 @@ on it directly. No byte passes through postern or a relay in the guest. Per laun
    reached within 10 s, shared across all of a launch's forwards, fails the launch
    before the guest runs. A guest that dies in bwrap's setup first is reported as
    any launch's is, with bwrap's own error.
-4. When the run is closed, postern closes the launch's control connections; the
-   handler's `Handoff.accept()` then returns `None`. A namespace that goes away
-   does not close a socket in it, so this is the handler's only signal.
+4. When the run is closed, postern closes the launch's control connections, which
+   reach end of stream at the handler: `Handoff.accept()` returns `None`. A
+   namespace that goes away does not close a socket in it, so this is the
+   handler's only signal.
+
+`Handoff.accept()`, as above, is for a handler with a thread per launch. It polls
+the listener and the control connection, and accepts from the listener once a
+connection waits there. A handler on an event loop uses neither: it registers
+`handoff.listener` with its loop to accept connections and `handoff.control` to
+learn the launch has ended, then closes the handoff. With asyncio:
+
+```python
+async def serve(handoff, handle):
+    loop = asyncio.get_running_loop()
+    ended = loop.create_future()
+    # Readable until closed, so the callback can run again once ended is set.
+    loop.add_reader(handoff.control, lambda: ended.done() or ended.set_result(None))
+    server = await asyncio.start_server(handle, sock=handoff.listener)
+    try:
+        await ended                       # the launch has ended
+    finally:
+        loop.remove_reader(handoff.control)
+        server.close()
+        await server.wait_closed()
+        handoff.close()
+```
+
+`Receiver.receive()` blocks, so such a handler calls it in a thread
+(`await asyncio.to_thread(receiver.receive)`).
 
 The listener lives in one launch's namespace, so only that launch's guest can
 connect, and two launches' connections arrive on two `Handoff`s. A `Handoff` says
@@ -537,7 +563,7 @@ there anyway.
   - `stderr=PIPE` is refused because nothing drains it and the command would deadlock; `stderr=STDOUT` is refused because stdout is the guest socket, so it would relay host-path diagnostics to the guest. Checked at construction for `Process(argv)`, and by detection for an adopted `Popen` where the platform allows, since `subprocess` keeps no record of the `stderr` it was passed.
   - `Stream.read_preamble(max_bytes, timeout)` bounds a preamble read without touching socket flags. Do not use `settimeout` for that: the command shares the descriptor.
   - `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)` is the stock handler; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`.
-- `postern.forward.PortForward(guest_port, handler)` — serve `guest_port` (1 to 65535) on the guest's loopback with the handler whose control socket is `handler`. `Receiver(path, *, mode=0o600)` binds a handler's control socket: `.receive()` → `Handoff` per launch (raises `HandoffError` for one bad control connection, which the loop should skip), `.close()` removes the socket file. `Handoff` — `.guest_port`, `.listener`, `.control`; `.accept()` → the next connection, or `None` once the launch ends; a context manager. Stdlib-only.
+- `postern.forward.PortForward(guest_port, handler)` — serve `guest_port` (1 to 65535) on the guest's loopback with the handler whose control socket is `handler`. `Receiver(path, *, mode=0o600)` binds a handler's control socket: `.receive()` → `Handoff` per launch (raises `HandoffError` for one bad control connection, which the loop should skip), `.close()` removes the socket file. `Handoff` — `.guest_port`; `.listener` and `.control`, the sockets an event loop registers (a waiting connection, the launch's end); `.accept()` polls both for a threaded handler → the next connection, or `None` once the launch ends; a context manager. Stdlib-only.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`, member-vetting only — see below.
 - `available()` — whether bubblewrap is on the PATH.
 
