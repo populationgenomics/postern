@@ -6,6 +6,7 @@ behind a `Receiver`; in production it is any process with a control socket.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import os
 import pathlib
@@ -118,6 +119,49 @@ def test_each_launch_hands_over_its_own_listener_and_ends_it(echo):
     first, second = (handoff.listener for handoff in handler.handoffs)
     assert first is not second
     _wait_for(lambda: handler.ended == [8080, 8080])
+
+
+def _started(process) -> bool:
+    with process:
+        return process.communicate(30).ok
+
+
+def _astarted(starting) -> bool:
+    async def main():
+        async with await starting as process:
+            return (await process.communicate(30)).ok
+
+    return asyncio.run(main())
+
+
+# Each launch method, given a token: what it ran succeeded.
+_LAUNCHES = {
+    'run': lambda s, t: s.run(['true'], timeout=30, launch_token=t).ok,
+    'run_bash': lambda s, t: s.run_bash('true', timeout=30, launch_token=t).ok,
+    'run_python': lambda s, t: s.run_python('pass', timeout=30, launch_token=t).ok,
+    'start': lambda s, t: _started(s.start(['true'], launch_token=t)),
+    'start_bash': lambda s, t: _started(s.start_bash('true', launch_token=t)),
+    'start_python': lambda s, t: _started(s.start_python('pass', launch_token=t)),
+    'astart': lambda s, t: _astarted(s.astart(['true'], launch_token=t)),
+    'astart_bash': lambda s, t: _astarted(s.astart_bash('true', launch_token=t)),
+    'astart_python': lambda s, t: _astarted(s.astart_python('pass', launch_token=t)),
+}
+
+
+@pytest.mark.parametrize('method', list(_LAUNCHES))
+def test_a_launch_hands_its_handler_the_token_the_caller_gave_it(echo, method):
+    handler = echo('files')
+    sandbox = Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)])
+    assert _LAUNCHES[method](sandbox, b'launch-17')
+    assert [handoff.token for handoff in handler.handoffs] == [b'launch-17']
+
+
+def test_successive_launches_each_carry_their_own_token(echo):
+    handler = echo('files')
+    sandbox = Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)])
+    assert sandbox.run(_client(8080), timeout=30, launch_token=b'first').ok
+    assert sandbox.run(_client(8080), timeout=30).ok
+    assert [handoff.token for handoff in handler.handoffs] == [b'first', b'']
 
 
 def test_a_port_busy_on_the_host_is_free_in_the_guest(echo):

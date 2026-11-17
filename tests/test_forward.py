@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
-from postern import Sandbox, forward
+from postern import Sandbox, SandboxProfile, forward
 from postern.forward import Handoff, HandoffError, PortForward, Receiver, hand_over
 
 
@@ -50,10 +50,34 @@ def test_a_handoff_delivers_the_listener_and_ends_at_the_launch_end(tmp_path: pa
             assert handoff.accept() is None
 
 
+def _message(port: int, token: bytes = b'', *, version: int = 1, length: int | None = None) -> bytes:
+    """A hand-over message as postern frames it, with each field open to corruption."""
+    stated = len(token) if length is None else length
+    return bytes([version]) + port.to_bytes(2, 'big') + stated.to_bytes(2, 'big') + token
+
+
 @pytest.mark.parametrize(
     ('message', 'with_listener'),
-    [(b'8080', False), (b'port', True), (b'', True), (b'0', True), (b'65536', True)],
-    ids=['no-descriptor', 'not-a-port', 'empty', 'port-zero', 'port-too-high'],
+    [
+        (_message(8080), False),
+        (b'8080', True),
+        (b'', True),
+        (_message(0), True),
+        (_message(8080, version=2), True),
+        (_message(8080)[:4], True),
+        (_message(8080, b'abc', length=2), True),
+        (_message(8080, b'abc', length=4), True),
+    ],
+    ids=[
+        'no-descriptor',
+        'unversioned-0.7.0-message',
+        'empty',
+        'port-zero',
+        'unknown-version',
+        'cut-header',
+        'token-longer-than-stated',
+        'token-shorter-than-stated',
+    ],
 )
 def test_a_malformed_handoff_is_refused(tmp_path: pathlib.Path, message: bytes, with_listener: bool):
     with (
@@ -89,7 +113,7 @@ def test_a_handoff_with_bytes_past_the_port_is_refused(tmp_path: pathlib.Path):
     ):
         control.connect(receiver.path)
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
-        control.sendmsg([b'8080'], fds)
+        control.sendmsg([_message(8080)], fds)
         control.sendall(b'more')
         with pytest.raises(HandoffError, match='malformed port forward handoff'):
             receiver.receive()
@@ -186,3 +210,31 @@ def test_a_handoff_serves_from_an_event_loop(tmp_path: pathlib.Path):
             return reply
 
     assert asyncio.run(main()) == b'echo:hi'
+
+
+@pytest.mark.parametrize('token', [b'', b'launch-17', bytes(range(256))], ids=['none', 'text', 'longest-binary'])
+def test_a_handoff_carries_the_token_it_was_sent_with(tmp_path: pathlib.Path, token: bytes):
+    with Receiver(tmp_path / 'h.sock') as receiver, socket.create_server(('127.0.0.1', 0)) as listener:
+        control = hand_over(PortForward(8080, receiver.path), listener, timeout=5, token=token)
+        with control, receiver.receive() as handoff:
+            assert handoff.token == token
+            assert handoff.guest_port == 8080
+
+
+@pytest.mark.parametrize(
+    ('token', 'error'),
+    [('launch-17', TypeError), (bytearray(b'launch-17'), TypeError), (bytes(257), ValueError)],
+    ids=['str', 'bytearray', 'too-long'],
+)
+def test_a_launch_refuses_a_bad_token_before_it_starts(tmp_path: pathlib.Path, token: object, error: type):
+    sandbox = Sandbox(SandboxProfile(), forwards=[PortForward(8080, tmp_path / 'never-bound.sock')])
+    with pytest.raises(error, match='launch token'):
+        sandbox.start(['true'], launch_token=token)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ('token', 'error'), [('launch-17', TypeError), (bytes(70000), ValueError)], ids=['str', 'huge']
+)
+def test_hand_over_refuses_a_bad_token_before_it_connects(tmp_path: pathlib.Path, token: object, error: type):
+    with socket.create_server(('127.0.0.1', 0)) as listener, pytest.raises(error, match='launch token'):
+        hand_over(PortForward(8080, tmp_path / 'never-bound.sock'), listener, timeout=5, token=token)  # type: ignore[arg-type]

@@ -686,6 +686,7 @@ def _spawn(
     seccomp_fd: int | None,
     profile: SandboxProfile,
     forwards: collections.abc.Sequence[forward.PortForward],
+    launch_token: bytes,
     resources: contextlib.ExitStack,
 ) -> _process.Launch:
     """Start bwrap and take hold of the guest's init. Not on the caller's thread: see :class:`_Job`.
@@ -694,7 +695,8 @@ def _spawn(
     ``--seccomp`` naming :data:`_SECCOMP_SLOT`, where ``seccomp_fd`` lands;
     ``--info-fd`` is added here. With ``forwards``, so is ``--block-fd``: the guest
     is held before its init until :func:`_forward_ports` has handed each port's
-    listener to its handler, whose control connections go on ``resources``. On any
+    listener, with ``launch_token``, to its handler, whose control connections
+    go on ``resources``. On any
     failure, whatever was started is killed before this raises — except an init
     that could not be held, which only killing bwrap can reach: one already past
     ``--die-with-parent`` dies with it, one not yet past it does not. Only
@@ -750,7 +752,7 @@ def _spawn(
             if held is not None:
                 pid, launch.init_pidfd = held
                 if block_write is not None and _forward_ports(
-                    pid, launch.init_pidfd, forwards, profile=profile, resources=resources
+                    pid, launch.init_pidfd, forwards, token=launch_token, profile=profile, resources=resources
                 ):
                     with contextlib.suppress(BrokenPipeError):  # the guest died during setup: bwrap reports why
                         os.write(block_write, b'x')
@@ -770,10 +772,11 @@ def _forward_ports(
     pidfd: int,
     forwards: collections.abc.Sequence[forward.PortForward],
     *,
+    token: bytes,
     profile: SandboxProfile,
     resources: contextlib.ExitStack,
 ) -> bool:
-    """Open each forward's port in the guest's network namespace and hand its listener to the handler.
+    """Open each forward's port in the guest's network namespace and hand its listener, with ``token``, to the handler.
 
     Returns:
         False if the guest died in bwrap's setup first, which then reports why as
@@ -792,7 +795,7 @@ def _forward_ports(
             owned.enter_context(listener)
         for each, listener in zip(forwards, listeners, strict=True):
             remaining = max(0.001, deadline - time.monotonic())
-            control = forward.hand_over(each, listener, timeout=remaining)
+            control = forward.hand_over(each, listener, timeout=remaining, token=token)
             resources.callback(control.close)
     return True
 
@@ -1111,6 +1114,7 @@ class Sandbox:
         resources: contextlib.ExitStack,
         setenv: dict[str, str] | None = None,
         extra_binds: list[str] | None = None,
+        launch_token: bytes = b'',
     ) -> _process.Process:
         """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
 
@@ -1120,7 +1124,14 @@ class Sandbox:
         it, so an interrupt cannot leave a guest between the two.
         """
         job = _Job(
-            functools.partial(self._launch, argv, setenv=setenv, extra_binds=extra_binds, resources=resources),
+            functools.partial(
+                self._launch,
+                argv,
+                setenv=setenv,
+                extra_binds=extra_binds,
+                launch_token=launch_token,
+                resources=resources,
+            ),
             _discard_process,
         )
         try:
@@ -1135,6 +1146,7 @@ class Sandbox:
         *,
         setenv: dict[str, str] | None,
         extra_binds: list[str] | None,
+        launch_token: bytes,
         resources: contextlib.ExitStack,
     ) -> _process.Process:
         if not available():
@@ -1160,6 +1172,7 @@ class Sandbox:
                 seccomp_fd=None if seccomp is None else seccomp.fileno(),
                 profile=self._profile,
                 forwards=self._forwards,
+                launch_token=launch_token,
                 resources=resources,
             )
             if seccomp is not None:
@@ -1187,7 +1200,9 @@ class Sandbox:
             )
         return str(_PACKAGED_INIT)
 
-    def _supervised(self, work_argv: list[str], *, code: str | None = None) -> _process.Process:
+    def _supervised(
+        self, work_argv: list[str], *, code: str | None = None, launch_token: bytes = b''
+    ) -> _process.Process:
         """Start ``work_argv`` under the guest's init, with every hatch bound and served.
 
         The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.
@@ -1199,13 +1214,18 @@ class Sandbox:
             code: ``POSTERN_CODE`` when ``work_argv`` runs the shim
                 (:meth:`run_python`); ``None`` for an arbitrary program, which reads
                 its own input.
+            launch_token: What each forward's handler receives with this launch's
+                listener (`forward.Handoff.token`).
 
         Returns:
             The running process, which owns the hatches' serving contexts.
 
         Raises:
             IsolationError: If there is no guest init to launch.
+            TypeError: If ``launch_token`` is not bytes.
+            ValueError: If ``launch_token`` is longer than `forward.MAX_TOKEN`.
         """
+        forward._checked_token(launch_token)  # noqa: SLF001 — validated before anything starts
         binds, env = self._hatch_wiring()
         # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
         # raise KeyError with no hatch configured; seed it empty instead.
@@ -1226,9 +1246,11 @@ class Sandbox:
         except BaseException:
             stack.close()
             raise
-        return self._start(entrypoint, resources=stack, setenv=env, extra_binds=binds)
+        return self._start(entrypoint, resources=stack, setenv=env, extra_binds=binds, launch_token=launch_token)
 
-    def run(self, argv: list[str], *, timeout: float = 60, max_output: int | None = None) -> _process.ProcResult:
+    def run(
+        self, argv: list[str], *, timeout: float = 60, max_output: int | None = None, launch_token: bytes = b''
+    ) -> _process.ProcResult:
         """Run ``argv`` inside the sandbox and return its result.
 
         The entrypoint for a program that is not Python. It runs under the same
@@ -1239,11 +1261,23 @@ class Sandbox:
         Every configured :class:`Hatch` is bound and served: the socket is a file at
         ``$POSTERN_HATCH``/``$POSTERN_HATCH_<NAME>``, so ``argv`` reaches it with no
         in-guest relay.
+
+        With ``forwards``, each handler receives this launch's listener with
+        ``launch_token``, at most `forward.MAX_TOKEN` bytes, as `forward.Handoff.token`:
+        a name the caller chose for the launch, so a handler serving several can
+        tell them apart. A sandbox without forwards takes a token and sends it
+        nowhere.
         """
-        return self.start(argv).communicate(timeout, max_output=max_output)
+        return self.start(argv, launch_token=launch_token).communicate(timeout, max_output=max_output)
 
     def run_bash(
-        self, script: str, *, shell: str = 'bash', timeout: float = 60, max_output: int | None = None
+        self,
+        script: str,
+        *,
+        shell: str = 'bash',
+        timeout: float = 60,
+        max_output: int | None = None,
+        launch_token: bytes = b'',
     ) -> _process.ProcResult:
         """Run ``script`` inside the sandbox as ``shell -c script``.
 
@@ -1255,13 +1289,19 @@ class Sandbox:
             timeout: Seconds before the launch is killed.
             max_output: Maximum total bytes of stdout and stderr to buffer. Output
                 beyond this is discarded and result.truncated is set.
+            launch_token: What each forward's handler receives with the launch's
+                listener, as :meth:`run` describes.
 
         Returns:
             The launch's result.
         """
-        return self.start_bash(script, shell=shell).communicate(timeout, max_output=max_output)
+        return self.start_bash(script, shell=shell, launch_token=launch_token).communicate(
+            timeout, max_output=max_output
+        )
 
-    def run_python(self, code: str, *, timeout: float = 60, max_output: int | None = None) -> _process.ProcResult:
+    def run_python(
+        self, code: str, *, timeout: float = 60, max_output: int | None = None, launch_token: bytes = b''
+    ) -> _process.ProcResult:
         """Run untrusted Python ``code`` inside the sandbox.
 
         The init's child execs ``profile.python`` on the shim to run ``code``, and
@@ -1272,24 +1312,24 @@ class Sandbox:
         ``POSTERN_HATCH_<NAME>``; the client library that dials it comes from the
         guest's bound environment.
         """
-        return self.start_python(code).communicate(timeout, max_output=max_output)
+        return self.start_python(code, launch_token=launch_token).communicate(timeout, max_output=max_output)
 
-    def start(self, argv: list[str]) -> _process.Process:
+    def start(self, argv: list[str], *, launch_token: bytes = b'') -> _process.Process:
         """Start ``argv`` in the sandbox, as :meth:`run` does, and return at once.
 
         The :class:`Process` streams the output as it arrives
         (:meth:`Process.output`) and can be stopped (:meth:`Process.terminate`).
         Use it as a context manager: the run's hatches serve until it is closed.
         """
-        return self._supervised(list(argv))
+        return self._supervised(list(argv), launch_token=launch_token)
 
-    def start_bash(self, script: str, *, shell: str = 'bash') -> _process.Process:
+    def start_bash(self, script: str, *, shell: str = 'bash', launch_token: bytes = b'') -> _process.Process:
         """Start ``shell -c script`` in the sandbox, as :meth:`run_bash` does, and return at once."""
-        return self._supervised([shell, '-c', script])
+        return self._supervised([shell, '-c', script], launch_token=launch_token)
 
-    def start_python(self, code: str) -> _process.Process:
+    def start_python(self, code: str, *, launch_token: bytes = b'') -> _process.Process:
         """Start ``code`` in the sandbox, as :meth:`run_python` does, and return at once."""
-        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code)
+        return self._supervised([self._profile.python, '-u', _GUEST_SHIM], code=code, launch_token=launch_token)
 
     async def _astart(
         self,
@@ -1311,17 +1351,19 @@ class Sandbox:
             process.close()
             raise
 
-    async def astart(self, argv: list[str]) -> _process.AsyncProcess:
+    async def astart(self, argv: list[str], *, launch_token: bytes = b'') -> _process.AsyncProcess:
         """Start ``argv`` as :meth:`start` does, for asyncio. Use with ``async with``."""
-        return await self._astart(self.start, argv)
+        return await self._astart(self.start, argv, launch_token=launch_token)
 
-    async def astart_bash(self, script: str, *, shell: str = 'bash') -> _process.AsyncProcess:
+    async def astart_bash(
+        self, script: str, *, shell: str = 'bash', launch_token: bytes = b''
+    ) -> _process.AsyncProcess:
         """Start ``shell -c script`` as :meth:`start_bash` does, for asyncio."""
-        return await self._astart(self.start_bash, script, shell=shell)
+        return await self._astart(self.start_bash, script, shell=shell, launch_token=launch_token)
 
-    async def astart_python(self, code: str) -> _process.AsyncProcess:
+    async def astart_python(self, code: str, *, launch_token: bytes = b'') -> _process.AsyncProcess:
         """Start ``code`` as :meth:`start_python` does, for asyncio."""
-        return await self._astart(self.start_python, code)
+        return await self._astart(self.start_python, code, launch_token=launch_token)
 
     def verify(self, *, timeout: float = 30) -> None:
         """Fail fast at startup unless the sandbox actually launches here.
@@ -1338,7 +1380,8 @@ class Sandbox:
         and its answer must be this postern's version, as must the launcher's. With
         ``forwards``, the port opener's must too, and the trivial launch forwards
         the ports like any other: each handler's control socket must take a
-        connection, and the handler receives one handoff that ends at once.
+        connection, and the handler receives one handoff that ends at once, with
+        an empty token.
 
         Raises:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no

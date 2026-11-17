@@ -326,10 +326,10 @@ on it directly. No byte passes through postern or a relay in the guest. Per laun
    and `::1` both reach it. A wildcard rather than a loopback address because
    bwrap reports the pid before it brings loopback up; loopback is the guest's
    only interface either way.
-3. postern connects to each handler's control socket and sends its listener and
-   guest port (`SCM_RIGHTS`), then releases the guest. A handler that cannot be
-   reached within 10 s, shared across all of a launch's forwards, fails the launch
-   before the guest runs. A guest that dies in bwrap's setup first is reported as
+3. postern connects to each handler's control socket and sends its listener
+   (`SCM_RIGHTS`), the guest port, and the launch's token, then releases the
+   guest. A handler that cannot be reached within 10 s, shared across all of a
+   launch's forwards, fails the launch before the guest runs. A guest that dies in bwrap's setup first is reported as
    any launch's is, with bwrap's own error.
 4. When the run is closed, postern closes the launch's control connections, which
    reach end of stream at the handler: `Handoff.accept()` returns `None`. A
@@ -362,10 +362,21 @@ async def serve(handoff, handle):
 (`await asyncio.to_thread(receiver.receive)`).
 
 The listener lives in one launch's namespace, so only that launch's guest can
-connect, and two launches' connections arrive on two `Handoff`s. A `Handoff` says
-which launch, not whose: nothing in it names the `Sandbox` or caller, so one
-control socket grants the same authority to every launch pointed at it. Give each
-scope of authority (one session's files, say) a `Receiver` of its own. A port
+connect, and two launches' connections arrive on two `Handoff`s. To say which
+launch a `Handoff` is, the caller can give the launch a token, up to 256 bytes,
+which every handler receives as `handoff.token`:
+
+```python
+sandbox.run(['curl', 'http://127.0.0.1:8080/x'], launch_token=b'session-4/call-17')
+```
+
+postern chooses nothing in the token and checks nothing of its meaning, and
+anything that can reach a control socket can send any token, so it names a launch for a
+handler and proves nothing. A handler serving several launches at once tells their
+listeners apart by it, or looks it up in what the caller registered with the
+handler before the launch. A `Handoff` says which launch, not whose: one control
+socket grants the same authority to every launch pointed at it. Give each scope of
+authority (one session's files, say) a `Receiver` of its own. A port
 below 1024 needs no capability in the guest: postern-listen binds it as the
 namespace's owner. The listener is dual-stack, so a guest's 127.0.0.1 arrives as
 `::ffff:127.0.0.1`. The handler is a server for untrusted clients, and the control
@@ -378,7 +389,8 @@ Like the launcher, postern-listen runs on the host as the worker and is never
 configurable. `verify()` checks its version when forwards are configured, and its
 trivial launch forwards the ports like any launch: it proves at startup that the
 ports open and each handler's control socket takes a connection. Each handler must
-be listening by then, and receives one handoff that ends at once.
+be listening by then, and receives one handoff that ends at once, with an empty
+token.
 
 ## Stream hatch
 
@@ -553,7 +565,7 @@ there anyway.
 
 ## Public API
 
-- `Sandbox(profile=None, *, hatch=None, forwards=())` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.start(argv)`, `.start_bash(script, *, shell='bash')`, `.start_python(code)` → `Process`, and `await .astart(...)`, `.astart_bash(...)`, `.astart_python(...)` → `AsyncProcess` ([streaming and stopping](#streaming-and-stopping-a-run)); `.verify()` (fail-closed boot check, raises `IsolationError`, as does any launch with no guest init or launcher, whose launcher fails, on a glibc older than 2.24, or where pidfds do not work). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var. `forwards` takes `PortForward`s with distinct guest ports, at most 64 ([port forwards](#port-forwards)).
+- `Sandbox(profile=None, *, hatch=None, forwards=())` — `.run(argv)`, `.run_bash(script, *, shell='bash')`, `.run_python(code)` → `ProcResult(returncode, stdout, stderr, ok)`; `.start(argv)`, `.start_bash(script, *, shell='bash')`, `.start_python(code)` → `Process`, and `await .astart(...)`, `.astart_bash(...)`, `.astart_python(...)` → `AsyncProcess` ([streaming and stopping](#streaming-and-stopping-a-run)); `.verify()` (fail-closed boot check, raises `IsolationError`, as does any launch with no guest init or launcher, whose launcher fails, on a glibc older than 2.24, or where pidfds do not work). All three bind and serve every configured hatch, get the identical bwrap profile, and run under the guest init with the same rlimits and orphan reaping ([above](#pid-1-and-the-resource-backstops)); they differ only in what the init's child execs. `hatch` takes one hatch or a sequence, with at most one *unnamed* hatch since that one owns a fixed guest env var. `forwards` takes `PortForward`s with distinct guest ports, at most 64 ([port forwards](#port-forwards)); every run and start method takes `launch_token=b''`, `bytes` of at most `postern.forward.MAX_TOKEN` (256), which each handler receives with the launch's listener; a sandbox without forwards takes one and sends it nowhere. A handler and the worker that hands over to it must run the same postern minor version: a handoff in another version's format is refused as malformed.
 - `Process` — `.output()` → iterator of `(stream, bytes)`; `.terminate(*, grace=5.0)`, `.kill()`, `.wait(timeout=None)`, `.communicate(timeout=None)` → `ProcResult`, `.close()`; `.pid`, `.returncode`, `.terminated`; a context manager. `AsyncProcess` is the same run for asyncio: `async for` over `.output()`, `await .wait()`, `await .communicate(timeout=None)`, `await .aclose()`, `async with`.
 - `SandboxProfile(workspace=None, rootfs=None, python='python3', ro_binds=[], required_ro_binds=[], stubs=None, env=..., seccomp=True, rlimit_nproc=1024, rlimit_as=None, guest_uid=65534, guest_gid=65534, host_uid=None, host_gid=None, init=None)` and `SandboxProfile.with_venv(venv, **kw)`. `ro_binds=` are `--ro-bind-try` (a missing source is skipped silently); `required_ro_binds=` are `--ro-bind` (a missing source fails the launch), for a bind the guest cannot run without. `host_uid=` runs bwrap itself at a non-root real uid; the deploy must then make every bind source, and the files postern binds from its own install, reachable by it. `init=` names a static C init built by `python -m postern.build_init` ([above](#pid-1-and-the-resource-backstops)); `None` uses the one the Linux wheel carries, and a launch with neither raises `IsolationError`. `verify()` checks the init and the launcher were built from this postern version. `stubs=` injects a dir or list of files at `/run/postern/stubs`, prepended to `PYTHONPATH`. `rlimit_nproc=`/`rlimit_as=` are applied by the guest init, so every entrypoint gets them.
 - `postern.grpc.GrpcHatch(allowlist, *, socket_path=None)` — `.add_servicer(register_fn, servicer)`; `with hatch.accepting(): ...`. (`grpc` extra.)
@@ -563,7 +575,7 @@ there anyway.
   - `stderr=PIPE` is refused because nothing drains it and the command would deadlock; `stderr=STDOUT` is refused because stdout is the guest socket, so it would relay host-path diagnostics to the guest. Checked at construction for `Process(argv)`, and by detection for an adopted `Popen` where the platform allows, since `subprocess` keeps no record of the `stderr` it was passed.
   - `Stream.read_preamble(max_bytes, timeout)` bounds a preamble read without touching socket flags. Do not use `settimeout` for that: the command shares the descriptor.
   - `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)` is the stock handler; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`.
-- `postern.forward.PortForward(guest_port, handler)` — serve `guest_port` (1 to 65535) on the guest's loopback with the handler whose control socket is `handler`. `Receiver(path, *, mode=0o600)` binds a handler's control socket: `.receive()` → `Handoff` per launch (raises `HandoffError` for one bad control connection, which the loop should skip), `.close()` removes the socket file. `Handoff` — `.guest_port`; `.listener` and `.control`, the sockets an event loop registers (a waiting connection, the launch's end); `.accept()` polls both for a threaded handler → the next connection, or `None` once the launch ends; a context manager. Stdlib-only.
+- `postern.forward.PortForward(guest_port, handler)` — serve `guest_port` (1 to 65535) on the guest's loopback with the handler whose control socket is `handler`. `Receiver(path, *, mode=0o600)` binds a handler's control socket: `.receive()` → `Handoff` per launch (raises `HandoffError` for one bad control connection, which the loop should skip), `.close()` removes the socket file. `Handoff` — `.guest_port`; `.token`, the launch's `launch_token` (`b''` if none); `.listener` and `.control`, the sockets an event loop registers (a waiting connection, the launch's end); `.accept()` polls both for a threaded handler → the next connection, or `None` once the launch ends; a context manager. Stdlib-only.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`, member-vetting only — see below.
 - `available()` — whether bubblewrap is on the PATH.
 

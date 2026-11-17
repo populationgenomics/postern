@@ -29,7 +29,7 @@ nothing of postern runs in the guest to serve the port.
 
     # The worker:
     sandbox = Sandbox(profile, forwards=[PortForward(8080, '/run/files/control.sock')])
-    sandbox.run(['curl', 'http://127.0.0.1:8080/x'])
+    sandbox.run(['curl', 'http://127.0.0.1:8080/x'], launch_token=b'launch-17')   # handoff.token
 
 The handler learns a launch has ended when postern closes that launch's control
 connection, which it does when the run is closed. A guest's namespace going away
@@ -50,11 +50,16 @@ is the capability. It lives in one launch's namespace, so only that launch's gue
 can connect to it, and connections from two launches arrive on two `Handoff`s.
 
 A `Handoff` says which launch a connection came from, not whose: it carries the
-guest port and nothing that names the `Sandbox` or the caller. So one control
-socket grants the same authority to every launch pointed at it. Where launches
-differ in what they may reach (one session's files, say, and another's), give each
-scope a `Receiver` of its own, and the handler behind it only that scope's
-authority.
+guest port, and the token the caller gave the launch (``launch_token`` on
+`Sandbox.run` and the other launch methods; empty if it gave none). postern
+chooses nothing in it and checks nothing of its meaning, and anything that can
+reach the control socket can send any token. So a token names a launch for a handler that
+already trusts its control socket: one serving several launches at once can tell
+their listeners apart, or look the token up in what the caller registered with it
+before the launch. It is not a credential. One control socket grants the same
+authority to every launch pointed at it. Where launches differ in what they may
+reach (one session's files, say, and another's), give each scope a `Receiver` of
+its own, and the handler behind it only that scope's authority.
 
 The control socket is the handler's own: postern connects to it, and anything else
 that can reach it can hand the handler listeners too. `Receiver` makes it mode
@@ -89,8 +94,13 @@ if typing.TYPE_CHECKING:
     # the floor is 3.10, so the backport must stay behind this guard.
     import typing_extensions
 
-# What postern sends on a control connection besides the listener: the guest port, in decimal ASCII.
-_MAX_MESSAGE = 5
+# The longest launch token a caller may give.
+MAX_TOKEN = 256
+# What postern sends on a control connection besides the listener: the format version (one byte), the guest port
+# and the token's length (two bytes each, network order), then the token.
+_VERSION = 1
+_HEADER = 5
+_MAX_MESSAGE = _HEADER + MAX_TOKEN
 # How long a control connection may take to deliver its handoff; postern sends it whole on connecting.
 _HANDOFF_TIMEOUT_S = 10.0
 # The pause before accepting again while this process is out of descriptors.
@@ -129,6 +139,9 @@ class Handoff:
 
     Attributes:
         guest_port: The port the guest connects to.
+        token: The token the caller gave the launch, as it gave it; empty where it
+            gave none. Anything that can reach the control socket can send any
+            token: it names the launch for a handler, and proves nothing.
         listener: The listening socket, in the guest's network namespace,
             non-blocking. Readable when a guest connection waits to be accepted.
         control: The launch's control connection. Readable, at end of stream, when
@@ -136,8 +149,9 @@ class Handoff:
             for connections, in place of :meth:`accept`.
     """
 
-    def __init__(self, guest_port: int, listener: socket.socket, control: socket.socket) -> None:
+    def __init__(self, guest_port: int, listener: socket.socket, control: socket.socket, token: bytes = b'') -> None:
         self.guest_port = guest_port
+        self.token = token
         self.listener = listener
         self.control = control
         # close() frees the descriptors only once no accept() is polling them, so none polls a reused number.
@@ -302,11 +316,13 @@ class Receiver:
 
 
 def _take(control: socket.socket) -> Handoff:
-    """Read one handoff from ``control``: a guest port and its listener."""
+    """Read one handoff from ``control``: a guest port, the launch's token and its listener."""
     message, fds, cut = _process.recv_fds(control, _MAX_MESSAGE, 1)
     try:
-        port = int(message) if message.isdigit() else 0
-        malformed = len(fds) != 1 or cut or not 1 <= port <= 65535 or _more_queued(control)
+        whole = len(message) >= _HEADER and message[0] == _VERSION
+        port = int.from_bytes(message[1:3], 'big') if whole else 0
+        whole = whole and len(message) == _HEADER + int.from_bytes(message[3:_HEADER], 'big')
+        malformed = len(fds) != 1 or cut or not whole or not 1 <= port <= 65535 or _more_queued(control)
     except BaseException:
         for fd in fds:
             os.close(fd)
@@ -314,7 +330,7 @@ def _take(control: socket.socket) -> Handoff:
     if malformed:
         for fd in fds:
             os.close(fd)
-        raise ValueError(f'malformed port forward handoff: {message!r} with {len(fds)} descriptors')
+        raise ValueError(f'malformed port forward handoff: {len(message)} bytes with {len(fds)} descriptors')
     try:
         listener = socket.socket(fileno=fds[0])
     except OSError:
@@ -328,7 +344,21 @@ def _take(control: socket.socket) -> Handoff:
         listener.close()
         raise ValueError('a port forward handoff carried something other than a listening TCP socket')
     listener.setblocking(False)
-    return Handoff(port, listener, control)
+    return Handoff(port, listener, control, token=message[_HEADER:])
+
+
+def _checked_token(token: bytes) -> bytes:
+    """``token`` once it is one a launch may carry: bytes, at most `MAX_TOKEN` of them.
+
+    Raises:
+        TypeError: If ``token`` is not bytes (a bytearray or memoryview included).
+        ValueError: If it is longer than `MAX_TOKEN`.
+    """
+    if not isinstance(token, bytes):
+        raise TypeError(f'a launch token is bytes, got {type(token).__name__}')
+    if len(token) > MAX_TOKEN:
+        raise ValueError(f'a launch token is at most {MAX_TOKEN} bytes, got {len(token)}')
+    return token
 
 
 def _more_queued(control: socket.socket) -> bool:
@@ -344,25 +374,36 @@ def _more_queued(control: socket.socket) -> bool:
         control.settimeout(timeout)
 
 
-def hand_over(forward: PortForward, listener: socket.socket, *, timeout: float) -> socket.socket:
-    """Send ``listener`` to ``forward``'s handler; the returned control connection is the launch's to close.
+def hand_over(forward: PortForward, listener: socket.socket, *, timeout: float, token: bytes = b'') -> socket.socket:
+    """Send ``listener`` and the launch's ``token`` to ``forward``'s handler.
+
+    The returned control connection is the launch's to close.
+
+    Raises:
+        TypeError: If ``token`` is not bytes.
+        ValueError: If ``token`` is longer than `MAX_TOKEN`.
 
     Raises:
         ConnectionError: If the handler's control socket cannot be reached in ``timeout`` seconds.
     """
+    message = bytes([_VERSION]) + forward.guest_port.to_bytes(2, 'big') + len(_checked_token(token)).to_bytes(2, 'big')
     control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         control.settimeout(timeout)
         try:
             control.connect(os.fspath(forward.handler))
-            control.sendmsg(
-                [str(forward.guest_port).encode('ascii')],
+            sent = control.sendmsg(
+                [message + token],
                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))],
             )
         except OSError as exc:
             raise ConnectionError(
                 f'port forward {forward.guest_port}: cannot hand the listener to {os.fspath(forward.handler)!r}: {exc}'
             ) from exc
+        if sent != len(message) + len(token):
+            raise ConnectionError(
+                f'port forward {forward.guest_port}: the handoff reached {os.fspath(forward.handler)!r} cut short'
+            )
         control.settimeout(None)
     except BaseException:
         control.close()
