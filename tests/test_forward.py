@@ -130,6 +130,20 @@ def test_closing_a_receiver_ends_a_receive_waiting_on_it(tmp_path: pathlib.Path)
         assert [type(exc) for exc in raised] == [OSError]
 
 
+def test_closing_a_receiver_ends_a_receive_waiting_on_a_silent_connection(tmp_path: pathlib.Path):
+    with (
+        Receiver(tmp_path / 'h.sock') as receiver,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as silent,
+    ):
+        silent.connect(receiver.path)
+        waiter, raised = _receive_in_a_thread(receiver)
+        time.sleep(0.2)
+        receiver.close()
+        waiter.join(2)  # well inside the 10 s a silent connection is otherwise given
+        assert not waiter.is_alive()
+        assert [type(exc) for exc in raised] == [OSError]
+
+
 def test_a_handoff_from_a_peer_that_half_closes_is_taken_and_ends_at_the_half_close(tmp_path: pathlib.Path):
     with (
         Receiver(tmp_path / 'h.sock') as receiver,

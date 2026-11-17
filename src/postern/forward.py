@@ -270,6 +270,11 @@ class Receiver:
         except BaseException:
             self._socket.close()
             raise
+        # close() frees the descriptor only once no receive() uses it, so none accepts on a reused number.
+        self._lock = threading.Lock()
+        self._waiting = 0
+        self._closing = False
+        self._taking: set[socket.socket] = set()
 
     def receive(self) -> Handoff:
         """Wait for postern's next launch and take its listener.
@@ -282,20 +287,44 @@ class Receiver:
                 listening TCP socket and one whole frame of this format (guest
                 port and launch token) within a bounded time, or failed while it
                 was read. Only that connection is refused.
-            OSError: If the receiver itself cannot accept: closed, say. Running
-                out of descriptors is waited out, not raised.
+            OSError: If the receiver was closed, before or during the wait, or
+                cannot accept. Running out of descriptors is waited out, not raised.
         """
+        with self._lock:
+            if self._closing:
+                raise OSError(errno.EBADF, 'the receiver is closed')
+            self._waiting += 1
+        try:
+            return self._receive()
+        finally:
+            with self._lock:
+                self._waiting -= 1
+                release = self._closing and not self._waiting
+            if release:
+                self._socket.close()
+
+    def _receive(self) -> Handoff:
         control = self._accept()
+        with self._lock:
+            if self._closing:
+                control.close()
+                raise OSError(errno.EBADF, 'the receiver was closed')
+            self._taking.add(control)
         try:
             control.settimeout(_HANDOFF_TIMEOUT_S)
             handoff = _take(control)
             control.settimeout(None)
         except (ValueError, OSError) as exc:
             control.close()
+            if self._closing:
+                raise OSError(errno.EBADF, 'the receiver was closed') from exc
             raise HandoffError(f'refused a control connection: {exc}') from exc
         except BaseException:
             control.close()
             raise
+        finally:
+            with self._lock:
+                self._taking.discard(control)
         return handoff
 
     def _accept(self) -> socket.socket:
@@ -313,13 +342,20 @@ class Receiver:
             return control
 
     def close(self) -> None:
-        """Stop listening and remove the socket file, ending a :meth:`receive` waiting here. Idempotent."""
-        if self._socket.fileno() >= 0:
-            # close() does not wake a blocked accept(), which keeps the descriptor number it reserved; shutdown does.
-            with contextlib.suppress(OSError):
-                self._socket.shutdown(socket.SHUT_RDWR)
+        """Stop listening and remove the socket file, ending any :meth:`receive` waiting here. Idempotent."""
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            # close() does not wake a blocked accept() or recvmsg(), and accept() keeps the descriptor number it
+            # reserved; shutdown wakes both.
+            for sock in (self._socket, *self._taking):
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+            release = not self._waiting
+        os.unlink(self.path)
+        if release:
             self._socket.close()
-            os.unlink(self.path)
 
     def __enter__(self) -> typing_extensions.Self:
         return self
