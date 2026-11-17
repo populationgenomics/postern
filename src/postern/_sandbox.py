@@ -428,8 +428,9 @@ _INFO_TIMEOUT_S = 30.0
 # take all of them: each is a few syscalls, so these bound only a hung process.
 _LISTEN_TIMEOUT_S = 10.0
 _HANDOFF_TIMEOUT_S = 10.0
-# What postern-listen sends at most, as its MAX_PORTS.
+# What postern-listen sends at most, as its MAX_PORTS; and its status for a guest that has exited, as its EXIT_GONE.
 _MAX_FORWARDS = 64
+_LISTEN_GUEST_GONE = 3
 
 
 class _Job(typing.Generic[_T]):
@@ -777,23 +778,12 @@ def _forward_ports(
         a launch with no forwards does; True once every handler has its listener.
 
     Raises:
-        IsolationError: If the namespace cannot be opened while the guest lives, or
-            postern-listen fails.
+        IsolationError: If postern-listen fails.
         ConnectionError: If a handler cannot be reached within the handoffs' shared deadline.
     """
-    try:
-        netns = os.open(f'/proc/{pid}/ns/net', os.O_RDONLY | os.O_CLOEXEC)
-    except OSError as exc:
-        if not _alive(pidfd):
-            return False
-        raise IsolationError(f"cannot open the guest's network namespace: {exc}") from exc
-    try:
-        # Alive, the pid cannot have changed hands since _hold_init vouched for it, so the namespace is the guest's.
-        if not _alive(pidfd):
-            return False
-        listeners = _open_ports(netns, [f.guest_port for f in forwards], profile=profile)
-    finally:
-        os.close(netns)
+    listeners = _open_ports(pid, pidfd, [f.guest_port for f in forwards], profile=profile)
+    if listeners is None:
+        return False
     deadline = time.monotonic() + _HANDOFF_TIMEOUT_S
     with contextlib.ExitStack() as owned:
         for listener in listeners:
@@ -805,16 +795,16 @@ def _forward_ports(
     return True
 
 
-def _alive(pidfd: int) -> bool:
-    try:
-        _process.pidfd_signal(pidfd, 0)
-    except ProcessLookupError:
-        return False
-    return True
+def _open_ports(
+    pid: int, pidfd: int, ports: collections.abc.Sequence[int], *, profile: SandboxProfile
+) -> list[socket.socket] | None:
+    """Run postern-listen to open ``ports`` in the network namespace of the guest ``pid``, and take its listeners.
 
+    Through postern-launch, so at bwrap's uid: ``/proc/<pid>/ns`` is ptrace-gated,
+    and only that uid owns the guest without ``CAP_SYS_PTRACE``.
 
-def _open_ports(netns: int, ports: collections.abc.Sequence[int], *, profile: SandboxProfile) -> list[socket.socket]:
-    """Run postern-listen to open ``ports`` in the network namespace ``netns``, and take its listeners.
+    Returns:
+        The listeners, in ``ports`` order, or None if the guest has exited.
 
     Raises:
         IsolationError: If postern-listen is missing, fails, or sends back other than one listener per port.
@@ -831,18 +821,22 @@ def _open_ports(netns: int, ports: collections.abc.Sequence[int], *, profile: Sa
                 *bwrap_credentials(profile, os.geteuid()),
                 '--',
                 listen,
-                '--netns',
+                '--pid',
+                str(pid),
+                '--pidfd',
                 str(_process.FIRST_INHERITED),
                 '--send',
                 str(_process.FIRST_INHERITED + 1),
                 *(arg for port in ports for arg in ('--port', str(port))),
             ]
             try:
-                launch = _process.spawn(launcher, argv, env=bwrap_env(), inherit=(netns, theirs.fileno()))
+                launch = _process.spawn(launcher, argv, env=bwrap_env(), inherit=(pidfd, theirs.fileno()))
             except OSError as exc:
                 raise IsolationError(f'cannot start {listen}: {exc}') from exc
         with _process.Process(launch, resources=contextlib.ExitStack()) as process:
             result = process.communicate(_LISTEN_TIMEOUT_S)
+        if result.returncode == _LISTEN_GUEST_GONE:
+            return None
         if not result.ok:
             raise IsolationError(f'{listen} failed: {result.stderr.strip() or result.returncode}')
         return _receive_listeners(ours, len(ports))
@@ -859,7 +853,16 @@ def _receive_listeners(channel: socket.socket, count: int) -> list[socket.socket
         _, fds, cut = _process.recv_fds(channel, 1, count)
     except BlockingIOError:
         fds, cut = [], False
-    listeners = [socket.socket(fileno=fd) for fd in fds]
+    listeners: list[socket.socket] = []
+    try:
+        for fd in fds:
+            listeners.append(socket.socket(fileno=fd))
+    except BaseException:
+        for fd in fds[len(listeners) :]:
+            os.close(fd)
+        for listener in listeners:
+            listener.close()
+        raise
     if len(listeners) != count or cut:
         for listener in listeners:
             listener.close()
@@ -1332,8 +1335,8 @@ class Sandbox:
         The trivial launch is the init's own ``--version``, run inside the sandbox,
         and its answer must be this postern's version, as must the launcher's. With
         ``forwards``, the port opener's must too, and the trivial launch forwards
-        the ports like any other: each handler must be serving, and receives one
-        handoff that ends at once.
+        the ports like any other: each handler's control socket must take a
+        connection, and the handler receives one handoff that ends at once.
 
         Raises:
             IsolationError: If ``seccomp`` is disabled in the profile, there is no

@@ -286,12 +286,15 @@ loopback, served by a **handler**, a host process the caller runs.
 
 ```python
 from postern import Sandbox, SandboxProfile
-from postern.forward import PortForward, Receiver
+from postern.forward import HandoffError, PortForward, Receiver
 
 # The handler, in a process of its own:
-with Receiver('/run/files/control.sock') as receiver:
+with Receiver('/run/files/control.sock') as receiver:   # mode 0600
     while True:
-        handoff = receiver.receive()                     # one per launch
+        try:
+            handoff = receiver.receive()                 # one per launch
+        except HandoffError:
+            continue                                     # one bad control connection
         threading.Thread(target=serve, args=(handoff,)).start()
 
 def serve(handoff):
@@ -311,10 +314,12 @@ on it directly. No byte passes through postern or a relay in the guest. Per laun
 
 1. bwrap starts with `--block-fd`, which holds the guest before its init, and
    reports the init's pid on `--info-fd` as every launch does.
-2. postern opens `/proc/<pid>/ns/net` and confirms through the init's pidfd that
-   the pid is still the init's. It runs `postern-listen` (`_listen.c`) through
-   `postern-launch`, so at the same uid as bwrap: it joins the user namespace that
-   owns the guest's network namespace (bwrap nests the guest's own inside it, and
+2. postern runs `postern-listen` (`_listen.c`) through `postern-launch`, so at
+   the same uid as bwrap, which owns the guest: `/proc/<pid>/ns` is ptrace-gated,
+   and a root worker whose bwrap drops to `host_uid` would otherwise need
+   `CAP_SYS_PTRACE`. It opens `/proc/<pid>/ns/net`, confirms through the init's
+   pidfd (not yet readable, so not exited) that the pid is still the init's, joins
+   the user namespace that owns the guest's network namespace (bwrap nests the guest's own inside it, and
    only the owner's gives the capability to join), joins the network namespace,
    opens one listener per port on the dual-stack wildcard `::` (`0.0.0.0` on a
    kernel without IPv6), and sends them back over a socket pair. So `127.0.0.1`
@@ -331,15 +336,23 @@ on it directly. No byte passes through postern or a relay in the guest. Per laun
    does not close a socket in it, so this is the handler's only signal.
 
 The listener lives in one launch's namespace, so only that launch's guest can
-connect, and a handler serving several launches tells them apart by `Handoff`. A
-port below 1024 needs no capability in the guest: postern-listen binds it as the
-namespace's owner. The handler is a server for untrusted clients, and the control
-socket is its own: anything that can reach that path can hand it listeners, so its
-directory should admit only the worker. Like the launcher, postern-listen runs on
-the host as the worker and is never configurable;
-`verify()` checks its version when forwards are configured. Its trivial launch
-forwards the ports like any launch, so it proves the whole path at startup: each
-handler must be serving by then, and receives one handoff that ends at once.
+connect, and two launches' connections arrive on two `Handoff`s. A `Handoff` says
+which launch, not whose: nothing in it names the `Sandbox` or caller, so one
+control socket grants the same authority to every launch pointed at it. Give each
+scope of authority (one session's files, say) a `Receiver` of its own. A port
+below 1024 needs no capability in the guest: postern-listen binds it as the
+namespace's owner. The listener is dual-stack, so a guest's 127.0.0.1 arrives as
+`::ffff:127.0.0.1`. The handler is a server for untrusted clients, and the control
+socket is its own: anything that can reach it can hand it listeners, so `Receiver`
+makes it mode 0600 and its directory should admit only the worker. Each accepted
+connection is a descriptor in the handler, and the guest decides how many it opens,
+so bound the connections served per `Handoff`.
+
+Like the launcher, postern-listen runs on the host as the worker and is never
+configurable. `verify()` checks its version when forwards are configured, and its
+trivial launch forwards the ports like any launch: it proves at startup that the
+ports open and each handler's control socket takes a connection. Each handler must
+be listening by then, and receives one handoff that ends at once.
 
 ## Stream hatch
 
@@ -524,7 +537,7 @@ there anyway.
   - `stderr=PIPE` is refused because nothing drains it and the command would deadlock; `stderr=STDOUT` is refused because stdout is the guest socket, so it would relay host-path diagnostics to the guest. Checked at construction for `Process(argv)`, and by detection for an adopted `Popen` where the platform allows, since `subprocess` keeps no record of the `stderr` it was passed.
   - `Stream.read_preamble(max_bytes, timeout)` bounds a preamble read without touching socket flags. Do not use `settimeout` for that: the command shares the descriptor.
   - `splice_subprocess(argv, *, cwd=None, env=None, stderr=DEVNULL)` is the stock handler; `git_url(name, *, profile=None, python=None)` builds the `ext::` URL for the in-guest connector at `$POSTERN_CONNECT`.
-- `postern.forward.PortForward(guest_port, handler)` — serve `guest_port` (1 to 65535) on the guest's loopback with the handler whose control socket is `handler`. `Receiver(path)` binds a handler's control socket: `.receive()` → `Handoff` per launch, `.close()` removes the socket file. `Handoff` — `.guest_port`, `.listener`, `.control`; `.accept()` → the next connection, or `None` once the launch ends; a context manager. Stdlib-only.
+- `postern.forward.PortForward(guest_port, handler)` — serve `guest_port` (1 to 65535) on the guest's loopback with the handler whose control socket is `handler`. `Receiver(path, *, mode=0o600)` binds a handler's control socket: `.receive()` → `Handoff` per launch (raises `HandoffError` for one bad control connection, which the loop should skip), `.close()` removes the socket file. `Handoff` — `.guest_port`, `.listener`, `.control`; `.accept()` → the next connection, or `None` once the launch ends; a context manager. Stdlib-only.
 - `Sandbox.accessor()` / `postern.Workspace(dir)` — a reference-closed handle to a workspace; `WorkspacePath` is its `pathlib`-like facade. `.pack_tar(f, *, exclude=…)` and `.restore_tar(f, *, max_entries=…, max_bytes=…)` → `WorkspaceReport`; `ws / 'a/b'`, `.iterdir()`, `.walk()`, `.open()`, `.read_bytes()`. `reference_closed_filter` plugs into `tarfile.extractall(filter=...)`, member-vetting only — see below.
 - `available()` — whether bubblewrap is on the PATH.
 

@@ -7,18 +7,24 @@ behind a `Receiver`; in production it is any process with a control socket.
 from __future__ import annotations
 
 import errno
+import os
 import pathlib
+import shutil
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
 
 import pytest
 
-from postern import Sandbox, SandboxProfile, available
-from postern.forward import Handoff, PortForward, Receiver
+from postern import Sandbox, SandboxProfile, _sandbox, available
+from postern.forward import Handoff, HandoffError, PortForward, Receiver
 
 pytestmark = pytest.mark.skipif(not available(), reason='requires Linux + bubblewrap')
+requires_root = pytest.mark.skipif(os.geteuid() != 0, reason='a uid drop needs root')
 
 # Connects to each port given on argv, sends its name, half-closes, and prints the reply.
 _CLIENT = """
@@ -49,6 +55,8 @@ class _Echo:
         while True:
             try:
                 handoff = self.receiver.receive()
+            except HandoffError:
+                continue
             except OSError:
                 return  # the receiver was closed
             self.handoffs.append(handoff)
@@ -229,3 +237,64 @@ def _wait_for(condition: Callable[[], bool], timeout: float = 10) -> None:
         if time.monotonic() > deadline:
             raise AssertionError('condition not met in time')
         time.sleep(0.02)
+
+
+@pytest.fixture
+def reachable_binaries(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Copies of the init and port opener a uid-dropped process can reach: pytest's temp root is 0700."""
+    directory = pathlib.Path(tempfile.mkdtemp())
+    try:
+        directory.chmod(0o755)
+        for source in (_sandbox._PACKAGED_INIT, _sandbox._PACKAGED_LISTEN):
+            shutil.copy(source, directory / source.name)
+        monkeypatch.setattr(_sandbox, '_PACKAGED_LISTEN', directory / _sandbox._PACKAGED_LISTEN.name)
+        yield str(directory / _sandbox._PACKAGED_INIT.name)
+    finally:
+        shutil.rmtree(directory)
+
+
+# Run in a child whose bounding set lacks CAP_SYS_PTRACE, as in a default container:
+# root keeps it otherwise, and with it the worker could open the namespace itself.
+_NO_PTRACE_WORKER = """
+import os, sys, threading
+from postern import Sandbox, SandboxProfile, _sandbox
+from postern.forward import PortForward, Receiver
+_sandbox._PACKAGED_LISTEN = _sandbox._PACKAGED_LISTEN.__class__(sys.argv[2])
+effective = int([l for l in open('/proc/self/status') if l.startswith('CapEff')][0].split()[1], 16)
+assert not effective >> 19 & 1, 'the worker still holds CAP_SYS_PTRACE'
+with Receiver(sys.argv[3]) as receiver:
+    def serve():
+        with receiver.receive() as handoff:
+            while (conn := handoff.accept()) is not None:
+                with conn:
+                    conn.sendall(b'reached')
+    threading.Thread(target=serve, daemon=True).start()
+    profile = SandboxProfile(host_uid=65534, host_gid=65534, init=sys.argv[1])
+    probe = 'import socket; print(socket.create_connection(("127.0.0.1", 8080), timeout=10).recv(16).decode())'
+    result = Sandbox(profile, forwards=[PortForward(8080, receiver.path)]).run(['python3', '-c', probe], timeout=30)
+print(result.returncode, result.stdout.strip(), result.stderr.strip()[-300:])
+"""
+
+
+@requires_root
+@pytest.mark.skipif(shutil.which('setpriv') is None, reason='needs setpriv to drop CAP_SYS_PTRACE')
+def test_a_root_worker_dropping_to_host_uid_needs_no_ptrace_capability(child_prelude, reachable_binaries, tmp_path):
+    listen = str(_sandbox._PACKAGED_LISTEN)
+    child = subprocess.run(
+        [
+            'setpriv',
+            '--bounding-set=-sys_ptrace',
+            sys.executable,
+            '-c',
+            child_prelude + _NO_PTRACE_WORKER,
+            reachable_binaries,
+            listen,
+            str(tmp_path / 'h.sock'),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.split(None, 2)[:2] == ['0', 'reached'], child.stdout

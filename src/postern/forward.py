@@ -8,13 +8,18 @@ handler over the control socket. The handler accepts the guest's connections on
 it directly: no byte passes through postern or through a relay in the guest, and
 nothing of postern runs in the guest to serve the port.
 
+    import threading
+
     from postern import Sandbox
-    from postern.forward import PortForward, Receiver
+    from postern.forward import HandoffError, PortForward, Receiver
 
     # The handler, in a process of its own:
     with Receiver('/run/files/control.sock') as receiver:
         while True:
-            handoff = receiver.receive()          # one per launch
+            try:
+                handoff = receiver.receive()      # one per launch
+            except HandoffError:
+                continue                          # one bad control connection, not the receiver
             threading.Thread(target=serve, args=(handoff,)).start()
 
     def serve(handoff):
@@ -36,19 +41,39 @@ Trust model
 Every byte on an accepted connection is the guest's: the handler is a server for
 untrusted clients, and what it can reach is what the guest can reach. The listener
 is the capability. It lives in one launch's namespace, so only that launch's guest
-can connect to it, and a handler serving several launches tells them apart by the
-`Handoff` a connection arrived on. The control socket is the handler's own: postern
-connects to it, and anything else that can reach that path can hand the handler
-listeners too, so its directory should admit only the worker.
+can connect to it, and connections from two launches arrive on two `Handoff`s.
+
+A `Handoff` says which launch a connection came from, not whose: it carries the
+guest port and nothing that names the `Sandbox` or the caller. So one control
+socket grants the same authority to every launch pointed at it. Where launches
+differ in what they may reach (one session's files, say, and another's), give each
+scope a `Receiver` of its own, and the handler behind it only that scope's
+authority.
+
+The control socket is the handler's own: postern connects to it, and anything else
+that can reach it can hand the handler listeners too. `Receiver` makes it mode
+0600 by default, and its directory should admit only the worker.
+
+Each accepted connection is a descriptor in the handler's process, and the guest
+decides how many it opens. Bound the connections served per `Handoff`: a handler
+that runs out of descriptors waits, in `accept` and in `receive`, for some to free.
+
+The listener is dual-stack, so a guest connecting to 127.0.0.1 arrives as an IPv6
+socket from ``::ffff:127.0.0.1``. The peer address says nothing the listener does
+not: every connection on it is that launch's guest.
 """
 
 from __future__ import annotations
 
 import array
+import contextlib
 import dataclasses
+import errno
 import os
 import select
 import socket
+import threading
+import time
 import typing
 
 from postern import _process
@@ -62,6 +87,12 @@ if typing.TYPE_CHECKING:
 _MAX_MESSAGE = 5
 # How long a control connection may take to deliver its handoff; postern sends it whole on connecting.
 _HANDOFF_TIMEOUT_S = 10.0
+# The pause before accepting again while this process is out of descriptors.
+_ACCEPT_RETRY_S = 0.05
+
+
+class HandoffError(Exception):
+    """A control connection did not carry a handoff: refused, and the `Receiver` serves on."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,35 +132,79 @@ class Handoff:
         self.guest_port = guest_port
         self.listener = listener
         self.control = control
+        # close() frees the descriptors only once no accept() is polling them, so none polls a reused number.
+        self._lock = threading.Lock()
+        self._waiting = 0
+        self._closing = False
 
     def accept(self) -> socket.socket | None:
         """Wait for the guest's next connection.
 
         Returns:
-            The connection, blocking. None once the launch has ended: a connection
-            that arrived and was not yet taken by then is closed with the listener.
+            The connection, blocking. None once the launch has ended, or the
+            handoff was closed: a connection that arrived and was not yet taken by
+            then is closed with the listener.
 
         Raises:
             ValueError: If postern sent anything more on the control connection.
         """
+        with self._lock:
+            if self._closing:
+                return None
+            self._waiting += 1
+        try:
+            return self._wait()
+        finally:
+            with self._lock:
+                self._waiting -= 1
+                release = self._closing and not self._waiting
+            if release:
+                self._release()
+
+    def _wait(self) -> socket.socket | None:
         poller = select.poll()
         poller.register(self.listener, select.POLLIN)
         poller.register(self.control, select.POLLIN)
         while True:
-            ready = {fd for fd, _ in poller.poll()}
-            if self.control.fileno() in ready:
+            events = dict(poller.poll())
+            if self._closing:
+                return None
+            if self.control.fileno() in events:
                 if self.control.recv(1):
                     raise ValueError('unexpected bytes on a port forward control connection')
                 return None
-            try:
-                connection, _ = self.listener.accept()
-            except BlockingIOError:
-                continue  # taken by another thread accepting on the same listener
-            connection.setblocking(True)
-            return connection
+            connection = self._try_accept()
+            if connection is not None:
+                return connection
+
+    def _try_accept(self) -> socket.socket | None:
+        """The next connection, or None to wait again."""
+        try:
+            connection, _ = self.listener.accept()
+        except (BlockingIOError, ConnectionAbortedError):
+            return None  # taken by another thread, or the guest's dial died in the handshake
+        except OSError as exc:
+            if exc.errno not in (errno.EMFILE, errno.ENFILE):
+                raise
+            time.sleep(_ACCEPT_RETRY_S)  # out of descriptors here; the guest's dial waits in the backlog
+            return None
+        connection.setblocking(True)
+        return connection
 
     def close(self) -> None:
-        """Close the listener and the control connection. Idempotent."""
+        """Close the listener and the control connection, ending any :meth:`accept` waiting on them. Idempotent."""
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            # poll() does not wake for a descriptor closed under it; end of stream on the control connection does.
+            with contextlib.suppress(OSError):
+                self.control.shutdown(socket.SHUT_RDWR)
+            release = not self._waiting
+        if release:
+            self._release()
+
+    def _release(self) -> None:
         self.listener.close()
         self.control.close()
 
@@ -143,16 +218,18 @@ class Handoff:
 class Receiver:
     """A handler's control socket: where postern hands it each launch's listener.
 
-    Binds ``path`` on construction, with the process's umask; the caller decides
-    who may reach it through the directory it lies in. Use it as a context
+    Binds ``path`` on construction and sets its ``mode``, 0600 by default: postern
+    connects as the worker, so widen it only for a worker at another uid. The
+    directory it lies in decides who may reach it as well. Use it as a context
     manager, or call :meth:`close`, which also removes the socket file.
     """
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(self, path: str | os.PathLike[str], *, mode: int = 0o600) -> None:
         self.path = os.fspath(path)
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self._socket.bind(self.path)
+            os.chmod(self.path, mode)
             self._socket.listen()
         except BaseException:
             self._socket.close()
@@ -165,19 +242,38 @@ class Receiver:
             The launch's `Handoff`, which the caller now owns.
 
         Raises:
-            ValueError: If the control connection did not carry exactly one
-                listening TCP socket and a guest port.
-            TimeoutError: If it carried nothing within a bounded time.
+            HandoffError: If a control connection did not carry exactly one
+                listening TCP socket and a guest port within a bounded time, or
+                failed while it was read. Only that connection is refused.
+            OSError: If the receiver itself cannot accept: closed, say. Running
+                out of descriptors is waited out, not raised.
         """
-        control, _ = self._socket.accept()
+        control = self._accept()
         try:
             control.settimeout(_HANDOFF_TIMEOUT_S)
             handoff = _take(control)
             control.settimeout(None)
-            return handoff
+        except (ValueError, OSError) as exc:
+            control.close()
+            raise HandoffError(f'refused a control connection: {exc}') from exc
         except BaseException:
             control.close()
             raise
+        return handoff
+
+    def _accept(self) -> socket.socket:
+        while True:
+            try:
+                control, _ = self._socket.accept()
+            except ConnectionAbortedError:
+                continue
+            except OSError as exc:
+                if exc.errno not in (errno.EMFILE, errno.ENFILE):
+                    raise
+                # Out of descriptors, which guests' connections can cause: wait, not end every launch's handoffs.
+                time.sleep(_ACCEPT_RETRY_S)
+                continue
+            return control
 
     def close(self) -> None:
         """Stop listening and remove the socket file. Idempotent."""
@@ -195,11 +291,22 @@ class Receiver:
 def _take(control: socket.socket) -> Handoff:
     """Read one handoff from ``control``: a guest port and its listener."""
     message, fds, cut = _process.recv_fds(control, _MAX_MESSAGE, 1)
-    if len(fds) != 1 or cut or not message.isdigit() or _more_queued(control):
+    try:
+        port = int(message) if message.isdigit() else 0
+        malformed = len(fds) != 1 or cut or not 1 <= port <= 65535 or _more_queued(control)
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
+    if malformed:
         for fd in fds:
             os.close(fd)
         raise ValueError(f'malformed port forward handoff: {message!r} with {len(fds)} descriptors')
-    listener = socket.socket(fileno=fds[0])
+    try:
+        listener = socket.socket(fileno=fds[0])
+    except OSError:
+        os.close(fds[0])
+        raise
     if (
         listener.family not in (socket.AF_INET, socket.AF_INET6)
         or listener.type != socket.SOCK_STREAM
@@ -208,7 +315,7 @@ def _take(control: socket.socket) -> Handoff:
         listener.close()
         raise ValueError('a port forward handoff carried something other than a listening TCP socket')
     listener.setblocking(False)
-    return Handoff(int(message), listener, control)
+    return Handoff(port, listener, control)
 
 
 def _more_queued(control: socket.socket) -> bool:

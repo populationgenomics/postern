@@ -5,11 +5,14 @@ from __future__ import annotations
 import array
 import pathlib
 import socket
+import stat
+import threading
+import time
 
 import pytest
 
 from postern import Sandbox, forward
-from postern.forward import PortForward, Receiver, hand_over
+from postern.forward import HandoffError, PortForward, Receiver, hand_over
 
 
 @pytest.mark.parametrize('port', [0, 65536, -1])
@@ -47,8 +50,8 @@ def test_a_handoff_delivers_the_listener_and_ends_at_the_launch_end(tmp_path: pa
 
 @pytest.mark.parametrize(
     ('message', 'with_listener'),
-    [(b'8080', False), (b'port', True), (b'', True)],
-    ids=['no-descriptor', 'not-a-port', 'empty'],
+    [(b'8080', False), (b'port', True), (b'', True), (b'0', True), (b'65536', True)],
+    ids=['no-descriptor', 'not-a-port', 'empty', 'port-zero', 'port-too-high'],
 )
 def test_a_malformed_handoff_is_refused(tmp_path: pathlib.Path, message: bytes, with_listener: bool):
     with (
@@ -59,14 +62,14 @@ def test_a_malformed_handoff_is_refused(tmp_path: pathlib.Path, message: bytes, 
         control.connect(receiver.path)
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
         control.sendmsg([message] if message else [b'\0'], fds if with_listener else [])
-        with pytest.raises(ValueError, match='malformed port forward handoff'):
+        with pytest.raises(HandoffError, match='malformed port forward handoff'):
             receiver.receive()
 
 
 def test_a_handoff_of_something_other_than_a_listener_is_refused(tmp_path: pathlib.Path):
     with Receiver(tmp_path / 'h.sock') as receiver, socket.socket() as not_listening:
         hand_over(PortForward(8080, receiver.path), not_listening, timeout=5).close()
-        with pytest.raises(ValueError, match='listening TCP socket'):
+        with pytest.raises(HandoffError, match='listening TCP socket'):
             receiver.receive()
 
 
@@ -86,7 +89,7 @@ def test_a_handoff_with_bytes_past_the_port_is_refused(tmp_path: pathlib.Path):
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
         control.sendmsg([b'8080'], fds)
         control.sendall(b'more')
-        with pytest.raises(ValueError, match='malformed port forward handoff'):
+        with pytest.raises(HandoffError, match='malformed port forward handoff'):
             receiver.receive()
 
 
@@ -95,7 +98,7 @@ def test_a_handoff_of_a_unix_listener_is_refused(tmp_path: pathlib.Path):
         unix.bind(str(tmp_path / 'other.sock'))
         unix.listen()
         hand_over(PortForward(8080, receiver.path), unix, timeout=5).close()
-        with pytest.raises(ValueError, match='listening TCP socket'):
+        with pytest.raises(HandoffError, match='listening TCP socket'):
             receiver.receive()
 
 
@@ -103,5 +106,39 @@ def test_a_silent_control_connection_times_out(tmp_path: pathlib.Path, monkeypat
     monkeypatch.setattr(forward, '_HANDOFF_TIMEOUT_S', 0.2)
     with Receiver(tmp_path / 'h.sock') as receiver, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
         control.connect(receiver.path)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(HandoffError, match='timed out'):
             receiver.receive()
+
+
+def test_a_receiver_serves_on_after_refusing_a_connection(tmp_path: pathlib.Path):
+    with Receiver(tmp_path / 'h.sock') as receiver, socket.create_server(('127.0.0.1', 0)) as listener:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bad:
+            bad.connect(receiver.path)
+            bad.sendall(b'junk')
+            with pytest.raises(HandoffError):
+                receiver.receive()
+        hand_over(PortForward(8080, receiver.path), listener, timeout=5)
+        with receiver.receive() as handoff:
+            assert handoff.guest_port == 8080
+
+
+def test_the_control_socket_admits_only_its_owner_by_default(tmp_path: pathlib.Path):
+    with Receiver(tmp_path / 'h.sock'):
+        assert stat.S_IMODE((tmp_path / 'h.sock').stat().st_mode) == 0o600
+    with Receiver(tmp_path / 'w.sock', mode=0o660):
+        assert stat.S_IMODE((tmp_path / 'w.sock').stat().st_mode) == 0o660
+
+
+def test_closing_a_handoff_ends_an_accept_waiting_on_it(tmp_path: pathlib.Path):
+    with Receiver(tmp_path / 'h.sock') as receiver, socket.create_server(('127.0.0.1', 0)) as listener:
+        control = hand_over(PortForward(8080, receiver.path), listener, timeout=5)
+        handoff = receiver.receive()
+        result: list[object] = []
+        waiter = threading.Thread(target=lambda: result.append(handoff.accept()))
+        waiter.start()
+        time.sleep(0.2)
+        handoff.close()
+        waiter.join(5)
+        control.close()
+        assert not waiter.is_alive()
+        assert result == [None]

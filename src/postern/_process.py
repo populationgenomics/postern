@@ -119,6 +119,9 @@ def recv_fds(channel: socket.socket, bufsize: int, maxfds: int) -> tuple[bytes, 
     for level, kind, data in ancillary:
         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
             fds.frombytes(data[: len(data) - len(data) % fds.itemsize])
+    if not flags:
+        for fd in fds:
+            os.set_inheritable(fd, False)
     return message, list(fds), bool(msg_flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC))
 
 
