@@ -97,10 +97,9 @@ if typing.TYPE_CHECKING:
 
 # The longest launch token a caller may give.
 MAX_TOKEN = 256
-# What postern sends on a control connection, as one message with the listener: this header (the format's version,
-# the guest port and the token's length), then the token.
-_FRAME_HEADER = struct.Struct('>BHH')
-_VERSION = 1
+# What postern sends on a control connection, as one message with the listener: this header (the guest port and the
+# token's length), then the token.
+_FRAME_HEADER = struct.Struct('>HH')
 # How long a control connection may take to deliver its handoff; postern sends it whole on connecting.
 _HANDOFF_TIMEOUT_S = 10.0
 # The pause before accepting again while this process is out of descriptors.
@@ -358,8 +357,8 @@ def _frame(message: bytes) -> tuple[int, bytes] | None:
     """The guest port and token of a handoff ``message``, or None if it is not one of this format."""
     if len(message) < _FRAME_HEADER.size:
         return None
-    version, port, length = _FRAME_HEADER.unpack_from(message)
-    if version != _VERSION or not 1 <= port <= 65535 or len(message) != _FRAME_HEADER.size + length:
+    port, length = _FRAME_HEADER.unpack_from(message)
+    if not 1 <= port <= 65535 or len(message) != _FRAME_HEADER.size + length:
         return None
     return port, message[_FRAME_HEADER.size :]
 
@@ -402,7 +401,7 @@ def hand_over(forward: PortForward, listener: socket.socket, *, timeout: float, 
             ``timeout`` seconds.
     """
     check_token(token)
-    frame = _FRAME_HEADER.pack(_VERSION, forward.guest_port, len(token)) + token
+    frame = _FRAME_HEADER.pack(forward.guest_port, len(token)) + token
     control = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
         control.settimeout(timeout)

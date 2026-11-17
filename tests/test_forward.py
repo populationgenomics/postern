@@ -50,31 +50,27 @@ def test_a_handoff_delivers_the_listener_and_ends_at_the_launch_end(tmp_path: pa
             assert handoff.accept() is None
 
 
-def _message(port: int, token: bytes = b'', *, version: int = 1, length: int | None = None) -> bytes:
-    """A hand-over message as postern frames it, with each field open to corruption."""
+def _message(port: int, token: bytes = b'', *, length: int | None = None) -> bytes:
+    """A hand-over message as postern frames it, with its stated token length open to corruption."""
     stated = len(token) if length is None else length
-    return bytes([version]) + port.to_bytes(2, 'big') + stated.to_bytes(2, 'big') + token
+    return port.to_bytes(2, 'big') + stated.to_bytes(2, 'big') + token
 
 
 @pytest.mark.parametrize(
     ('message', 'with_listener'),
     [
         (_message(8080), False),
-        (b'8080', True),
         (b'', True),
         (_message(0), True),
-        (_message(8080, version=2), True),
-        (_message(8080)[:4], True),
+        (_message(8080)[:3], True),
         (_message(8080, b'abc', length=2), True),
         (_message(8080, b'abc', length=4), True),
         (_message(8080, bytes(257)), True),
     ],
     ids=[
         'no-descriptor',
-        'unversioned-0.7.0-message',
         'empty',
         'port-zero',
-        'unknown-version',
         'cut-header',
         'token-longer-than-stated',
         'token-shorter-than-stated',
