@@ -52,11 +52,6 @@ import tarfile
 import typing
 from collections.abc import Iterator
 
-if typing.TYPE_CHECKING:
-    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
-    # the floor is 3.10, so the backport must stay behind this guard.
-    from typing_extensions import Self
-
 # The anchor is host-trusted, so a symlinked prefix reaching it is fine; every
 # component below it is opened O_NOFOLLOW.
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
@@ -165,7 +160,7 @@ class Workspace:
             os.close(self._fd)
             self._fd = None
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:

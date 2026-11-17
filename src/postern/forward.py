@@ -90,11 +90,6 @@ import typing
 
 from postern import _process
 
-if typing.TYPE_CHECKING:
-    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
-    # the floor is 3.10, so the backport must stay behind this guard.
-    import typing_extensions
-
 MAX_TOKEN = 256
 # What postern sends on a control connection, as one message with the listener: this header (the guest port and the
 # token's length), then the token.
@@ -242,7 +237,7 @@ class Handoff:
         self.listener.close()
         self.control.close()
 
-    def __enter__(self) -> typing_extensions.Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -357,7 +352,7 @@ class Receiver:
         if release:
             self._socket.close()
 
-    def __enter__(self) -> typing_extensions.Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
