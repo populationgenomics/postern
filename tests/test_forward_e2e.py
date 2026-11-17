@@ -49,8 +49,9 @@ class _Echo:
         self.tag = tag
         self.handoffs: list[Handoff] = []
         self.ended: list[int] = []
-        self._thread = threading.Thread(target=self._receive, daemon=True)
-        self._thread.start()
+        self.serving: list[threading.Thread] = []
+        self.receiving = threading.Thread(target=self._receive, daemon=True)
+        self.receiving.start()
 
     def _receive(self) -> None:
         while True:
@@ -61,7 +62,9 @@ class _Echo:
             except OSError:
                 return  # the receiver was closed
             self.handoffs.append(handoff)
-            threading.Thread(target=self._serve, args=(handoff,), daemon=True).start()
+            serving = threading.Thread(target=self._serve, args=(handoff,), daemon=True)
+            self.serving.append(serving)
+            serving.start()
 
     def _serve(self, handoff: Handoff) -> None:
         with handoff:
@@ -71,7 +74,7 @@ class _Echo:
                     while chunk := conn.recv(4096):
                         data += chunk
                     conn.sendall(f'{self.tag}:'.encode() + data)
-            self.ended.append(handoff.guest_port)
+        self.ended.append(handoff.guest_port)  # closed: its descriptors are free
 
 
 @pytest.fixture
@@ -86,6 +89,10 @@ def echo(tmp_path: pathlib.Path) -> Iterator[Callable[[str], _Echo]]:
     yield make
     for handler in handlers:
         handler.receiver.close()
+        # A handler thread outliving its test closes descriptors under the next one's feet.
+        for serving in handler.serving:
+            serving.join(10)
+            assert not serving.is_alive(), 'a handoff outlived its launch'
 
 
 def _client(*ports: int) -> list[str]:
@@ -134,7 +141,6 @@ def _aexited_ok(starting) -> bool:
     return asyncio.run(main())
 
 
-# Each launch method, given a token: what it ran succeeded.
 _LAUNCHES = {
     'run': lambda s, t: s.run(['true'], timeout=30, launch_token=t).ok,
     'run_bash': lambda s, t: s.run_bash('true', timeout=30, launch_token=t).ok,

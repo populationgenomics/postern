@@ -329,7 +329,7 @@ def test_a_failed_start_leaves_no_guest(sandbox, monkeypatch):
 
     monkeypatch.setattr(_process.Process, '__init__', fail)
     with pytest.raises(RuntimeError, match='boom'):
-        sandbox._start(['bash', '-c', _SURVIVOR], resources=resources)
+        sandbox._start(['bash', '-c', _SURVIVOR], resources=resources, launch_token=b'')
     assert closed.is_set()
     _assert_no_survivor(sandbox)
 

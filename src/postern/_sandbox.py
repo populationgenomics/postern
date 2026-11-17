@@ -1114,7 +1114,7 @@ class Sandbox:
         resources: contextlib.ExitStack,
         setenv: dict[str, str] | None = None,
         extra_binds: list[str] | None = None,
-        launch_token: bytes = b'',
+        launch_token: bytes,
     ) -> _process.Process:
         """Launch ``argv`` under bwrap and hand back the running :class:`Process`.
 
@@ -1200,9 +1200,7 @@ class Sandbox:
             )
         return str(_PACKAGED_INIT)
 
-    def _supervised(
-        self, work_argv: list[str], *, code: str | None = None, launch_token: bytes = b''
-    ) -> _process.Process:
+    def _supervised(self, work_argv: list[str], *, code: str | None = None, launch_token: bytes) -> _process.Process:
         """Start ``work_argv`` under the guest's init, with every hatch bound and served.
 
         The one funnel behind :meth:`run`, :meth:`run_bash` and :meth:`run_python`.

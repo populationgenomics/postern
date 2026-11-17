@@ -332,7 +332,7 @@ on it directly. No byte passes through postern or a relay in the guest. Per laun
    launch's forwards, fails the launch before the guest runs. A guest that dies in bwrap's setup first is reported as
    any launch's is, with bwrap's own error.
 4. When the run is closed, postern closes the launch's control connections, which
-   reach end of stream at the handler: `Handoff.accept()` returns `None`. A
+   the handler sees closed: `Handoff.accept()` returns `None`. A
    namespace that goes away does not close a socket in it, so this is the
    handler's only signal.
 

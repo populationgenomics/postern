@@ -40,7 +40,7 @@ launch's listener for good.
 and the control connection, and accepts from the listener once a connection waits
 there. A handler on an event loop uses neither: it registers `Handoff.listener`
 with its loop to accept connections, and `Handoff.control` to learn the launch
-has ended (end of stream), then closes the handoff.
+has ended (postern closed it), then closes the handoff.
 
 Trust model
 -----------
@@ -95,7 +95,6 @@ if typing.TYPE_CHECKING:
     # the floor is 3.10, so the backport must stay behind this guard.
     import typing_extensions
 
-# The longest launch token a caller may give.
 MAX_TOKEN = 256
 # What postern sends on a control connection, as one message with the listener: this header (the guest port and the
 # token's length), then the token.
@@ -143,8 +142,8 @@ class Handoff:
             token: it names the launch for a handler, and proves nothing.
         listener: The listening socket, in the guest's network namespace,
             non-blocking. Readable when a guest connection waits to be accepted.
-        control: The launch's control connection. Readable, at end of stream, when
-            the launch ends. An event loop watches it for that, and the listener
+        control: The launch's control connection. Readable, closed by postern,
+            when the launch ends. An event loop watches it for that, and the listener
             for connections, in place of :meth:`accept`.
     """
 
@@ -179,7 +178,7 @@ class Handoff:
             then is closed with the listener.
 
         Raises:
-            ValueError: If postern sent anything more on the control connection.
+            ValueError: If a message followed the handoff on the control connection.
         """
         with self._lock:
             if self._closing:
@@ -203,8 +202,8 @@ class Handoff:
             if self._closing:
                 return None
             if self.control.fileno() in events:
-                if self.control.recv(1):
-                    raise ValueError('unexpected bytes on a port forward control connection')
+                if _more_queued(self.control):
+                    raise ValueError('unexpected message on a port forward control connection')
                 return None
             connection = self._try_accept()
             if connection is not None:
@@ -230,7 +229,7 @@ class Handoff:
             if self._closing:
                 return
             self._closing = True
-            # poll() does not wake for a descriptor closed under it; end of stream on the control connection does.
+            # poll() does not wake for a descriptor closed under it; a hang-up on the control connection does.
             with contextlib.suppress(OSError):
                 self.control.shutdown(socket.SHUT_RDWR)
             release = not self._waiting
@@ -251,15 +250,16 @@ class Handoff:
 class Receiver:
     """A handler's control socket: where postern hands it each launch's listener.
 
-    Binds ``path`` on construction and sets its ``mode``, 0600 by default: postern
-    connects as the worker, so widen it only for a worker at another uid. The
-    directory it lies in decides who may reach it as well. Use it as a context
-    manager, or call :meth:`close`, which also removes the socket file.
+    An ``AF_UNIX`` ``SOCK_SEQPACKET`` socket, so a handoff arrives as one message,
+    whole or not at all; a stream connection is refused. Binds ``path`` on
+    construction and sets its ``mode``, 0600 by default: postern connects as the
+    worker, so widen it only for a worker at another uid. The directory it lies in
+    decides who may reach it as well. Use it as a context manager, or call
+    :meth:`close`, which also removes the socket file.
     """
 
     def __init__(self, path: str | os.PathLike[str], *, mode: int = 0o600) -> None:
         self.path = os.fspath(path)
-        # Seqpacket: a handoff is one message, whole or refused, with no framing to reassemble.
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             self._socket.bind(self.path)
@@ -327,16 +327,16 @@ def _take(control: socket.socket) -> Handoff:
     """Read one handoff from ``control``: a guest port, the launch's token and its listener."""
     received, fds, cut = _process.recv_fds(control, _FRAME_HEADER.size + MAX_TOKEN, 1)
     try:
-        frame = None if len(fds) != 1 or cut or _more_queued(control) else _frame(received)
+        parsed = None if len(fds) != 1 or cut or _more_queued(control) else _parse(received)
     except BaseException:
         for fd in fds:
             os.close(fd)
         raise
-    if frame is None:
+    if parsed is None:
         for fd in fds:
             os.close(fd)
         raise ValueError(f'malformed port forward handoff: {len(received)} bytes with {len(fds)} descriptors')
-    port, token = frame
+    port, token = parsed
     try:
         listener = socket.socket(fileno=fds[0])
     except OSError:
@@ -353,7 +353,7 @@ def _take(control: socket.socket) -> Handoff:
     return Handoff(port, listener, control, token=token)
 
 
-def _frame(message: bytes) -> tuple[int, bytes] | None:
+def _parse(message: bytes) -> tuple[int, bytes] | None:
     """The guest port and token of a handoff ``message``, or None if it is not one of this format."""
     if len(message) < _FRAME_HEADER.size:
         return None
@@ -377,16 +377,15 @@ def check_token(token: bytes) -> None:
 
 
 def _more_queued(control: socket.socket) -> bool:
-    """Whether ``control`` holds bytes past the handoff: postern sends nothing more."""
-    # Non-blocking for the peek: under a timeout, Python waits for readability before recv whatever its flags.
-    timeout = control.gettimeout()
-    control.setblocking(False)
-    try:
-        return bool(control.recv(1, socket.MSG_PEEK))
-    except BlockingIOError:
+    """Whether a message waits on ``control`` past the handoff, which postern never sends."""
+    poller = select.poll()
+    poller.register(control, select.POLLIN)
+    events = sum(revents for _, revents in poller.poll(0))
+    if not events & select.POLLIN:
         return False
-    finally:
-        control.settimeout(timeout)
+    if not events & select.POLLHUP:
+        return True  # postern holds its end, so this is a message: an empty one reads as b'', as a hang-up does
+    return bool(control.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT))
 
 
 def hand_over(forward: PortForward, listener: socket.socket, *, timeout: float, token: bytes = b'') -> socket.socket:
@@ -401,14 +400,14 @@ def hand_over(forward: PortForward, listener: socket.socket, *, timeout: float, 
             ``timeout`` seconds.
     """
     check_token(token)
-    frame = _FRAME_HEADER.pack(forward.guest_port, len(token)) + token
+    message = _FRAME_HEADER.pack(forward.guest_port, len(token)) + token
     control = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
         control.settimeout(timeout)
         try:
             control.connect(os.fspath(forward.handler))
             control.sendmsg(  # one seqpacket message: sent whole or not at all
-                [frame],
+                [message],
                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))],
             )
         except OSError as exc:

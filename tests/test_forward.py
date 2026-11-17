@@ -7,6 +7,7 @@ import asyncio
 import pathlib
 import socket
 import stat
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,8 @@ import pytest
 
 from postern import Sandbox, SandboxProfile, forward
 from postern.forward import Handoff, HandoffError, PortForward, Receiver, hand_over
+
+pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='control sockets are Linux AF_UNIX SOCK_SEQPACKET')
 
 
 @pytest.mark.parametrize('port', [0, 65536, -1])
@@ -85,7 +88,7 @@ def test_a_malformed_handoff_is_refused(tmp_path: pathlib.Path, message: bytes, 
     ):
         control.connect(receiver.path)
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
-        control.sendmsg([message] if message else [b'\0'], fds if with_listener else [])
+        control.sendmsg([message], fds if with_listener else [])
         with pytest.raises(HandoffError, match='malformed port forward handoff'):
             receiver.receive()
 
@@ -103,7 +106,8 @@ def test_closing_the_receiver_removes_its_socket(tmp_path: pathlib.Path):
     assert not path.exists()
 
 
-def test_a_handoff_with_bytes_past_its_frame_is_refused(tmp_path: pathlib.Path):
+@pytest.mark.parametrize('extra', [b'more', b''], ids=['bytes', 'empty-message'])
+def test_a_handoff_with_a_message_past_its_frame_is_refused(tmp_path: pathlib.Path, extra: bytes):
     with (
         Receiver(tmp_path / 'h.sock') as receiver,
         socket.create_server(('127.0.0.1', 0)) as listener,
@@ -112,7 +116,7 @@ def test_a_handoff_with_bytes_past_its_frame_is_refused(tmp_path: pathlib.Path):
         control.connect(receiver.path)
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
         control.sendmsg([_message(8080)], fds)
-        control.sendall(b'more')
+        control.send(extra)
         with pytest.raises(HandoffError, match='malformed port forward handoff'):
             receiver.receive()
 
@@ -141,8 +145,7 @@ def test_a_receiver_serves_on_after_refusing_a_connection(tmp_path: pathlib.Path
             bad.sendall(b'junk')
             with pytest.raises(HandoffError):
                 receiver.receive()
-        hand_over(PortForward(8080, receiver.path), listener, timeout=5)
-        with receiver.receive() as handoff:
+        with hand_over(PortForward(8080, receiver.path), listener, timeout=5), receiver.receive() as handoff:
             assert handoff.guest_port == 8080
 
 
@@ -151,6 +154,18 @@ def test_the_control_socket_admits_only_its_owner_by_default(tmp_path: pathlib.P
         assert stat.S_IMODE((tmp_path / 'h.sock').stat().st_mode) == 0o600
     with Receiver(tmp_path / 'w.sock', mode=0o660):
         assert stat.S_IMODE((tmp_path / 'w.sock').stat().st_mode) == 0o660
+
+
+def test_an_empty_message_during_a_launch_is_not_its_end(tmp_path: pathlib.Path):
+    with (
+        Receiver(tmp_path / 'h.sock') as receiver,
+        socket.create_server(('127.0.0.1', 0)) as listener,
+        hand_over(PortForward(8080, receiver.path), listener, timeout=5) as control,
+        receiver.receive() as handoff,
+    ):
+        control.send(b'')
+        with pytest.raises(ValueError, match='unexpected message'):
+            handoff.accept()
 
 
 def test_closing_a_handoff_ends_an_accept_waiting_on_it(tmp_path: pathlib.Path):
@@ -172,7 +187,7 @@ async def _serve_in_a_loop(
     handoff: Handoff, handle: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 ) -> None:
     # The event-loop pattern the README shows: the listener into asyncio's server,
-    # the control connection's end of stream as the launch's end.
+    # the control connection's hang-up as the launch's end.
     loop = asyncio.get_running_loop()
     ended = loop.create_future()
     loop.add_reader(handoff.control, lambda: ended.done() or ended.set_result(None))
