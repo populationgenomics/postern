@@ -106,23 +106,43 @@ def test_closing_the_receiver_removes_its_socket(tmp_path: pathlib.Path):
     assert not path.exists()
 
 
-def test_closing_a_receiver_ends_a_receive_waiting_on_it(tmp_path: pathlib.Path):
-    receiver = Receiver(tmp_path / 'h.sock')
+def _receive_in_a_thread(receiver: Receiver) -> tuple[threading.Thread, list[BaseException]]:
     raised: list[BaseException] = []
 
     def receive() -> None:
         try:
             receiver.receive()
-        except OSError as exc:
+        except BaseException as exc:  # noqa: BLE001 — the test asserts on what was raised
             raised.append(exc)
 
     waiter = threading.Thread(target=receive)
     waiter.start()
-    time.sleep(0.2)
-    receiver.close()
-    waiter.join(5)
-    assert not waiter.is_alive()
-    assert len(raised) == 1
+    return waiter, raised
+
+
+def test_closing_a_receiver_ends_a_receive_waiting_on_it(tmp_path: pathlib.Path):
+    with Receiver(tmp_path / 'h.sock') as receiver:
+        waiter, raised = _receive_in_a_thread(receiver)
+        time.sleep(0.2)
+        receiver.close()
+        waiter.join(5)
+        assert not waiter.is_alive()
+        assert [type(exc) for exc in raised] == [OSError]
+
+
+def test_a_handoff_from_a_peer_that_half_closes_is_taken_and_ends_at_the_half_close(tmp_path: pathlib.Path):
+    with (
+        Receiver(tmp_path / 'h.sock') as receiver,
+        socket.create_server(('127.0.0.1', 0)) as listener,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control,
+    ):
+        control.connect(receiver.path)
+        fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
+        control.sendmsg([_message(8080, b'launch-17')], fds)
+        control.shutdown(socket.SHUT_WR)
+        with receiver.receive() as handoff:
+            assert handoff.token == b'launch-17'
+            assert handoff.accept() is None
 
 
 @pytest.mark.parametrize('extra', [b'more', b''], ids=['bytes', 'empty-message'])
@@ -260,20 +280,21 @@ def test_a_handoff_carries_the_token_it_was_sent_with(tmp_path: pathlib.Path, to
     ids=['str', 'bytearray', 'too-long'],
 )
 def test_a_launch_refuses_a_bad_token_before_it_starts(
-    tmp_path: pathlib.Path, token: object, error: type, with_forwards: bool
+    tmp_path: pathlib.Path, token: object, error: type[Exception], with_forwards: bool
 ):
     forwards = [PortForward(8080, tmp_path / 'never-bound.sock')] if with_forwards else []
-    sandbox = Sandbox(SandboxProfile(), forwards=forwards)
-    with pytest.raises(error, match='launch token'):
-        sandbox.start(['true'], launch_token=token)  # type: ignore[arg-type]
+    with Sandbox(SandboxProfile(), forwards=forwards) as sandbox, pytest.raises(error, match='launch token'):
+        sandbox.start(['true'], launch_token=token)  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.parametrize(
     ('token', 'error'), [('launch-17', TypeError), (bytes(70000), ValueError)], ids=['str', 'huge']
 )
-def test_hand_over_refuses_a_bad_token_before_it_connects(tmp_path: pathlib.Path, token: object, error: type):
+def test_hand_over_refuses_a_bad_token_before_it_connects(
+    tmp_path: pathlib.Path, token: object, error: type[Exception]
+):
     with socket.create_server(('127.0.0.1', 0)) as listener, pytest.raises(error, match='launch token'):
-        hand_over(PortForward(8080, tmp_path / 'never-bound.sock'), listener, timeout=5, token=token)  # type: ignore[arg-type]
+        hand_over(PortForward(8080, tmp_path / 'never-bound.sock'), listener, timeout=5, token=token)  # pyright: ignore[reportArgumentType]
 
 
 def test_a_handoff_split_over_two_messages_is_refused(tmp_path: pathlib.Path):
@@ -302,6 +323,6 @@ def test_a_stream_connection_cannot_reach_the_control_socket(tmp_path: pathlib.P
 @pytest.mark.parametrize(
     ('token', 'error'), [('launch-17', TypeError), (bytes(257), ValueError)], ids=['str', 'too-long']
 )
-def test_a_handoff_refuses_a_bad_token(token: object, error: type):
+def test_a_handoff_refuses_a_bad_token(token: object, error: type[Exception]):
     with socket.socket() as listener, socket.socket() as control, pytest.raises(error, match='launch token'):
-        Handoff(8080, listener, control, token=token)  # type: ignore[arg-type]
+        Handoff(8080, listener, control, token=token)  # pyright: ignore[reportArgumentType]

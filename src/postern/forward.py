@@ -101,6 +101,8 @@ MAX_TOKEN = 256
 _FRAME_HEADER = struct.Struct('>HH')
 # How long a control connection may take to deliver its handoff; postern sends it whole on connecting.
 _HANDOFF_TIMEOUT_S = 10.0
+# Linux's: a peer's shutdown(SHUT_WR), which a hang-up's POLLHUP does not report.
+_POLLRDHUP = typing.cast('int', getattr(select, 'POLLRDHUP', 0))
 # The pause before accepting again while this process is out of descriptors.
 _ACCEPT_RETRY_S = 0.05
 
@@ -331,14 +333,12 @@ def _take(control: socket.socket) -> Handoff:
     received, fds, cut = _process.recv_fds(control, _FRAME_HEADER.size + MAX_TOKEN, 1)
     try:
         parsed = None if len(fds) != 1 or cut or _more_queued(control) else _parse(received)
+        if parsed is None:
+            raise ValueError(f'malformed port forward handoff: {len(received)} bytes with {len(fds)} descriptors')
     except BaseException:
         for fd in fds:
             os.close(fd)
         raise
-    if parsed is None:
-        for fd in fds:
-            os.close(fd)
-        raise ValueError(f'malformed port forward handoff: {len(received)} bytes with {len(fds)} descriptors')
     port, token = parsed
     try:
         listener = socket.socket(fileno=fds[0])
@@ -382,12 +382,14 @@ def check_token(token: bytes) -> None:
 def _more_queued(control: socket.socket) -> bool:
     """Whether a message waits on ``control`` past the handoff, which postern never sends."""
     poller = select.poll()
-    poller.register(control, select.POLLIN)
+    poller.register(control, select.POLLIN | _POLLRDHUP)
     events = sum(revents for _, revents in poller.poll(0))
     if not events & select.POLLIN:
         return False
-    if not events & select.POLLHUP:
-        return True  # postern holds its end, so this is a message: an empty one reads as b'', as a hang-up does
+    if not events & (select.POLLHUP | _POLLRDHUP):
+        return True  # the peer can still send, so this is a message: an empty one reads as b'', as a hang-up does
+    # Hung up, so the launch has ended. An empty message before the hang-up cannot be told from it, and ends nothing
+    # that has not ended; one with bytes in it is refused.
     return bool(control.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT))
 
 
