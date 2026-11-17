@@ -67,6 +67,7 @@ def _message(port: int, token: bytes = b'', *, version: int = 1, length: int | N
         (_message(8080)[:4], True),
         (_message(8080, b'abc', length=2), True),
         (_message(8080, b'abc', length=4), True),
+        (_message(8080, bytes(257)), True),
     ],
     ids=[
         'no-descriptor',
@@ -77,13 +78,14 @@ def _message(port: int, token: bytes = b'', *, version: int = 1, length: int | N
         'cut-header',
         'token-longer-than-stated',
         'token-shorter-than-stated',
+        'token-past-the-longest',
     ],
 )
 def test_a_malformed_handoff_is_refused(tmp_path: pathlib.Path, message: bytes, with_listener: bool):
     with (
         Receiver(tmp_path / 'h.sock') as receiver,
         socket.create_server(('127.0.0.1', 0)) as listener,
-        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control,
     ):
         control.connect(receiver.path)
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
@@ -105,11 +107,11 @@ def test_closing_the_receiver_removes_its_socket(tmp_path: pathlib.Path):
     assert not path.exists()
 
 
-def test_a_handoff_with_bytes_past_the_port_is_refused(tmp_path: pathlib.Path):
+def test_a_handoff_with_bytes_past_its_frame_is_refused(tmp_path: pathlib.Path):
     with (
         Receiver(tmp_path / 'h.sock') as receiver,
         socket.create_server(('127.0.0.1', 0)) as listener,
-        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control,
     ):
         control.connect(receiver.path)
         fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]
@@ -130,7 +132,7 @@ def test_a_handoff_of_a_unix_listener_is_refused(tmp_path: pathlib.Path):
 
 def test_a_silent_control_connection_times_out(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(forward, '_HANDOFF_TIMEOUT_S', 0.2)
-    with Receiver(tmp_path / 'h.sock') as receiver, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+    with Receiver(tmp_path / 'h.sock') as receiver, socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
         control.connect(receiver.path)
         with pytest.raises(HandoffError, match='timed out'):
             receiver.receive()
@@ -138,7 +140,7 @@ def test_a_silent_control_connection_times_out(tmp_path: pathlib.Path, monkeypat
 
 def test_a_receiver_serves_on_after_refusing_a_connection(tmp_path: pathlib.Path):
     with Receiver(tmp_path / 'h.sock') as receiver, socket.create_server(('127.0.0.1', 0)) as listener:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bad:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as bad:
             bad.connect(receiver.path)
             bad.sendall(b'junk')
             with pytest.raises(HandoffError):
@@ -221,13 +223,17 @@ def test_a_handoff_carries_the_token_it_was_sent_with(tmp_path: pathlib.Path, to
             assert handoff.guest_port == 8080
 
 
+@pytest.mark.parametrize('with_forwards', [True, False], ids=['forwards', 'no-forwards'])
 @pytest.mark.parametrize(
     ('token', 'error'),
     [('launch-17', TypeError), (bytearray(b'launch-17'), TypeError), (bytes(257), ValueError)],
     ids=['str', 'bytearray', 'too-long'],
 )
-def test_a_launch_refuses_a_bad_token_before_it_starts(tmp_path: pathlib.Path, token: object, error: type):
-    sandbox = Sandbox(SandboxProfile(), forwards=[PortForward(8080, tmp_path / 'never-bound.sock')])
+def test_a_launch_refuses_a_bad_token_before_it_starts(
+    tmp_path: pathlib.Path, token: object, error: type, with_forwards: bool
+):
+    forwards = [PortForward(8080, tmp_path / 'never-bound.sock')] if with_forwards else []
+    sandbox = Sandbox(SandboxProfile(), forwards=forwards)
     with pytest.raises(error, match='launch token'):
         sandbox.start(['true'], launch_token=token)  # type: ignore[arg-type]
 
@@ -238,3 +244,34 @@ def test_a_launch_refuses_a_bad_token_before_it_starts(tmp_path: pathlib.Path, t
 def test_hand_over_refuses_a_bad_token_before_it_connects(tmp_path: pathlib.Path, token: object, error: type):
     with socket.create_server(('127.0.0.1', 0)) as listener, pytest.raises(error, match='launch token'):
         hand_over(PortForward(8080, tmp_path / 'never-bound.sock'), listener, timeout=5, token=token)  # type: ignore[arg-type]
+
+
+def test_a_handoff_split_over_two_messages_is_refused(tmp_path: pathlib.Path):
+    frame = _message(8080, b'launch-17')
+    with (
+        Receiver(tmp_path / 'h.sock') as receiver,
+        socket.create_server(('127.0.0.1', 0)) as listener,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control,
+    ):
+        control.connect(receiver.path)
+        control.sendmsg([frame[:2]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))])
+        control.sendall(frame[2:])
+        with pytest.raises(HandoffError, match='malformed port forward handoff'):
+            receiver.receive()
+
+
+def test_a_stream_connection_cannot_reach_the_control_socket(tmp_path: pathlib.Path):
+    with (
+        Receiver(tmp_path / 'h.sock') as receiver,
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream,
+        pytest.raises(OSError, match='Protocol wrong type'),
+    ):
+        stream.connect(receiver.path)
+
+
+@pytest.mark.parametrize(
+    ('token', 'error'), [('launch-17', TypeError), (bytes(257), ValueError)], ids=['str', 'too-long']
+)
+def test_a_handoff_refuses_a_bad_token(token: object, error: type):
+    with socket.socket() as listener, socket.socket() as control, pytest.raises(error, match='launch token'):
+        Handoff(8080, listener, control, token=token)  # type: ignore[arg-type]

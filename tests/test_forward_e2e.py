@@ -121,12 +121,12 @@ def test_each_launch_hands_over_its_own_listener_and_ends_it(echo):
     _wait_for(lambda: handler.ended == [8080, 8080])
 
 
-def _started(process) -> bool:
+def _exited_ok(process) -> bool:
     with process:
         return process.communicate(30).ok
 
 
-def _astarted(starting) -> bool:
+def _aexited_ok(starting) -> bool:
     async def main():
         async with await starting as process:
             return (await process.communicate(30)).ok
@@ -139,12 +139,12 @@ _LAUNCHES = {
     'run': lambda s, t: s.run(['true'], timeout=30, launch_token=t).ok,
     'run_bash': lambda s, t: s.run_bash('true', timeout=30, launch_token=t).ok,
     'run_python': lambda s, t: s.run_python('pass', timeout=30, launch_token=t).ok,
-    'start': lambda s, t: _started(s.start(['true'], launch_token=t)),
-    'start_bash': lambda s, t: _started(s.start_bash('true', launch_token=t)),
-    'start_python': lambda s, t: _started(s.start_python('pass', launch_token=t)),
-    'astart': lambda s, t: _astarted(s.astart(['true'], launch_token=t)),
-    'astart_bash': lambda s, t: _astarted(s.astart_bash('true', launch_token=t)),
-    'astart_python': lambda s, t: _astarted(s.astart_python('pass', launch_token=t)),
+    'start': lambda s, t: _exited_ok(s.start(['true'], launch_token=t)),
+    'start_bash': lambda s, t: _exited_ok(s.start_bash('true', launch_token=t)),
+    'start_python': lambda s, t: _exited_ok(s.start_python('pass', launch_token=t)),
+    'astart': lambda s, t: _aexited_ok(s.astart(['true'], launch_token=t)),
+    'astart_bash': lambda s, t: _aexited_ok(s.astart_bash('true', launch_token=t)),
+    'astart_python': lambda s, t: _aexited_ok(s.astart_python('pass', launch_token=t)),
 }
 
 
@@ -153,7 +153,14 @@ def test_a_launch_hands_its_handler_the_token_the_caller_gave_it(echo, method):
     handler = echo('files')
     sandbox = Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)])
     assert _LAUNCHES[method](sandbox, b'launch-17')
+    # Nothing waited for the handler's threads, which also close the launch's sockets: left running, they could
+    # close a descriptor number a later test has reused.
+    _wait_for(lambda: handler.ended == [8080])
     assert [handoff.token for handoff in handler.handoffs] == [b'launch-17']
+
+
+def test_a_sandbox_without_forwards_runs_a_launch_given_a_token():
+    assert Sandbox(SandboxProfile()).run(['true'], timeout=30, launch_token=b'launch-17').ok
 
 
 def test_successive_launches_each_carry_their_own_token(echo):
@@ -161,6 +168,7 @@ def test_successive_launches_each_carry_their_own_token(echo):
     sandbox = Sandbox(SandboxProfile(), forwards=[PortForward(8080, handler.receiver.path)])
     assert sandbox.run(_client(8080), timeout=30, launch_token=b'first').ok
     assert sandbox.run(_client(8080), timeout=30).ok
+    _wait_for(lambda: handler.ended == [8080, 8080])
     assert [handoff.token for handoff in handler.handoffs] == [b'first', b'']
 
 

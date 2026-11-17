@@ -1225,7 +1225,7 @@ class Sandbox:
             TypeError: If ``launch_token`` is not bytes.
             ValueError: If ``launch_token`` is longer than `forward.MAX_TOKEN`.
         """
-        forward._checked_token(launch_token)  # noqa: SLF001 — validated before anything starts
+        forward.check_token(launch_token)
         binds, env = self._hatch_wiring()
         # Under --clearenv, guest code reading os.environ['POSTERN_HATCH'] would
         # raise KeyError with no hatch configured; seed it empty instead.

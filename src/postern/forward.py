@@ -83,6 +83,7 @@ import errno
 import os
 import select
 import socket
+import struct
 import threading
 import time
 import typing
@@ -96,11 +97,10 @@ if typing.TYPE_CHECKING:
 
 # The longest launch token a caller may give.
 MAX_TOKEN = 256
-# What postern sends on a control connection besides the listener: the format version (one byte), the guest port
-# and the token's length (two bytes each, network order), then the token.
+# What postern sends on a control connection, as one message with the listener: this header (the format's version,
+# the guest port and the token's length), then the token.
+_FRAME_HEADER = struct.Struct('>BHH')
 _VERSION = 1
-_HEADER = 5
-_MAX_MESSAGE = _HEADER + MAX_TOKEN
 # How long a control connection may take to deliver its handoff; postern sends it whole on connecting.
 _HANDOFF_TIMEOUT_S = 10.0
 # The pause before accepting again while this process is out of descriptors.
@@ -150,6 +150,13 @@ class Handoff:
     """
 
     def __init__(self, guest_port: int, listener: socket.socket, control: socket.socket, token: bytes = b'') -> None:
+        """Hold one launch's ``listener`` and ``control`` connection for ``guest_port``.
+
+        Raises:
+            TypeError: If ``token`` is not bytes.
+            ValueError: If ``token`` is longer than `MAX_TOKEN`.
+        """
+        check_token(token)
         self.guest_port = guest_port
         self.token = token
         self.listener = listener
@@ -253,7 +260,8 @@ class Receiver:
 
     def __init__(self, path: str | os.PathLike[str], *, mode: int = 0o600) -> None:
         self.path = os.fspath(path)
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # Seqpacket: a handoff is one message, whole or refused, with no framing to reassemble.
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             self._socket.bind(self.path)
             os.chmod(self.path, mode)
@@ -270,8 +278,9 @@ class Receiver:
 
         Raises:
             HandoffError: If a control connection did not carry exactly one
-                listening TCP socket and a guest port within a bounded time, or
-                failed while it was read. Only that connection is refused.
+                listening TCP socket and one whole frame of this format (guest
+                port and launch token) within a bounded time, or failed while it
+                was read. Only that connection is refused.
             OSError: If the receiver itself cannot accept: closed, say. Running
                 out of descriptors is waited out, not raised.
         """
@@ -317,20 +326,18 @@ class Receiver:
 
 def _take(control: socket.socket) -> Handoff:
     """Read one handoff from ``control``: a guest port, the launch's token and its listener."""
-    message, fds, cut = _process.recv_fds(control, _MAX_MESSAGE, 1)
+    received, fds, cut = _process.recv_fds(control, _FRAME_HEADER.size + MAX_TOKEN, 1)
     try:
-        whole = len(message) >= _HEADER and message[0] == _VERSION
-        port = int.from_bytes(message[1:3], 'big') if whole else 0
-        whole = whole and len(message) == _HEADER + int.from_bytes(message[3:_HEADER], 'big')
-        malformed = len(fds) != 1 or cut or not whole or not 1 <= port <= 65535 or _more_queued(control)
+        frame = None if len(fds) != 1 or cut or _more_queued(control) else _frame(received)
     except BaseException:
         for fd in fds:
             os.close(fd)
         raise
-    if malformed:
+    if frame is None:
         for fd in fds:
             os.close(fd)
-        raise ValueError(f'malformed port forward handoff: {len(message)} bytes with {len(fds)} descriptors')
+        raise ValueError(f'malformed port forward handoff: {len(received)} bytes with {len(fds)} descriptors')
+    port, token = frame
     try:
         listener = socket.socket(fileno=fds[0])
     except OSError:
@@ -344,11 +351,21 @@ def _take(control: socket.socket) -> Handoff:
         listener.close()
         raise ValueError('a port forward handoff carried something other than a listening TCP socket')
     listener.setblocking(False)
-    return Handoff(port, listener, control, token=message[_HEADER:])
+    return Handoff(port, listener, control, token=token)
 
 
-def _checked_token(token: bytes) -> bytes:
-    """``token`` once it is one a launch may carry: bytes, at most `MAX_TOKEN` of them.
+def _frame(message: bytes) -> tuple[int, bytes] | None:
+    """The guest port and token of a handoff ``message``, or None if it is not one of this format."""
+    if len(message) < _FRAME_HEADER.size:
+        return None
+    version, port, length = _FRAME_HEADER.unpack_from(message)
+    if version != _VERSION or not 1 <= port <= 65535 or len(message) != _FRAME_HEADER.size + length:
+        return None
+    return port, message[_FRAME_HEADER.size :]
+
+
+def check_token(token: bytes) -> None:
+    """Raise unless ``token`` is one a launch may carry: bytes, at most `MAX_TOKEN` of them.
 
     Raises:
         TypeError: If ``token`` is not bytes (a bytearray or memoryview included).
@@ -358,7 +375,6 @@ def _checked_token(token: bytes) -> bytes:
         raise TypeError(f'a launch token is bytes, got {type(token).__name__}')
     if len(token) > MAX_TOKEN:
         raise ValueError(f'a launch token is at most {MAX_TOKEN} bytes, got {len(token)}')
-    return token
 
 
 def _more_queued(control: socket.socket) -> bool:
@@ -382,28 +398,24 @@ def hand_over(forward: PortForward, listener: socket.socket, *, timeout: float, 
     Raises:
         TypeError: If ``token`` is not bytes.
         ValueError: If ``token`` is longer than `MAX_TOKEN`.
-
-    Raises:
-        ConnectionError: If the handler's control socket cannot be reached in ``timeout`` seconds.
+        ConnectionError: If the handler's control socket cannot be reached in
+            ``timeout`` seconds.
     """
-    message = bytes([_VERSION]) + forward.guest_port.to_bytes(2, 'big') + len(_checked_token(token)).to_bytes(2, 'big')
-    control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    check_token(token)
+    frame = _FRAME_HEADER.pack(_VERSION, forward.guest_port, len(token)) + token
+    control = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
         control.settimeout(timeout)
         try:
             control.connect(os.fspath(forward.handler))
-            sent = control.sendmsg(
-                [message + token],
+            control.sendmsg(  # one seqpacket message: sent whole or not at all
+                [frame],
                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))],
             )
         except OSError as exc:
             raise ConnectionError(
                 f'port forward {forward.guest_port}: cannot hand the listener to {os.fspath(forward.handler)!r}: {exc}'
             ) from exc
-        if sent != len(message) + len(token):
-            raise ConnectionError(
-                f'port forward {forward.guest_port}: the handoff reached {os.fspath(forward.handler)!r} cut short'
-            )
         control.settimeout(None)
     except BaseException:
         control.close()
