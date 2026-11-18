@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "postern"
-version = "0.7.0"
+version = "0.8.0"
 description = "Run untrusted Python in an OS-isolated sandbox whose only exit is a host-defined hatch."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Centre for Population Genomics" }]
 keywords = ["sandbox", "bubblewrap", "isolation", "untrusted-code", "seccomp", "rpc", "agent", "tool-use"]
@@ -17,7 +17,6 @@ dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -44,9 +43,7 @@ exclude-newer = "7 days"
 # postern.grpc; consumers opt in through the `grpc` extra instead.
 [dependency-groups]
 test = ["pytest", "grpcio>=1.60"]
-# typing-extensions: type-check-only backport of typing.Self for the 3.10 floor
-# (see src/postern/_sandbox.py) — not a runtime dependency.
-lint = ["ruff", "pyright", "pre-commit", "pytest", "grpcio>=1.60", "typing-extensions"]
+lint = ["ruff", "pyright", "pre-commit", "pytest", "grpcio>=1.60"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -56,7 +53,7 @@ postern = ["py.typed", "_seccomp.bpf", "_seccomp.spec", "_init.c", "_launch.c", 
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.format]
 quote-style = "single"
@@ -103,7 +100,7 @@ section-order = ["future", "standard-library", "third-party", "first-party", "lo
 [tool.pyright]
 # Check against the floor of requires-python; run via `uv run --group lint` so
 # the uv-managed environment supplies the imports.
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 include = ["src", "tests"]
 exclude = ["**/__pycache__", "src/postern/_guest.py", "src/postern/_stream_connect.py"]
 typeCheckingMode = "standard"

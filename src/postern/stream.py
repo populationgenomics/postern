@@ -79,7 +79,7 @@ Three tiers observe the exit, in ``_WAITID``'s order, because no single interfac
 is portable:
 
 1. ``os.waitid(..., WNOWAIT)``. Always present on Linux. On darwin CPython exposes
-   it only from 3.13, and the floor here is 3.10, hence the ``getattr``.
+   it only from 3.13, and the floor here is 3.11, hence the ``getattr``.
 2. ``kqueue``/``EVFILT_PROC``/``NOTE_EXIT`` on macOS and the BSDs. ``EVFILT_PROC``
    reports an immediate ``NOTE_EXIT`` for a pid that does not exist *at all*, so a
    registration only answers the question for a pid we own and have not reaped.
@@ -157,7 +157,7 @@ _EXIT_POLL = 0.02
 # empty: a quiet-period test, not a share of `grace`, which caps the whole drain.
 _DRAIN_QUIET = 0.1
 # The exit-observation tiers; see "Teardown and its caveats" above. waitid through
-# getattr: CPython exposes it on darwin only from 3.13, and the floor here is 3.10.
+# getattr: CPython exposes it on darwin only from 3.13, and the floor here is 3.11.
 _WAITID = getattr(os, 'waitid', None)
 _P_PID = getattr(os, 'P_PID', 0)
 _WEXITED = getattr(os, 'WEXITED', 0)

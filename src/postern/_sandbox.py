@@ -42,11 +42,6 @@ import typing
 
 from postern import _process, _seccomp, _workspace, forward
 
-if typing.TYPE_CHECKING:
-    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
-    # the floor is 3.10, so the backport must stay behind this guard.
-    import typing_extensions
-
 _GUEST_DIR = '/run/postern'
 _GUEST_SOCK = f'{_GUEST_DIR}/hatch.sock'  # the unnamed hatch (GrpcHatch) → POSTERN_HATCH
 _GUEST_SHIM = f'{_GUEST_DIR}/_guest.py'
@@ -1435,7 +1430,7 @@ class Sandbox:
         if self._own_workspace:
             shutil.rmtree(self._workspace, ignore_errors=True)
 
-    def __enter__(self) -> typing_extensions.Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:

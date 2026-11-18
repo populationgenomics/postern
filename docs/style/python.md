@@ -68,9 +68,8 @@ elsewhere:
 
 - If the import is type-only because of a *circular import*, the abstractions are usually wrong. Restructure.
 - If the import is type-only because the module is not installed at run time, that is a real exception — keep the block
-  and say why on the line above it. postern has one such import, `typing_extensions.Self`, guarded in `_sandbox.py`,
-  `_process.py` and `_workspace.py`: it is a type-check-only backport for the 3.10 floor and must not become a runtime dependency of a
-  package whose core has none.
+  and say why on the line above it. postern's core has no runtime dependencies, so such a module must stay out of
+  them.
 
 For everything else (`Iterator`, `Sequence` from `collections.abc`), import at module level. The runtime cost is
 nothing, and `from __future__ import annotations` means an unused type-only import costs the import and no resolution.
@@ -205,7 +204,7 @@ Annotations are required on signatures (ruff's `ANN`) and should be *specific*; 
 - Prefer the most general type the function actually uses for parameters (`Iterable[T]`, `Sequence[T]`, `Mapping[K, V]`)
   and a concrete `list`/`dict` for return types.
 - Don't annotate the obvious, and don't add `# type:` comments inside a function unless pyright is confused. pyright
-  runs in `standard` mode at `pythonVersion = "3.10"`, so an annotation that only type-checks on 3.11+ is a failure.
+  runs in `standard` mode at `pythonVersion = "3.11"`, so an annotation that only type-checks on 3.12+ is a failure.
 
 ## Function decomposition
 
@@ -221,8 +220,7 @@ branch is a different mode of operation is not; those branches want to be functi
 ### `from __future__ import annotations`
 
 Use it, on the line after the module docstring. It makes annotations lazily-evaluated strings, which removes ordering
-dependencies for forward references, allows `list[int]` and `X | Y` on the 3.10 floor, and keeps an unused type-only
-import cheap.
+dependencies for forward references and keeps an unused type-only import cheap.
 
 Every module under `src/postern/` has it except `_guest.py` and `_stream_connect.py` — the stdlib-only scripts that run
 *inside* the sandbox, exec'd by name and never imported by the package. Test modules that annotate nothing don't need

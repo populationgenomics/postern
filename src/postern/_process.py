@@ -42,11 +42,6 @@ import threading
 import time
 import typing
 
-if typing.TYPE_CHECKING:
-    # typing_extensions is not a runtime dependency: `typing.Self` is 3.11+ and
-    # the floor is 3.10, so the backport must stay behind this guard.
-    import typing_extensions
-
 _READ_SIZE = 65536
 # How long closing a still-running process allows it to stop on SIGTERM before it
 # is killed: closing should be prompt, but an interrupted caller is no reason to
@@ -591,7 +586,7 @@ class Process:
         finally:
             self._released.set()
 
-    def __enter__(self) -> typing_extensions.Self:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -722,7 +717,7 @@ class AsyncProcess:
         timed_out = False
         try:
             await asyncio.wait_for(collect(), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             timed_out = True
             self.kill()
             with contextlib.suppress(asyncio.TimeoutError):
@@ -753,7 +748,7 @@ class AsyncProcess:
 
                 try:
                     await asyncio.wait_for(drain(), _CLOSE_GRACE_S + 1)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self.kill()
                     await self.wait()
         finally:
@@ -764,7 +759,7 @@ class AsyncProcess:
                 self._release_exit_fd()
                 await asyncio.shield(asyncio.to_thread(self._process.close))
 
-    async def __aenter__(self) -> typing_extensions.Self:
+    async def __aenter__(self) -> typing.Self:
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
